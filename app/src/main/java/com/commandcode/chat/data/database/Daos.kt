@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 @Dao interface MessageDao {
     @Insert fun insert(value: MessageEntity)
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt ASC, id ASC") fun observeForConversation(conversationId: String): Flow<List<MessageEntity>>
+    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt ASC, id ASC") fun listForConversation(conversationId: String): List<MessageEntity>
     @Query("SELECT * FROM messages WHERE id = :id") fun find(id: String): MessageEntity?
     @Query("SELECT MAX(createdAt) FROM messages WHERE conversationId = :conversationId") fun latestCreatedAt(conversationId: String): Long?
     @Query("UPDATE messages SET content = :content, status = :newStatus WHERE id = :id AND status = :expectedStatus")

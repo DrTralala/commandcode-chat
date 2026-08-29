@@ -59,6 +59,7 @@ class ChatRepositoryTest {
         assertEquals("STREAMING", database.messages().find(turn.assistantMessageId)?.status)
         assertEquals("streamed", database.messages().find(turn.assistantMessageId)?.content)
         repository.completeTurn(turn.assistantMessageId, "answer", TokenUsage(1_000_000, 200_000, 1_000_000))
+        assertTrue(repository.isTurnComplete(turn.assistantMessageId))
         val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
         assertEquals(1_000_000L, event.inputTokens)
         assertEquals(200_000L, event.cachedInputTokens)
@@ -79,6 +80,8 @@ class ChatRepositoryTest {
         val turnWithoutUsage = repository.beginTurn(turn.conversationId, "next", ChatModel.LUNA)
         repository.completeTurn(turnWithoutUsage.assistantMessageId, "done", null)
         assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
+        assertEquals("INTERRUPTED", database.messages().find(turnWithoutUsage.assistantMessageId)?.status)
+        assertEquals("done", database.messages().find(turnWithoutUsage.assistantMessageId)?.content)
     }
 
     @Test
@@ -93,6 +96,7 @@ class ChatRepositoryTest {
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > before)
         repository.completeTurn(turn.assistantMessageId, "late", TokenUsage(1, 0, 1))
         assertEquals("partial", database.messages().find(turn.assistantMessageId)?.content)
+        assertTrue(!repository.isTurnComplete(turn.assistantMessageId))
         assertEquals(0, database.usageEvents().observeForConversation(turn.conversationId).first().size)
     }
 
@@ -114,14 +118,30 @@ class ChatRepositoryTest {
     }
 
     @Test
-    fun deletingConversationCascadesMessagesAndUsage() = runTest {
+    fun deletingSettledConversationCascadesInterruptedMessagesAndUsage() = runTest {
         val (repository, database) = testRepository()
         val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
-        repository.completeTurn(turn.assistantMessageId, "answer", TokenUsage(1, 0, 1))
-        database.conversations().delete(database.conversations().find(turn.conversationId)!!)
+        repository.interruptTurn(turn.assistantMessageId, "partial", "cancelled before delete")
+        repository.deleteConversation(turn.conversationId)
         assertTrue(database.messages().find(turn.userMessageId) == null)
         assertTrue(database.messages().find(turn.assistantMessageId) == null)
         assertTrue(database.usageEvents().observeForConversation(turn.conversationId).first().isEmpty())
+    }
+
+    @Test
+    fun messagesSnapshotImmediatelyReflectsCommittedAssistantWithoutFlowCollection() = runTest {
+        val (repository, _) = testRepository()
+        val turn = repository.beginTurn(null, "first", ChatModel.SOL)
+        repository.completeTurn(turn.assistantMessageId, "first answer", TokenUsage(1, 0, 1))
+        val second = repository.beginTurn(turn.conversationId, "second", ChatModel.SOL)
+
+        val snapshot = repository.messagesSnapshot(turn.conversationId)
+
+        assertEquals(
+            listOf("first", "first answer", "second", ""),
+            snapshot.map { it.content },
+        )
+        assertEquals(second.assistantMessageId, snapshot.last().id)
     }
 
     @Test

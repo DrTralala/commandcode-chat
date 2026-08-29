@@ -48,7 +48,9 @@ fun HistoryScreen(
                     }
                     OutlinedButton(
                         onClick = { pendingDelete = conversation },
-                        modifier = Modifier.semantics { contentDescription = "Delete ${conversation.title}" },
+                        modifier = Modifier
+                            .testTag("delete_conversation_${conversation.id}")
+                            .semantics { contentDescription = "Delete ${conversation.title}" },
                     ) { Text("Delete") }
                 }
             }
@@ -60,7 +62,10 @@ fun HistoryScreen(
             title = { Text("Delete conversation?") },
             text = { Text("This permanently removes the encrypted local conversation.") },
             confirmButton = {
-                TextButton(onClick = { onDelete(conversation.id); pendingDelete = null }) { Text("Delete") }
+                TextButton(
+                    onClick = { onDelete(conversation.id); pendingDelete = null },
+                    modifier = Modifier.testTag("confirm_delete_conversation"),
+                ) { Text("Delete") }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Keep") } },
         )

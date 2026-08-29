@@ -32,10 +32,11 @@ interface ApiKeyStore {
 interface ChatStore {
     fun observeConversations(): Flow<List<Conversation>>
     fun observeMessages(conversationId: String): Flow<List<Message>>
+    suspend fun messagesSnapshot(conversationId: String): List<Message>
     fun observeUsageEvents(): Flow<List<UsageEvent>>
     suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn
     suspend fun checkpointAssistant(messageId: String, text: String)
-    suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?)
+    suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String)
     suspend fun deleteConversation(id: String)
 }
@@ -89,13 +90,16 @@ class AppContainer(
     val chatStore: ChatStore = object : ChatStore {
         override fun observeConversations() = chatRepository.observeConversations()
         override fun observeMessages(conversationId: String) = chatRepository.observeMessages(conversationId)
+        override suspend fun messagesSnapshot(conversationId: String) = chatRepository.messagesSnapshot(conversationId)
         override fun observeUsageEvents() = chatRepository.observeUsageEvents()
         override suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel) =
             chatRepository.beginTurn(conversationId, text, model)
         override suspend fun checkpointAssistant(messageId: String, text: String) =
             chatRepository.checkpointAssistant(messageId, text)
-        override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?) =
+        override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
             chatRepository.completeTurn(messageId, text, usage)
+            return chatRepository.isTurnComplete(messageId)
+        }
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) =
             chatRepository.interruptTurn(messageId, partialText, reason)
         override suspend fun deleteConversation(id: String) = chatRepository.deleteConversation(id)

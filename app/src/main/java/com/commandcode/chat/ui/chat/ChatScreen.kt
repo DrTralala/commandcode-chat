@@ -60,14 +60,28 @@ fun ChatScreen(
                         DropdownMenuItem(
                             text = { Text(model.displayName) },
                             onClick = { onSelectModel(model); menuOpen = false },
+                            modifier = Modifier
+                                .testTag("model_option_${model.name.lowercase()}")
+                                .semantics { contentDescription = "Use ${model.displayName}" },
                         )
                     }
                 }
             }
         }
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(state.messages, key = Message::id) { message -> MessageRow(message.role, message.content, message.status) }
-            if (state.streamingText.isNotEmpty()) item { MessageRow("ASSISTANT", state.streamingText, "STREAMING") }
+            items(state.visibleMessages, key = Message::id) { message ->
+                MessageRow(message.role, message.content, message.status, Modifier.testTag("message_${message.id}"))
+            }
+            state.visibleStreamingText?.let { liveText ->
+                item {
+                    MessageRow(
+                        "ASSISTANT",
+                        liveText,
+                        "STREAMING",
+                        Modifier.testTag("active_assistant_response"),
+                    )
+                }
+            }
         }
         state.errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         OutlinedTextField(
@@ -90,8 +104,8 @@ fun ChatScreen(
 }
 
 @Composable
-private fun MessageRow(role: String, content: String, status: String) {
-    Surface(tonalElevation = if (role == "USER") 1.dp else 3.dp, modifier = Modifier.fillMaxWidth()) {
+private fun MessageRow(role: String, content: String, status: String, modifier: Modifier = Modifier) {
+    Surface(tonalElevation = if (role == "USER") 1.dp else 3.dp, modifier = modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {
             Text("$role · $status", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
             Text(content)

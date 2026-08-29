@@ -85,8 +85,9 @@ private fun AppContent(viewModel: AppViewModel) {
 
     val navController = rememberNavController()
     LaunchedEffect(state.keyConfigured) {
-        if (!state.keyConfigured) navController.navigate(Route.SETTINGS) {
-            popUpTo(navController.graph.startDestinationId) { inclusive = true }
+        val destination = if (state.keyConfigured) Route.CHAT else Route.SETTINGS
+        navController.navigate(destination) {
+            if (!state.keyConfigured) popUpTo(navController.graph.startDestinationId) { inclusive = true }
             launchSingleTop = true
         }
     }
@@ -94,7 +95,7 @@ private fun AppContent(viewModel: AppViewModel) {
         Box(Modifier.weight(1f)) {
             NavHost(
                 navController = navController,
-                startDestination = if (state.keyConfigured) Route.CHAT else Route.SETTINGS,
+                startDestination = initialRoute(state.keyConfigured),
             ) {
                 composable(Route.CHAT) {
                     ChatScreen(
@@ -124,7 +125,7 @@ private fun AppContent(viewModel: AppViewModel) {
             }
         }
         if (state.keyConfigured) BottomPanel(navController)
-        SecurityRail()
+        SecurityRail(state.zdr)
     }
 }
 
@@ -155,7 +156,7 @@ private fun BottomPanel(navController: NavHostController) {
 }
 
 @Composable
-private fun SecurityRail() {
+private fun SecurityRail(zdr: Boolean) {
     val statusDescription = stringResource(R.string.encrypted_local_status)
     Row(
         modifier = Modifier
@@ -167,13 +168,19 @@ private fun SecurityRail() {
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text("● ENCRYPTED LOCAL", color = Color(0xFF71D6AE), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
-        Text("ZDR READY", color = Color(0xFF9AA9BC), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
+        Text(
+            if (zdr) "ZDR ON" else "ZDR OFF",
+            color = Color(0xFF9AA9BC),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.testTag("security_zdr_status"),
+        )
     }
 }
 
 @Composable
 private fun RecoveryScreen(message: String) {
-    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(Modifier.fillMaxSize().padding(24.dp).testTag("recovery_screen"), contentAlignment = Alignment.Center) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("Recovery required", style = MaterialTheme.typography.headlineSmall, color = Amber)
             Text(message)
@@ -189,3 +196,5 @@ private object Route {
     const val BUDGET = "budget"
     const val SETTINGS = "settings"
 }
+
+internal fun initialRoute(keyConfigured: Boolean): String = if (keyConfigured) Route.CHAT else Route.SETTINGS

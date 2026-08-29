@@ -20,6 +20,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -61,7 +63,13 @@ fun SettingsScreen(
         Column {
             Text("Zero data retention")
             Text("Fail rather than route to a non-ZDR provider.", style = MaterialTheme.typography.bodySmall)
-            Switch(checked = state.zdr, onCheckedChange = onSetZdr, modifier = Modifier.testTag("zdr_toggle"))
+            Switch(
+                checked = state.zdr,
+                onCheckedChange = onSetZdr,
+                modifier = Modifier
+                    .testTag("zdr_toggle")
+                    .semantics { contentDescription = "Zero data retention" },
+            )
         }
         OutlinedTextField(
             value = billingDay,

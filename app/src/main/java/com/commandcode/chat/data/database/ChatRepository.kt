@@ -50,6 +50,10 @@ class ChatRepository(private val database: ChatDatabase) {
         database.messages().observeForConversation(conversationId)
             .map { rows -> rows.map { it.toDomain() } }
 
+    suspend fun messagesSnapshot(conversationId: String): List<Message> = database.withTransaction {
+        database.messages().listForConversation(conversationId).map { it.toDomain() }
+    }
+
     fun observeUsageEvents(): Flow<List<UsageEvent>> = database.usageEvents().observeAll()
         .map { rows -> rows.map { it.toDomain() } }
 
@@ -86,23 +90,30 @@ class ChatRepository(private val database: ChatDatabase) {
             val assistant = assistant(messageId)
             if (assistant.status == Status.COMPLETE || assistant.status == Status.INTERRUPTED) return@withTransaction
             check(assistant.status == Status.PENDING || assistant.status == Status.STREAMING) { "Assistant turn is terminal" }
+            if (usage == null) {
+                if (database.messages().updateIfStatus(messageId, assistant.status, text, Status.INTERRUPTED) != 0) {
+                    touchConversation(assistant.conversationId)
+                }
+                return@withTransaction
+            }
             if (database.messages().updateIfStatus(messageId, assistant.status, text, Status.COMPLETE) == 0) return@withTransaction
             touchConversation(assistant.conversationId)
-            val tokenUsage = usage
-            val estimate = tokenUsage?.let { BudgetCalculator.estimate(requireModel(assistant), it) }
-            if (tokenUsage != null) {
-                database.usageEvents().insert(
-                    UsageEventEntity(
-                        id = UUID.randomUUID().toString(), requestId = messageId,
-                        conversationId = assistant.conversationId, modelId = assistant.modelId!!,
-                        timestamp = System.currentTimeMillis(), inputTokens = tokenUsage.inputTokens,
-                        cachedInputTokens = tokenUsage.cachedInputTokens, outputTokens = tokenUsage.outputTokens,
-                        estimatedModelCost = estimate!!.modelCost.toPlainString(),
-                        estimatedGoatCredits = estimate.goatCredits.toPlainString(), usageComplete = true,
-                    ),
-                )
-            }
+            val estimate = BudgetCalculator.estimate(requireModel(assistant), usage)
+            database.usageEvents().insert(
+                UsageEventEntity(
+                    id = UUID.randomUUID().toString(), requestId = messageId,
+                    conversationId = assistant.conversationId, modelId = assistant.modelId!!,
+                    timestamp = System.currentTimeMillis(), inputTokens = usage.inputTokens,
+                    cachedInputTokens = usage.cachedInputTokens, outputTokens = usage.outputTokens,
+                    estimatedModelCost = estimate.modelCost.toPlainString(),
+                    estimatedGoatCredits = estimate.goatCredits.toPlainString(), usageComplete = true,
+                ),
+            )
         }
+    }
+
+    suspend fun isTurnComplete(messageId: String): Boolean = database.withTransaction {
+        database.messages().find(messageId)?.status == Status.COMPLETE
     }
 
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String) {

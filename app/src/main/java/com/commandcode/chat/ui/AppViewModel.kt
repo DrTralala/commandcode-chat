@@ -3,8 +3,8 @@ package com.commandcode.chat.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.commandcode.chat.AppContainer
 import com.commandcode.chat.ApiKeyStore
+import com.commandcode.chat.AppContainer
 import com.commandcode.chat.ChatStore
 import com.commandcode.chat.SettingsStore
 import com.commandcode.chat.StreamSource
@@ -29,6 +29,11 @@ import java.time.ZonedDateTime
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,11 +58,25 @@ data class AppUiState(
     val conversations: List<Conversation> = emptyList(),
     val currentConversationId: String? = null,
     val messages: List<Message> = emptyList(),
+    val activeConversationId: String? = null,
+    val activeAssistantMessageId: String? = null,
     val streamingText: String = "",
     val sending: Boolean = false,
     val errorMessage: String? = null,
     val budget: BudgetUiState = BudgetUiState(),
-)
+) {
+    val visibleMessages: List<Message>
+        get() = if (currentConversationId == activeConversationId && activeAssistantMessageId != null) {
+            messages.filterNot { it.id == activeAssistantMessageId }
+        } else {
+            messages
+        }
+
+    val visibleStreamingText: String?
+        get() = streamingText.takeIf {
+            it.isNotEmpty() && currentConversationId == activeConversationId
+        }
+}
 
 class AppViewModel(
     private val secrets: ApiKeyStore,
@@ -66,13 +85,17 @@ class AppViewModel(
     private val streamSource: StreamSource,
     private val now: () -> Instant = Instant::now,
     private val elapsedMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
+    private val budgetTicks: Flow<Unit>? = null,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr, billingDay = settings.billingDay))
     val state: StateFlow<AppUiState> = mutableState.asStateFlow()
 
     private var messageCollection: Job? = null
     private var sendJob: Job? = null
+    private var budgetTimer: Job? = null
     private var usageEvents: List<UsageEvent> = emptyList()
+    private var activeTurn: ActiveTurn? = null
+    private var sendTargetConversationId: String? = null
 
     init {
         viewModelScope.launch {
@@ -83,7 +106,7 @@ class AppViewModel(
             } catch (_: KeyRecoveryRequired) {
                 mutableState.value = mutableState.value.copy(
                     loading = false,
-                    recoveryMessage = "The encrypted API key cannot be opened. Recovery is required.",
+                    recoveryMessage = API_KEY_RECOVERY_MESSAGE,
                 )
                 return@launch
             }
@@ -99,6 +122,9 @@ class AppViewModel(
                 usageEvents = events
                 updateBudget()
             }
+        }
+        budgetTicks?.let { ticks ->
+            viewModelScope.launch { ticks.collect { updateBudget() } }
         }
     }
 
@@ -131,7 +157,7 @@ class AppViewModel(
 
     fun setBillingDay(day: Int) {
         if (day !in 1..31) {
-            mutableState.value = mutableState.value.copy(billingDayError = "Billing day must be from 1 to 31")
+            mutableState.value = mutableState.value.copy(billingDayError = BILLING_DAY_ERROR)
             return
         }
         settings.billingDay = day
@@ -157,10 +183,24 @@ class AppViewModel(
 
     fun deleteConversation(id: String) {
         viewModelScope.launch {
-            chats.deleteConversation(id)
-            if (mutableState.value.currentConversationId == id) {
-                messageCollection?.cancel()
-                mutableState.value = mutableState.value.copy(currentConversationId = null, messages = emptyList())
+            try {
+                if (activeTurn?.pending?.conversationId == id || sendTargetConversationId == id) {
+                    sendJob?.cancelAndJoin()
+                }
+                chats.deleteConversation(id)
+                if (mutableState.value.currentConversationId == id) {
+                    messageCollection?.cancelAndJoin()
+                    mutableState.value = mutableState.value.copy(
+                        currentConversationId = null,
+                        messages = emptyList(),
+                        sending = false,
+                    )
+                }
+            } catch (_: Exception) {
+                mutableState.value = mutableState.value.copy(
+                    sending = false,
+                    errorMessage = "Conversation could not be deleted. Try again.",
+                )
             }
         }
     }
@@ -168,72 +208,67 @@ class AppViewModel(
     fun send(text: String) {
         val prompt = text.trim()
         if (prompt.isEmpty() || sendJob?.isActive == true || !mutableState.value.keyConfigured) return
-        val startingState = mutableState.value
+        val selectedModel = mutableState.value.selectedModel
+        val zdr = mutableState.value.zdr
+        val requestedConversationId = mutableState.value.currentConversationId
+        sendTargetConversationId = requestedConversationId
         sendJob = viewModelScope.launch {
-            var pending: PendingTurn? = null
+            var turn: ActiveTurn? = null
             var apiKey: CharArray? = null
-            val partial = StringBuilder()
-            var usage: TokenUsage? = null
-            var done = false
             try {
                 mutableState.value = mutableState.value.copy(sending = true, streamingText = "", errorMessage = null)
-                pending = chats.beginTurn(startingState.currentConversationId, prompt, startingState.selectedModel)
-                if (startingState.currentConversationId != pending.conversationId) openConversation(pending.conversationId)
-                val context = startingState.messages.map {
-                    ApiMessage(if (it.role == "USER") "user" else "assistant", it.content)
-                } + ApiMessage("user", prompt)
-                apiKey = secrets.readApiKey() ?: error("API key is not configured")
-                var checkpointAt = elapsedMillis()
-                var checkpointLength = 0
-                streamSource.stream(apiKey, startingState.selectedModel, context, startingState.zdr).collect { event ->
-                    when (event) {
-                        is StreamEvent.Delta -> {
-                            partial.append(event.content)
-                            mutableState.value = mutableState.value.copy(streamingText = partial.toString())
-                            val currentTime = elapsedMillis()
-                            if (currentTime - checkpointAt >= CHECKPOINT_MILLIS || partial.length - checkpointLength >= CHECKPOINT_CHARS) {
-                                chats.checkpointAssistant(pending.assistantMessageId, partial.toString())
-                                checkpointAt = currentTime
-                                checkpointLength = partial.length
-                            }
-                        }
-                        is StreamEvent.Usage -> usage = event.usage
-                        StreamEvent.Done -> done = true
-                        is StreamEvent.Error -> throw StreamFailure(event.code)
-                    }
-                }
-                if (!done) throw IOException("Stream ended before completion")
-                chats.completeTurn(pending.assistantMessageId, partial.toString(), usage)
-                mutableState.value = mutableState.value.copy(sending = false, streamingText = "")
-            } catch (cancelled: CancellationException) {
-                pending?.let {
-                    withContext(NonCancellable) { chats.interruptTurn(it.assistantMessageId, partial.toString(), "cancelled") }
-                }
+                val pending = chats.beginTurn(requestedConversationId, prompt, selectedModel)
+                sendTargetConversationId = pending.conversationId
+                turn = ActiveTurn(pending)
+                activeTurn = turn
                 mutableState.value = mutableState.value.copy(
-                    sending = false,
-                    streamingText = "",
-                    errorMessage = if (partial.isNotEmpty()) "Response interrupted" else null,
+                    activeConversationId = pending.conversationId,
+                    activeAssistantMessageId = pending.assistantMessageId,
                 )
+                if (requestedConversationId != pending.conversationId) openConversation(pending.conversationId)
+
+                val context = chats.messagesSnapshot(pending.conversationId)
+                    .asSequence()
+                    .filterNot { it.id == pending.assistantMessageId }
+                    .filter { it.content.isNotEmpty() }
+                    .mapNotNull { message ->
+                        when (message.role) {
+                            "USER" -> ApiMessage("user", message.content)
+                            "ASSISTANT" -> ApiMessage("assistant", message.content)
+                            else -> null
+                        }
+                    }
+                    .toList()
+                apiKey = secrets.readApiKey() ?: error("API key is not configured")
+                collectStream(turn, apiKey, selectedModel, context, zdr)
+                currentCoroutineContext().ensureActive()
+                withContext(NonCancellable) {
+                    turn.completionCommitted = chats.completeTurn(
+                        pending.assistantMessageId,
+                        turn.partial.toString(),
+                        checkNotNull(turn.usage),
+                    )
+                    if (!turn.completionCommitted) throw TurnFailure(TurnFailureKind.COMMIT_REJECTED)
+                    finishTurn(turn, errorMessage = null)
+                }
+            } catch (cancelled: CancellationException) {
+                if (turn?.completionCommitted != true) {
+                    turn?.let { interruptSafely(it, "cancelled") }
+                    finishTurn(turn, if (turn?.partial?.isNotEmpty() == true) "Response interrupted" else null)
+                } else {
+                    finishTurn(turn, null)
+                }
                 throw cancelled
             } catch (error: Exception) {
-                pending?.let {
-                    withContext(NonCancellable) { chats.interruptTurn(it.assistantMessageId, partial.toString(), "failed") }
-                }
-                mutableState.value = if (error is KeyRecoveryRequired) {
-                    mutableState.value.copy(
-                        sending = false,
-                        streamingText = "",
-                        recoveryMessage = "The encrypted API key cannot be opened. Recovery is required.",
-                    )
+                if (turn?.completionCommitted != true) turn?.let { interruptSafely(it, "failed") }
+                if (error is KeyRecoveryRequired) {
+                    finishTurn(turn, null, recoveryMessage = API_KEY_RECOVERY_MESSAGE)
                 } else {
-                    mutableState.value.copy(
-                        sending = false,
-                        streamingText = "",
-                        errorMessage = safeMessage(error),
-                    )
+                    finishTurn(turn, safeMessage(error))
                 }
             } finally {
                 apiKey?.fill('\u0000')
+                sendTargetConversationId = null
             }
         }
     }
@@ -242,17 +277,92 @@ class AppViewModel(
         sendJob?.cancel()
     }
 
+    private suspend fun collectStream(
+        turn: ActiveTurn,
+        apiKey: CharArray,
+        model: ChatModel,
+        context: List<ApiMessage>,
+        zdr: Boolean,
+    ) {
+        var phase = StreamPhase.COLLECTING
+        var checkpointAt = elapsedMillis()
+        var checkpointLength = 0
+        streamSource.stream(apiKey, model, context, zdr).collect { event ->
+            if (phase == StreamPhase.DONE) return@collect
+            when (event) {
+                is StreamEvent.Delta -> {
+                    turn.partial.append(event.content)
+                    mutableState.value = mutableState.value.copy(streamingText = turn.partial.toString())
+                    val currentTime = elapsedMillis()
+                    if (currentTime - checkpointAt >= CHECKPOINT_MILLIS ||
+                        turn.partial.length - checkpointLength >= CHECKPOINT_CHARS
+                    ) {
+                        chats.checkpointAssistant(turn.pending.assistantMessageId, turn.partial.toString())
+                        checkpointAt = currentTime
+                        checkpointLength = turn.partial.length
+                    }
+                }
+                is StreamEvent.Usage -> turn.usage = event.usage
+                StreamEvent.Done -> phase = StreamPhase.DONE
+                is StreamEvent.Error -> throw TurnFailure(TurnFailureKind.FRAME_ERROR)
+            }
+        }
+        if (phase != StreamPhase.DONE) throw TurnFailure(TurnFailureKind.EARLY_EOF)
+        if (turn.usage == null) throw TurnFailure(TurnFailureKind.MISSING_USAGE)
+    }
+
+    private suspend fun interruptSafely(turn: ActiveTurn, reason: String) {
+        try {
+            withContext(NonCancellable) {
+                chats.interruptTurn(turn.pending.assistantMessageId, turn.partial.toString(), reason)
+            }
+        } catch (_: Exception) {
+            // UI still settles; repository terminal methods are idempotent and deletion waits for this path.
+        }
+    }
+
+    private fun finishTurn(turn: ActiveTurn?, errorMessage: String?, recoveryMessage: String? = null) {
+        if (turn == null || activeTurn?.pending?.assistantMessageId == turn.pending.assistantMessageId) {
+            activeTurn = null
+            mutableState.value = mutableState.value.copy(
+                activeConversationId = null,
+                activeAssistantMessageId = null,
+                streamingText = "",
+                sending = false,
+                errorMessage = errorMessage,
+                recoveryMessage = recoveryMessage ?: mutableState.value.recoveryMessage,
+            )
+        }
+    }
+
     private fun updateBudget() {
         val instant = now()
         val billingDay = mutableState.value.billingDay
         val fiveHours = BudgetCalculator.currentWindow(usageEvents, instant, Duration.ofHours(5), BigDecimal("14"))
         val weekly = BudgetCalculator.currentWindow(usageEvents, instant, Duration.ofDays(7), BigDecimal("35"))
-        val calculatedMonth = BudgetCalculator.monthlyWindow(
+        val monthly = BudgetCalculator.monthlyWindow(
             usageEvents,
             ZonedDateTime.ofInstant(instant, ZoneId.systemDefault()),
             billingDay,
         ).copy(capCredits = BigDecimal("70"))
-        mutableState.value = mutableState.value.copy(budget = BudgetUiState(fiveHours, weekly, calculatedMonth))
+        val budget = BudgetUiState(fiveHours, weekly, monthly)
+        mutableState.value = mutableState.value.copy(budget = budget)
+        if (budgetTicks == null) scheduleBudgetRefresh(instant, budget)
+    }
+
+    private fun scheduleBudgetRefresh(instant: Instant, budget: BudgetUiState) {
+        budgetTimer?.cancel()
+        val nextReset = listOfNotNull(
+            budget.fiveHours.resetAt,
+            budget.weekly.resetAt,
+            budget.monthly.resetAt,
+        ).filter { it > instant }.minOrNull() ?: return
+        val delayMillis = Duration.between(instant, nextReset).toMillis().coerceAtLeast(1L)
+        budgetTimer = viewModelScope.launch {
+            delay(delayMillis)
+            budgetTimer = null
+            updateBudget()
+        }
     }
 
     private fun safeMessage(error: Exception): String = when (error) {
@@ -261,16 +371,32 @@ class AppViewModel(
         is CommandCodeException.ZdrUnavailable -> "No ZDR-capable provider is available"
         is CommandCodeException.RateLimited -> "Request rate or plan limit reached"
         is CommandCodeException.ServerFailure -> "Command Code service failure"
-        is StreamFailure -> "Stream error: ${error.code}"
-        is IOException -> "Network stream interrupted"
-        else -> "The request could not be completed"
+        is TurnFailure -> when (error.kind) {
+            TurnFailureKind.MISSING_USAGE -> "Usage data was not received. Partial response saved. Try again."
+            TurnFailureKind.EARLY_EOF -> "Response stream ended early. Partial response saved. Try again."
+            TurnFailureKind.FRAME_ERROR -> "Response stream could not be read. Partial response saved. Try again."
+            TurnFailureKind.COMMIT_REJECTED -> "Response could not be finalised. Partial response saved. Try again."
+        }
+        is IOException -> "Network stream interrupted. Partial response saved. Try again."
+        else -> "The request could not be completed. Try again."
     }
 
-    private class StreamFailure(val code: String) : IOException()
+    private data class ActiveTurn(
+        val pending: PendingTurn,
+        val partial: StringBuilder = StringBuilder(),
+        var usage: TokenUsage? = null,
+        var completionCommitted: Boolean = false,
+    )
+
+    private enum class StreamPhase { COLLECTING, DONE }
+    private enum class TurnFailureKind { MISSING_USAGE, EARLY_EOF, FRAME_ERROR, COMMIT_REJECTED }
+    private class TurnFailure(val kind: TurnFailureKind) : IOException()
 
     companion object {
         private const val CHECKPOINT_MILLIS = 1_000L
         private const val CHECKPOINT_CHARS = 1_024
+        private const val BILLING_DAY_ERROR = "Billing day must be from 1 to 31"
+        private const val API_KEY_RECOVERY_MESSAGE = "The encrypted API key cannot be opened. Recovery is required."
 
         fun factory(container: AppContainer): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
