@@ -3,29 +3,31 @@ package com.commandcode.chat
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.ui.Alignment
-import androidx.compose.foundation.layout.Box
+import androidx.activity.viewModels
+import com.commandcode.chat.ui.AppRoot
+import com.commandcode.chat.ui.AppViewModel
 
 class MainActivity : ComponentActivity() {
+    private val commandCodeApplication: CommandCodeApplication
+        get() = application as CommandCodeApplication
+
+    val appContainer: AppContainer
+        get() = checkNotNull(commandCodeApplication.appContainer) { "Application is in recovery mode" }
+
+    val viewModelForTests: AppViewModel by viewModels { AppViewModel.factory(appContainer) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { CommandCodeChatApp() }
+        recreateUiForTests()
     }
-}
 
-@Composable
-private fun CommandCodeChatApp() {
-    MaterialTheme {
-        Surface(modifier = Modifier.fillMaxSize()) {
-            Box(contentAlignment = Alignment.Center) {
-                Text("Command Code Chat")
-            }
+    fun recreateUiForTests() {
+        val container = commandCodeApplication.appContainer
+        setContent {
+            AppRoot(
+                viewModel = if (container == null) null else viewModelForTests,
+                startupRecovery = commandCodeApplication.recoveryCause != null,
+            )
         }
     }
 }

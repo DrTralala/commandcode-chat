@@ -4,8 +4,11 @@ import androidx.room.withTransaction
 import com.commandcode.chat.data.budget.BudgetCalculator
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
+import com.commandcode.chat.domain.UsageEvent
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import java.math.BigDecimal
+import java.time.Instant
 import java.util.UUID
 
 data class Conversation(
@@ -46,6 +49,15 @@ class ChatRepository(private val database: ChatDatabase) {
     fun observeMessages(conversationId: String): Flow<List<Message>> =
         database.messages().observeForConversation(conversationId)
             .map { rows -> rows.map { it.toDomain() } }
+
+    fun observeUsageEvents(): Flow<List<UsageEvent>> = database.usageEvents().observeAll()
+        .map { rows -> rows.map { it.toDomain() } }
+
+    suspend fun deleteConversation(id: String) {
+        database.withTransaction {
+            database.conversations().find(id)?.let(database.conversations()::delete)
+        }
+    }
 
     suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn =
         database.withTransaction {
@@ -126,6 +138,16 @@ class ChatRepository(private val database: ChatDatabase) {
 
     private fun ConversationEntity.toDomain() = Conversation(id, title, ChatModel.fromApiId(defaultModel)!!, createdAt, updatedAt)
     private fun MessageEntity.toDomain() = Message(id, conversationId, role, content, modelId?.let(ChatModel::fromApiId), createdAt, status)
+    private fun UsageEventEntity.toDomain() = UsageEvent(
+        id = id,
+        model = ChatModel.fromApiId(modelId) ?: error("Unknown stored model"),
+        timestamp = Instant.ofEpochMilli(timestamp),
+        usage = if (usageComplete && inputTokens != null && outputTokens != null) {
+            TokenUsage(inputTokens, cachedInputTokens, outputTokens)
+        } else null,
+        estimatedModelCost = estimatedModelCost?.let(::BigDecimal),
+        estimatedGoatCredits = estimatedGoatCredits?.let(::BigDecimal),
+    )
 
     private fun titleFor(text: String): String {
         val normalised = buildString {

@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Command Code Chat</string>
+    <string name="encrypted_local_status">Encrypted local storage active</string>
 </resources>
