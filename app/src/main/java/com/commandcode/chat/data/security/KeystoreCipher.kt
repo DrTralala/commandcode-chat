@@ -11,20 +11,18 @@ import javax.crypto.spec.GCMParameterSpec
 class KeystoreCipher {
     fun encrypt(alias: String, plaintext: ByteArray): EncryptedBlob {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key(alias))
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey(alias))
         return EncryptedBlob(1, Base64.encodeToString(cipher.iv, Base64.NO_WRAP), Base64.encodeToString(cipher.doFinal(plaintext), Base64.NO_WRAP))
     }
-
-    fun hasKey(alias: String): Boolean = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.containsAlias(alias)
 
     fun decrypt(alias: String, blob: EncryptedBlob): ByteArray {
         require(blob.version == 1) { "Unsupported encrypted blob version" }
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, key(alias), GCMParameterSpec(128, Base64.decode(blob.nonceBase64, Base64.DEFAULT)))
+        cipher.init(Cipher.DECRYPT_MODE, existingKey(alias), GCMParameterSpec(128, Base64.decode(blob.nonceBase64, Base64.DEFAULT)))
         return cipher.doFinal(Base64.decode(blob.ciphertextBase64, Base64.DEFAULT))
     }
 
-    private fun key(alias: String): java.security.Key {
+    private fun getOrCreateKey(alias: String): java.security.Key {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         if (!store.containsAlias(alias)) {
             KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
@@ -35,6 +33,11 @@ class KeystoreCipher {
             }
         }
         return store.getKey(alias, null)
+    }
+
+    private fun existingKey(alias: String): java.security.Key {
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        return checkNotNull(store.getKey(alias, null)) { "Keystore key is unavailable" }
     }
 
     companion object { private const val TRANSFORMATION = "AES/GCM/NoPadding" }

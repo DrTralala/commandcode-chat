@@ -5,23 +5,26 @@ class DatabaseRecoveryRequired(message: String, cause: Throwable? = null) : Ille
 class DatabaseKeyManager(
     private val store: EncryptedBlobStore,
     private val cipher: KeystoreCipher = KeystoreCipher(),
+    private val alias: String = DB_ALIAS,
+    private val blobKey: String = DB_KEY,
 ) {
     fun <T> withPassphrase(block: (ByteArray) -> T): T {
         val passphrase = try {
-            val blob = store.get(DB_KEY) ?: throw DatabaseRecoveryRequired("Stored database key wrapper is missing")
-            if (!cipher.hasKey(DB_ALIAS)) throw DatabaseRecoveryRequired("Stored database Keystore key is unavailable")
-            cipher.decrypt(DB_ALIAS, blob)
+            val blob = store.get(blobKey) ?: throw DatabaseRecoveryRequired("Stored database key wrapper is missing")
+            cipher.decrypt(alias, blob)
         } catch (error: DatabaseRecoveryRequired) { throw error
         } catch (error: Exception) { throw DatabaseRecoveryRequired("Stored database key requires recovery", error) }
         return try { block(passphrase) } finally { passphrase.fill(0) }
     }
 
     fun initialiseIfMissing() {
-        if (store.rawValue(DB_KEY) != null) return
+        if (store.rawValue(blobKey) != null) return
         val generated = ByteArray(32)
         try {
             java.security.SecureRandom().nextBytes(generated)
-            cipher.encrypt(DB_ALIAS, generated).also { store.put(DB_KEY, it) }
+            cipher.encrypt(alias, generated).also { store.put(blobKey, it) }
+        } catch (error: Exception) {
+            throw DatabaseRecoveryRequired("Database key wrapper could not be persisted", error)
         } finally { generated.fill(0) }
     }
 

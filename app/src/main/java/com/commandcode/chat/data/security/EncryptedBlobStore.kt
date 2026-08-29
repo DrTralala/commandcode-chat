@@ -16,12 +16,18 @@ data class EncryptedBlob(val version: Int, val nonceBase64: String, val cipherte
     }
 }
 
-class EncryptedBlobStore(context: Context, private val name: String = "secure_secrets") {
+open class EncryptedBlobStore(context: Context, private val name: String = "secure_secrets") {
     private val preferences = context.getSharedPreferences(name, Context.MODE_PRIVATE)
 
-    fun put(key: String, blob: EncryptedBlob) { preferences.edit().putString(key, blob.encode()).apply() }
+    open fun put(key: String, blob: EncryptedBlob) {
+        check(preferences.edit().putString(key, blob.encode()).commit()) {
+            "Encrypted wrapper could not be persisted"
+        }
+    }
     fun get(key: String): EncryptedBlob? = preferences.getString(key, null)?.let(EncryptedBlob::decode)
-    fun remove(key: String) { preferences.edit().remove(key).apply() }
+    fun remove(key: String) {
+        check(preferences.edit().remove(key).commit()) { "Encrypted wrapper could not be removed" }
+    }
     fun rawValue(key: String): String? = preferences.getString(key, null)
     fun allRawValues(): Map<String, *> = preferences.all
 }
