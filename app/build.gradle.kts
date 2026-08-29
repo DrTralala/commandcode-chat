@@ -5,6 +5,11 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+    arg("room.generateKotlin", "true")
+}
+
 android {
     namespace = "com.commandcode.chat"
     compileSdk = 35
@@ -55,6 +60,13 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.2")
     implementation("com.squareup.okhttp3:okhttp-jvm:5.5.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    implementation("androidx.room:room-runtime:2.7.2")
+    implementation("androidx.room:room-ktx:2.7.2")
+    implementation("net.zetetic:android-database-sqlcipher:4.5.4")
+    ksp("androidx.room:room-compiler:2.7.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.room:room-testing:2.7.2")
     debugImplementation("androidx.compose.ui:ui-tooling:1.9.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20250517")
