@@ -1,6 +1,7 @@
 package com.commandcode.chat.domain
 
 import java.math.BigDecimal
+import java.math.MathContext
 
 data class TokenRates(
     val inputPerMillion: BigDecimal,
@@ -16,6 +17,9 @@ enum class ChatModel(
 ) {
     SOL("gpt-5.6-sol", "GPT-5.6 Sol", bd("70"), TokenRates(bd("5"), bd("0.5"), bd("30"))),
     LUNA("gpt-5.6-luna", "GPT-5.6 Luna", bd("20"), TokenRates(bd("0.2"), bd("0.02"), bd("1.2")));
+
+    val goatMultiplier: BigDecimal
+        get() = BigDecimal("70").divide(monthlyAllowance, MathContext.DECIMAL128)
 
     companion object {
         const val RATES_EFFECTIVE_AS_OF = "2026-08-29"

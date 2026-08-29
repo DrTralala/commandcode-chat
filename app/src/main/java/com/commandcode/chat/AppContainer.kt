@@ -97,8 +97,7 @@ class AppContainer(
         override suspend fun checkpointAssistant(messageId: String, text: String) =
             chatRepository.checkpointAssistant(messageId, text)
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
-            chatRepository.completeTurn(messageId, text, usage)
-            return chatRepository.isTurnComplete(messageId)
+            return chatRepository.completeTurn(messageId, text, usage)
         }
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) =
             chatRepository.interruptTurn(messageId, partialText, reason)

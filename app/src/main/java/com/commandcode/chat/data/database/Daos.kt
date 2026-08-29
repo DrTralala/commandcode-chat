@@ -23,6 +23,24 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao interface UsageEventDao {
     @Insert fun insert(value: UsageEventEntity)
+    @Query("""
+        UPDATE usage_events SET
+            inputTokens = :inputTokens,
+            cachedInputTokens = :cachedInputTokens,
+            outputTokens = :outputTokens,
+            estimatedModelCost = :estimatedModelCost,
+            estimatedGoatCredits = :estimatedGoatCredits,
+            usageComplete = 1
+        WHERE requestId = :requestId AND usageComplete = 0
+    """)
+    fun complete(
+        requestId: String,
+        inputTokens: Long?,
+        cachedInputTokens: Long?,
+        outputTokens: Long?,
+        estimatedModelCost: String?,
+        estimatedGoatCredits: String?,
+    ): Int
     @Query("SELECT * FROM usage_events ORDER BY timestamp ASC, id ASC") fun observeAll(): Flow<List<UsageEventEntity>>
     @Query("SELECT * FROM usage_events WHERE conversationId = :conversationId ORDER BY timestamp ASC, id ASC") fun observeForConversation(conversationId: String): Flow<List<UsageEventEntity>>
 }

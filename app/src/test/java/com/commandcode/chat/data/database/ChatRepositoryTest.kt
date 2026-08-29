@@ -26,8 +26,9 @@ class ChatRepositoryTest {
         databases.clear()
     }
     @Test
-    fun beginTurnCreatesConversationAndOrderedPendingRows() = runTest {
-        val (repository, database) = testRepository()
+    fun beginTurnCreatesConversationPendingRowsAndIncompleteUsageAnchor() = runTest {
+        val startedAt = 1_777_777L
+        val (repository, database) = testRepository(nowMillis = { startedAt })
 
         val turn = repository.beginTurn(null, "  hello   world  ", ChatModel.SOL)
 
@@ -48,10 +49,21 @@ class ChatRepositoryTest {
         assertEquals(ChatModel.SOL, rows[1].model)
         assertEquals("PENDING", rows[1].status)
         assertTrue(rows[1].createdAt > rows[0].createdAt)
+        val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
+        assertEquals(turn.assistantMessageId, event.requestId)
+        assertEquals(turn.conversationId, event.conversationId)
+        assertEquals(ChatModel.SOL.apiId, event.modelId)
+        assertEquals(startedAt, event.timestamp)
+        assertNull(event.inputTokens)
+        assertNull(event.cachedInputTokens)
+        assertNull(event.outputTokens)
+        assertNull(event.estimatedModelCost)
+        assertNull(event.estimatedGoatCredits)
+        assertTrue(!event.usageComplete)
     }
 
     @Test
-    fun completeTurnPersistsUsageWithCalculatedCostsAndNullUsageDoesNotCreateEvent() = runTest {
+    fun completeTurnUpdatesSingleAnchorWithFullyDetailedExactCosts() = runTest {
         val (repository, database) = testRepository()
         val turn = repository.beginTurn(null, "hello", ChatModel.LUNA)
         val before = database.conversations().find(turn.conversationId)!!.updatedAt
@@ -77,11 +89,42 @@ class ChatRepositoryTest {
         repository.interruptTurn(turn.assistantMessageId, "stale", "stale")
         assertEquals("answer", database.messages().find(turn.assistantMessageId)?.content)
 
-        val turnWithoutUsage = repository.beginTurn(turn.conversationId, "next", ChatModel.LUNA)
-        repository.completeTurn(turnWithoutUsage.assistantMessageId, "done", null)
-        assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
-        assertEquals("INTERRUPTED", database.messages().find(turnWithoutUsage.assistantMessageId)?.status)
-        assertEquals("done", database.messages().find(turnWithoutUsage.assistantMessageId)?.content)
+        assertTrue(event.usageComplete)
+    }
+
+    @Test
+    fun doneWithoutUsageCompletesMessageAndAnchorWithUnknownCosts() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
+
+        repository.completeTurn(turn.assistantMessageId, "done", null)
+
+        val assistant = database.messages().find(turn.assistantMessageId)!!
+        val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
+        assertEquals("COMPLETE", assistant.status)
+        assertEquals("done", assistant.content)
+        assertTrue(event.usageComplete)
+        assertNull(event.inputTokens)
+        assertNull(event.cachedInputTokens)
+        assertNull(event.outputTokens)
+        assertNull(event.estimatedModelCost)
+        assertNull(event.estimatedGoatCredits)
+    }
+
+    @Test
+    fun partialUsageRetainsRawValuesButLeavesCostsUnknown() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "hello", ChatModel.LUNA)
+
+        repository.completeTurn(turn.assistantMessageId, "done", TokenUsage(11, null, 7))
+
+        val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
+        assertTrue(event.usageComplete)
+        assertEquals(11L, event.inputTokens)
+        assertNull(event.cachedInputTokens)
+        assertEquals(7L, event.outputTokens)
+        assertNull(event.estimatedModelCost)
+        assertNull(event.estimatedGoatCredits)
     }
 
     @Test
@@ -97,7 +140,10 @@ class ChatRepositoryTest {
         repository.completeTurn(turn.assistantMessageId, "late", TokenUsage(1, 0, 1))
         assertEquals("partial", database.messages().find(turn.assistantMessageId)?.content)
         assertTrue(!repository.isTurnComplete(turn.assistantMessageId))
-        assertEquals(0, database.usageEvents().observeForConversation(turn.conversationId).first().size)
+        val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
+        assertTrue(!event.usageComplete)
+        assertNull(event.estimatedModelCost)
+        assertNull(event.estimatedGoatCredits)
     }
 
     @Test
@@ -162,15 +208,31 @@ class ChatRepositoryTest {
         database.messages().insert(MessageEntity("existing", "boundary", "USER", "existing", null, Long.MAX_VALUE, "COMPLETE"))
         assertTrue(runCatching { repository.beginTurn("boundary", "overflow", ChatModel.SOL) }.exceptionOrNull() is IllegalStateException)
         assertEquals(1, database.messages().observeForConversation("boundary").first().size)
-        assertNull(database.messages().find("overflow"))
+        assertTrue(database.usageEvents().observeForConversation("boundary").first().isEmpty())
     }
 
-    private fun testRepository(): Pair<ChatRepository, ChatDatabase> {
+    @Test
+    fun startupReconciliationInterruptsPendingAndStreamingTogetherWithoutLosingText() = runTest {
+        val (repository, database) = testRepository()
+        val pending = repository.beginTurn(null, "pending", ChatModel.SOL)
+        val streaming = repository.beginTurn(pending.conversationId, "streaming", ChatModel.LUNA)
+        repository.checkpointAssistant(streaming.assistantMessageId, "checkpoint text")
+
+        database.reconcileUnfinishedTurnsForStartup()
+
+        assertEquals("INTERRUPTED", database.messages().find(pending.assistantMessageId)?.status)
+        assertEquals("", database.messages().find(pending.assistantMessageId)?.content)
+        assertEquals("INTERRUPTED", database.messages().find(streaming.assistantMessageId)?.status)
+        assertEquals("checkpoint text", database.messages().find(streaming.assistantMessageId)?.content)
+        assertTrue(database.usageEvents().observeForConversation(pending.conversationId).first().all { !it.usageComplete })
+    }
+
+    private fun testRepository(nowMillis: () -> Long = System::currentTimeMillis): Pair<ChatRepository, ChatDatabase> {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val database = Room.inMemoryDatabaseBuilder(context, ChatDatabase::class.java)
             .allowMainThreadQueries()
             .build()
         databases += database
-        return ChatRepository(database) to database
+        return ChatRepository(database, nowMillis) to database
     }
 }

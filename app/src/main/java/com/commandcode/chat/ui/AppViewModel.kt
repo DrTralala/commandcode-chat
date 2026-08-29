@@ -46,6 +46,7 @@ data class BudgetUiState(
     val fiveHours: BudgetWindow = BudgetWindow(BigDecimal.ZERO, BigDecimal("14"), null, null),
     val weekly: BudgetWindow = BudgetWindow(BigDecimal.ZERO, BigDecimal("35"), null, null),
     val monthly: BudgetWindow = BudgetWindow(BigDecimal.ZERO, BigDecimal("70"), null, null),
+    val selectedModel: ChatModel = ChatModel.SOL,
 )
 
 data class AppUiState(
@@ -169,6 +170,7 @@ class AppViewModel(
     fun selectModel(model: ChatModel) {
         require(model == ChatModel.SOL || model == ChatModel.LUNA)
         mutableState.value = mutableState.value.copy(selectedModel = model)
+        updateBudget()
     }
 
     fun openConversation(id: String) {
@@ -217,14 +219,20 @@ class AppViewModel(
             var apiKey: CharArray? = null
             try {
                 mutableState.value = mutableState.value.copy(sending = true, streamingText = "", errorMessage = null)
-                val pending = chats.beginTurn(requestedConversationId, prompt, selectedModel)
-                sendTargetConversationId = pending.conversationId
-                turn = ActiveTurn(pending)
-                activeTurn = turn
-                mutableState.value = mutableState.value.copy(
-                    activeConversationId = pending.conversationId,
-                    activeAssistantMessageId = pending.assistantMessageId,
-                )
+                val registeredTurn = withContext(NonCancellable) {
+                    val pending = chats.beginTurn(requestedConversationId, prompt, selectedModel)
+                    sendTargetConversationId = pending.conversationId
+                    ActiveTurn(pending).also { active ->
+                        turn = active
+                        activeTurn = active
+                        mutableState.value = mutableState.value.copy(
+                            activeConversationId = pending.conversationId,
+                            activeAssistantMessageId = pending.assistantMessageId,
+                        )
+                    }
+                }
+                currentCoroutineContext().ensureActive()
+                val pending = registeredTurn.pending
                 if (requestedConversationId != pending.conversationId) openConversation(pending.conversationId)
 
                 val context = chats.messagesSnapshot(pending.conversationId)
@@ -240,16 +248,16 @@ class AppViewModel(
                     }
                     .toList()
                 apiKey = secrets.readApiKey() ?: error("API key is not configured")
-                collectStream(turn, apiKey, selectedModel, context, zdr)
+                collectStream(registeredTurn, apiKey, selectedModel, context, zdr)
                 currentCoroutineContext().ensureActive()
                 withContext(NonCancellable) {
-                    turn.completionCommitted = chats.completeTurn(
+                    registeredTurn.completionCommitted = chats.completeTurn(
                         pending.assistantMessageId,
-                        turn.partial.toString(),
-                        checkNotNull(turn.usage),
+                        registeredTurn.partial.toString(),
+                        registeredTurn.usage,
                     )
-                    if (!turn.completionCommitted) throw TurnFailure(TurnFailureKind.COMMIT_REJECTED)
-                    finishTurn(turn, errorMessage = null)
+                    if (!registeredTurn.completionCommitted) throw TurnFailure(TurnFailureKind.COMMIT_REJECTED)
+                    finishTurn(registeredTurn, errorMessage = null)
                 }
             } catch (cancelled: CancellationException) {
                 if (turn?.completionCommitted != true) {
@@ -308,7 +316,6 @@ class AppViewModel(
             phase != StreamPhase.DONE
         }.collect { }
         if (phase != StreamPhase.DONE) throw TurnFailure(TurnFailureKind.EARLY_EOF)
-        if (turn.usage == null) throw TurnFailure(TurnFailureKind.MISSING_USAGE)
     }
 
     private suspend fun interruptSafely(turn: ActiveTurn, reason: String) {
@@ -345,7 +352,7 @@ class AppViewModel(
             ZonedDateTime.ofInstant(instant, ZoneId.systemDefault()),
             billingDay,
         ).copy(capCredits = BigDecimal("70"))
-        val budget = BudgetUiState(fiveHours, weekly, monthly)
+        val budget = BudgetUiState(fiveHours, weekly, monthly, mutableState.value.selectedModel)
         mutableState.value = mutableState.value.copy(budget = budget)
         if (budgetTicks == null) scheduleBudgetRefresh(instant, budget)
     }
@@ -372,7 +379,6 @@ class AppViewModel(
         is CommandCodeException.RateLimited -> "Request rate or plan limit reached"
         is CommandCodeException.ServerFailure -> "Command Code service failure"
         is TurnFailure -> when (error.kind) {
-            TurnFailureKind.MISSING_USAGE -> "Usage data was not received. Partial response saved. Try again."
             TurnFailureKind.EARLY_EOF -> "Response stream ended early. Partial response saved. Try again."
             TurnFailureKind.FRAME_ERROR -> "Response stream could not be read. Partial response saved. Try again."
             TurnFailureKind.COMMIT_REJECTED -> "Response could not be finalised. Partial response saved. Try again."
@@ -389,7 +395,7 @@ class AppViewModel(
     )
 
     private enum class StreamPhase { COLLECTING, DONE }
-    private enum class TurnFailureKind { MISSING_USAGE, EARLY_EOF, FRAME_ERROR, COMMIT_REJECTED }
+    private enum class TurnFailureKind { EARLY_EOF, FRAME_ERROR, COMMIT_REJECTED }
     private class TurnFailure(val kind: TurnFailureKind) : IOException()
 
     companion object {

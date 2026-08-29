@@ -52,12 +52,22 @@ class BudgetCalculatorTest {
 
     @Test
     fun solFreshCachedAndOutputComponentsAreDistinguished() {
-        val fresh = BudgetCalculator.estimate(sol, TokenUsage(inputTokens = 10, cachedInputTokens = null, outputTokens = 0))
+        val fresh = BudgetCalculator.estimate(sol, TokenUsage(inputTokens = 10, cachedInputTokens = 0, outputTokens = 0))
         val cached = BudgetCalculator.estimate(sol, TokenUsage(inputTokens = 10, cachedInputTokens = 10, outputTokens = 0))
         val output = BudgetCalculator.estimate(sol, TokenUsage(inputTokens = 0, cachedInputTokens = 0, outputTokens = 1))
         assertEquals(0, bd("0.000050").compareTo(fresh.modelCost))
         assertEquals(0, bd("0.000005").compareTo(cached.modelCost))
         assertEquals(0, bd("0.000030").compareTo(output.modelCost))
+    }
+
+    @Test
+    fun missingCachedTokenDetailLeavesEstimateUnknown() {
+        val estimate = BudgetCalculator.estimateIfDetailed(
+            sol,
+            TokenUsage(inputTokens = 10, cachedInputTokens = null, outputTokens = 1),
+        )
+
+        assertEquals(null, estimate)
     }
 
     @Test

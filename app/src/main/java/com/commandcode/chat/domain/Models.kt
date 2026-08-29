@@ -16,4 +16,5 @@ data class UsageEvent(
     val usage: TokenUsage?,
     val estimatedModelCost: BigDecimal?,
     val estimatedGoatCredits: BigDecimal?,
+    val usageComplete: Boolean = true,
 )

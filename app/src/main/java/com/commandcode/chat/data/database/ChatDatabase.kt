@@ -28,11 +28,26 @@ abstract class ChatDatabase : RoomDatabase() {
                     .openHelperFactory(SupportOpenHelperFactory(factoryPassphrase))
                     .build()
                     database.openHelper.writableDatabase
+                    database.reconcileUnfinishedTurnsForStartup()
                     database
                 } catch (error: Exception) {
                     throw DatabaseRecoveryRequired("Encrypted database requires recovery", error)
                 }
             }
+        }
+    }
+
+    internal fun reconcileUnfinishedTurnsForStartup() {
+        val writableDatabase = openHelper.writableDatabase
+        writableDatabase.beginTransaction()
+        try {
+            writableDatabase.execSQL(
+                "UPDATE messages SET status = 'INTERRUPTED' " +
+                    "WHERE role = 'ASSISTANT' AND status IN ('PENDING', 'STREAMING')",
+            )
+            writableDatabase.setTransactionSuccessful()
+        } finally {
+            writableDatabase.endTransaction()
         }
     }
 }

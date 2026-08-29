@@ -27,13 +27,12 @@ object BudgetCalculator {
     private val PER_MILLION = BigDecimal("1000000")
 
     /** GOAT credits = model-dollar usage * (70 / model monthly allowance). */
-    private fun goatMultiplier(model: ChatModel): BigDecimal =
-        BigDecimal("70").divide(model.monthlyAllowance, MathContext.DECIMAL128)
-
     fun estimate(model: ChatModel, usage: TokenUsage): CostEstimate {
         require(usage.inputTokens >= 0) { "inputTokens must not be negative" }
         require(usage.outputTokens >= 0) { "outputTokens must not be negative" }
-        val cachedInput = usage.cachedInputTokens ?: 0
+        val cachedInput = requireNotNull(usage.cachedInputTokens) {
+            "cachedInputTokens are required for a detailed estimate"
+        }
         require(cachedInput >= 0) { "cachedInputTokens must not be negative" }
         require(cachedInput <= usage.inputTokens) { "cachedInputTokens must not exceed inputTokens" }
 
@@ -53,10 +52,13 @@ object BudgetCalculator {
             .add(outputCost, MathContext.DECIMAL128)
             .stripTrailingZeros()
         val goatCredits = modelCost
-            .multiply(goatMultiplier(model), MathContext.DECIMAL128)
+            .multiply(model.goatMultiplier, MathContext.DECIMAL128)
             .stripTrailingZeros()
         return CostEstimate(modelCost, goatCredits)
     }
+
+    fun estimateIfDetailed(model: ChatModel, usage: TokenUsage): CostEstimate? =
+        if (usage.cachedInputTokens == null) null else estimate(model, usage)
 
     fun currentWindow(
         events: List<UsageEvent>,

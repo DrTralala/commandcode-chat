@@ -68,7 +68,7 @@ class AppViewModelTest {
     }
 
     @Test
-    fun doneWithoutUsageInterruptsPartialWithActionableSafeError() = runTest(dispatcher) {
+    fun doneWithoutUsageCompletesWithUnknownUsageAndNoError() = runTest(dispatcher) {
         val chats = FakeChats()
         val viewModel = viewModel(chats, StreamSource { _, _, _, _ ->
             flowOf(StreamEvent.Delta("partial"), StreamEvent.Done)
@@ -78,9 +78,10 @@ class AppViewModelTest {
         viewModel.send("hello")
         advanceUntilIdle()
 
-        assertEquals("partial", chats.interruptedText)
-        assertNull(chats.completedText)
-        assertEquals("Usage data was not received. Partial response saved. Try again.", viewModel.state.value.errorMessage)
+        assertEquals("partial", chats.completedText)
+        assertNull(chats.completedUsage)
+        assertNull(chats.interruptedText)
+        assertNull(viewModel.state.value.errorMessage)
     }
 
     @Test
@@ -112,8 +113,9 @@ class AppViewModelTest {
         viewModel.send("hello")
         advanceUntilIdle()
 
-        assertEquals("kept", chats.interruptedText)
-        assertNull(chats.completedText)
+        assertEquals("kept", chats.completedText)
+        assertNull(chats.completedUsage)
+        assertNull(chats.interruptedText)
     }
 
     @Test
@@ -163,6 +165,28 @@ class AppViewModelTest {
         assertEquals("partial", chats.interruptedText)
         assertNull(chats.completedText)
         assertEquals("Response interrupted", viewModel.state.value.errorMessage)
+    }
+
+    @Test
+    fun cancellationImmediatelyAfterBeginTurnCommitRegistersThenInterruptsAnchor() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            beginTurnCommitted = CompletableDeferred()
+            beginTurnRelease = CompletableDeferred()
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"))
+        configureKey(viewModel)
+        viewModel.send("hello")
+        runCurrent()
+        chats.beginTurnCommitted!!.await()
+
+        viewModel.cancel()
+        chats.beginTurnRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("INTERRUPTED", chats.assistantStatus("assistant-1"))
+        assertEquals(false, chats.usageCompleteByRequest["assistant-1"])
+        assertTrue(chats.lifecycleEvents.contains("interrupt:assistant-1"))
+        assertFalse(viewModel.state.value.sending)
     }
 
     @Test
@@ -466,6 +490,9 @@ class AppViewModelTest {
         var interruptedText: String? = null
         var completionEntered: CompletableDeferred<Unit>? = null
         var completionRelease: CompletableDeferred<Unit>? = null
+        var beginTurnCommitted: CompletableDeferred<Unit>? = null
+        var beginTurnRelease: CompletableDeferred<Unit>? = null
+        val usageCompleteByRequest = mutableMapOf<String, Boolean>()
         val deleteFailures = mutableSetOf<String>()
         private var turnCount = 0
         private val deletedConversations = mutableSetOf<String>()
@@ -488,6 +515,9 @@ class AppViewModelTest {
             messages(id).value = existing +
                 Message(userId, id, "USER", text, null, turnCount * 2L, "COMPLETE") +
                 Message(assistantId, id, "ASSISTANT", "", model, turnCount * 2L + 1, "PENDING")
+            usageCompleteByRequest[assistantId] = false
+            beginTurnCommitted?.complete(Unit)
+            beginTurnRelease?.await()
             return PendingTurn(id, userId, assistantId)
         }
 
@@ -501,6 +531,7 @@ class AppViewModelTest {
             completedText = text
             completedUsage = usage
             updateAssistant(messageId, text, "COMPLETE")
+            usageCompleteByRequest[messageId] = true
             completionEntered?.complete(Unit)
             completionRelease?.await()
             return true
@@ -525,6 +556,9 @@ class AppViewModelTest {
             conversations.value = conversations.value + Conversation(id, id, ChatModel.SOL, 1, 1)
             messages(id)
         }
+
+        fun assistantStatus(messageId: String): String? =
+            messageFlows.values.flatMap { it.value }.singleOrNull { it.id == messageId }?.status
 
         private fun messages(id: String) = messageFlows.getOrPut(id) { MutableStateFlow(emptyList()) }
         private fun messageConversation(messageId: String): String? = messageOwners[messageId]
