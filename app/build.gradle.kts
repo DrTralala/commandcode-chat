@@ -12,7 +12,7 @@ ksp {
 
 android {
     namespace = "com.commandcode.chat"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.commandcode.chat"
@@ -60,10 +60,11 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.2")
     implementation("com.squareup.okhttp3:okhttp-jvm:5.5.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
-    implementation("androidx.room:room-runtime:2.7.2")
-    implementation("androidx.room:room-ktx:2.7.2")
-    implementation("net.zetetic:android-database-sqlcipher:4.5.4")
-    ksp("androidx.room:room-compiler:2.7.2")
+    implementation("androidx.room:room-runtime:2.8.4")
+    implementation("androidx.room:room-ktx:2.8.4")
+    implementation("androidx.sqlite:sqlite:2.7.0")
+    implementation("net.zetetic:sqlcipher-android:4.18.0")
+    ksp("androidx.room:room-compiler:2.8.4")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.room:room-testing:2.7.2")

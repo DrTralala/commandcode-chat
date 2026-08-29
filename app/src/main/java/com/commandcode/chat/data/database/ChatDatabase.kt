@@ -5,8 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import com.commandcode.chat.data.security.DatabaseKeyManager
-import net.sqlcipher.database.SQLiteDatabase
-import net.sqlcipher.database.SupportFactory
+import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 
 @Database(entities = [ConversationEntity::class, MessageEntity::class, UsageEventEntity::class], version = 1, exportSchema = true)
 abstract class ChatDatabase : RoomDatabase() {
@@ -17,10 +16,9 @@ abstract class ChatDatabase : RoomDatabase() {
     companion object {
         fun open(context: Context, keyManager: DatabaseKeyManager): ChatDatabase {
             System.loadLibrary("sqlcipher")
-            SQLiteDatabase.loadLibs(context)
             return keyManager.withPassphrase { passphrase ->
                 val database = Room.databaseBuilder(context, ChatDatabase::class.java, "chat.db")
-                    .openHelperFactory(SupportFactory(passphrase))
+                    .openHelperFactory(SupportOpenHelperFactory(passphrase))
                     .fallbackToDestructiveMigration(false)
                     .build()
                 database.openHelper.writableDatabase
