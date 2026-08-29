@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -183,8 +184,9 @@ class AppViewModel(
 
     fun deleteConversation(id: String) {
         viewModelScope.launch {
+            val targetsActiveSend = activeTurn?.pending?.conversationId == id || sendTargetConversationId == id
             try {
-                if (activeTurn?.pending?.conversationId == id || sendTargetConversationId == id) {
+                if (targetsActiveSend) {
                     sendJob?.cancelAndJoin()
                 }
                 chats.deleteConversation(id)
@@ -193,12 +195,10 @@ class AppViewModel(
                     mutableState.value = mutableState.value.copy(
                         currentConversationId = null,
                         messages = emptyList(),
-                        sending = false,
                     )
                 }
             } catch (_: Exception) {
                 mutableState.value = mutableState.value.copy(
-                    sending = false,
                     errorMessage = "Conversation could not be deleted. Try again.",
                 )
             }
@@ -287,8 +287,7 @@ class AppViewModel(
         var phase = StreamPhase.COLLECTING
         var checkpointAt = elapsedMillis()
         var checkpointLength = 0
-        streamSource.stream(apiKey, model, context, zdr).collect { event ->
-            if (phase == StreamPhase.DONE) return@collect
+        streamSource.stream(apiKey, model, context, zdr).takeWhile { event ->
             when (event) {
                 is StreamEvent.Delta -> {
                     turn.partial.append(event.content)
@@ -306,7 +305,8 @@ class AppViewModel(
                 StreamEvent.Done -> phase = StreamPhase.DONE
                 is StreamEvent.Error -> throw TurnFailure(TurnFailureKind.FRAME_ERROR)
             }
-        }
+            phase != StreamPhase.DONE
+        }.collect { }
         if (phase != StreamPhase.DONE) throw TurnFailure(TurnFailureKind.EARLY_EOF)
         if (turn.usage == null) throw TurnFailure(TurnFailureKind.MISSING_USAGE)
     }

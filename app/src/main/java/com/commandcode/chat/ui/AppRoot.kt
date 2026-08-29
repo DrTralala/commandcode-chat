@@ -20,6 +20,9 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -84,12 +87,15 @@ private fun AppContent(viewModel: AppViewModel) {
     }
 
     val navController = rememberNavController()
+    var previouslyConfigured by rememberSaveable { mutableStateOf(state.keyConfigured) }
     LaunchedEffect(state.keyConfigured) {
-        val destination = if (state.keyConfigured) Route.CHAT else Route.SETTINGS
-        navController.navigate(destination) {
-            if (!state.keyConfigured) popUpTo(navController.graph.startDestinationId) { inclusive = true }
-            launchSingleTop = true
+        navigationTarget(previouslyConfigured, state.keyConfigured)?.let { destination ->
+            navController.navigate(destination) {
+                if (!state.keyConfigured) popUpTo(navController.graph.startDestinationId) { inclusive = true }
+                launchSingleTop = true
+            }
         }
+        previouslyConfigured = state.keyConfigured
     }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.weight(1f)) {
@@ -198,3 +204,9 @@ private object Route {
 }
 
 internal fun initialRoute(keyConfigured: Boolean): String = if (keyConfigured) Route.CHAT else Route.SETTINGS
+
+internal fun navigationTarget(previouslyConfigured: Boolean, keyConfigured: Boolean): String? = when {
+    !previouslyConfigured && keyConfigured -> Route.CHAT
+    previouslyConfigured && !keyConfigured -> Route.SETTINGS
+    else -> null
+}

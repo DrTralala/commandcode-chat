@@ -19,6 +19,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -116,12 +117,39 @@ class AppViewModelTest {
     }
 
     @Test
+    fun usageAndDoneCompletesWithoutWaitingForOpenUpstreamAndCancelsIt() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val upstreamCleaned = CompletableDeferred<Unit>()
+        var codeAfterDoneRan = false
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            try {
+                emit(StreamEvent.Delta("answer"))
+                emit(StreamEvent.Usage(TokenUsage(1, 0, 1)))
+                emit(StreamEvent.Done)
+                codeAfterDoneRan = true
+                awaitCancellation()
+            } finally {
+                upstreamCleaned.complete(Unit)
+            }
+        } })
+        configureKey(viewModel)
+
+        viewModel.send("hello")
+        runCurrent()
+        withTimeout(1_000) { upstreamCleaned.await() }
+
+        assertEquals("answer", chats.completedText)
+        assertTrue(upstreamCleaned.isCompleted)
+        assertFalse(codeAfterDoneRan)
+        assertFalse(viewModel.state.value.sending)
+    }
+
+    @Test
     fun cancellationBeforeCommitInterrupts() = runTest(dispatcher) {
         val chats = FakeChats()
         val source = StreamSource { _, _, _, _ -> flow {
             emit(StreamEvent.Delta("partial"))
             emit(StreamEvent.Usage(TokenUsage(1, 0, 1)))
-            emit(StreamEvent.Done)
             awaitCancellation()
         } }
         val viewModel = viewModel(chats, source)
@@ -176,6 +204,62 @@ class AppViewModelTest {
         assertEquals(listOf("interrupt:assistant-1", "delete:conversation"), chats.lifecycleEvents)
         assertFalse(viewModel.state.value.sending)
         assertNull(viewModel.state.value.currentConversationId)
+    }
+
+    @Test
+    fun deletingUnrelatedConversationKeepsActiveSendAndCancelControl() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation"); addConversation("other") }
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            emit(StreamEvent.Delta("active A"))
+            awaitCancellation()
+        } })
+        configureKey(viewModel)
+        viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.send("hello")
+        runCurrent()
+        viewModel.openConversation("other")
+        runCurrent()
+
+        viewModel.deleteConversation("other")
+        runCurrent()
+
+        assertTrue(viewModel.state.value.sending)
+        assertEquals("conversation", viewModel.state.value.activeConversationId)
+        assertTrue(chats.lifecycleEvents.none { it.startsWith("interrupt:") })
+        viewModel.cancel()
+        advanceUntilIdle()
+        assertEquals("active A", chats.interruptedText)
+        assertFalse(viewModel.state.value.sending)
+    }
+
+    @Test
+    fun failedUnrelatedDeletionKeepsActiveSendAndCancelControl() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("conversation")
+            addConversation("other")
+            deleteFailures += "other"
+        }
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            emit(StreamEvent.Delta("active A"))
+            awaitCancellation()
+        } })
+        configureKey(viewModel)
+        viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.send("hello")
+        runCurrent()
+
+        viewModel.deleteConversation("other")
+        runCurrent()
+
+        assertTrue(viewModel.state.value.sending)
+        assertEquals("conversation", viewModel.state.value.activeConversationId)
+        assertEquals("Conversation could not be deleted. Try again.", viewModel.state.value.errorMessage)
+        viewModel.cancel()
+        advanceUntilIdle()
+        assertEquals("active A", chats.interruptedText)
+        assertFalse(viewModel.state.value.sending)
     }
 
     @Test
@@ -382,8 +466,10 @@ class AppViewModelTest {
         var interruptedText: String? = null
         var completionEntered: CompletableDeferred<Unit>? = null
         var completionRelease: CompletableDeferred<Unit>? = null
+        val deleteFailures = mutableSetOf<String>()
         private var turnCount = 0
-        private var deleted = false
+        private val deletedConversations = mutableSetOf<String>()
+        private val messageOwners = mutableMapOf<String, String>()
 
         override fun observeConversations(): Flow<List<Conversation>> = conversations
         override fun observeMessages(conversationId: String): Flow<List<Message>> = messages(conversationId)
@@ -395,6 +481,8 @@ class AppViewModelTest {
             turnCount += 1
             val userId = "user-$turnCount"
             val assistantId = "assistant-$turnCount"
+            messageOwners[userId] = id
+            messageOwners[assistantId] = id
             if (conversations.value.none { it.id == id }) addConversation(id)
             val existing = messages(id).value
             messages(id).value = existing +
@@ -404,7 +492,7 @@ class AppViewModelTest {
         }
 
         override suspend fun checkpointAssistant(messageId: String, text: String) {
-            check(!deleted) { "checkpoint after delete" }
+            check(messageConversation(messageId) !in deletedConversations) { "checkpoint after delete" }
             checkpoints += text
             updateAssistant(messageId, text, "STREAMING")
         }
@@ -419,15 +507,16 @@ class AppViewModelTest {
         }
 
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) {
-            check(!deleted) { "interrupt after delete" }
+            check(messageConversation(messageId) !in deletedConversations) { "interrupt after delete" }
             lifecycleEvents += "interrupt:$messageId"
             interruptedText = partialText
             updateAssistant(messageId, partialText, "INTERRUPTED")
         }
 
         override suspend fun deleteConversation(id: String) {
+            if (id in deleteFailures) throw IllegalStateException("fake delete failure")
             lifecycleEvents += "delete:$id"
-            deleted = true
+            deletedConversations += id
             conversations.value = conversations.value.filterNot { it.id == id }
             messageFlows.remove(id)
         }
@@ -438,6 +527,7 @@ class AppViewModelTest {
         }
 
         private fun messages(id: String) = messageFlows.getOrPut(id) { MutableStateFlow(emptyList()) }
+        private fun messageConversation(messageId: String): String? = messageOwners[messageId]
         private fun updateAssistant(messageId: String, text: String, status: String) {
             messageFlows.values.forEach { messageFlow ->
                 messageFlow.value = messageFlow.value.map {
