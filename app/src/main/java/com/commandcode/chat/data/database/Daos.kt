@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.Flow
     @Insert fun insert(value: ConversationEntity)
     @Query("SELECT * FROM conversations ORDER BY updatedAt DESC") fun observeAll(): Flow<List<ConversationEntity>>
     @Query("SELECT * FROM conversations WHERE id = :id") fun find(id: String): ConversationEntity?
+    @Query("UPDATE conversations SET updatedAt = :updatedAt WHERE id = :id") fun touch(id: String, updatedAt: Long)
     @Delete fun delete(value: ConversationEntity)
 }
 
