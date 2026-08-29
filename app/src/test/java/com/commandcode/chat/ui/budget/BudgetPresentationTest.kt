@@ -22,4 +22,10 @@ class BudgetPresentationTest {
 
         assertEquals(0, BigDecimal("4").compareTo(equivalentRemaining(window, ChatModel.LUNA)))
     }
+
+    @Test
+    fun equivalentLabelDescribesEstimatedSelectedModelUsageWithoutCredits() {
+        assertEquals("$14 estimated GPT-5.6 Sol usage", equivalentRemainingLabel(BigDecimal("14"), ChatModel.SOL))
+        assertEquals("$4 estimated GPT-5.6 Luna usage", equivalentRemainingLabel(BigDecimal("4.0"), ChatModel.LUNA))
+    }
 }

@@ -17,6 +17,7 @@ import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.KeyRecoveryRequired
+import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
 import com.commandcode.chat.domain.UsageEvent
@@ -148,8 +149,12 @@ class AppViewModel(
 
     fun clearApiKey() {
         cancel()
-        secrets.clearApiKey()
-        mutableState.value = mutableState.value.copy(keyConfigured = false, errorMessage = null)
+        try {
+            secrets.clearApiKey()
+            mutableState.value = mutableState.value.copy(keyConfigured = false, errorMessage = null)
+        } catch (_: SecureStoragePersistenceFailure) {
+            mutableState.value = mutableState.value.copy(errorMessage = API_KEY_CLEAR_FAILURE_MESSAGE)
+        }
     }
 
     fun setZdr(enabled: Boolean) {
@@ -403,6 +408,7 @@ class AppViewModel(
         private const val CHECKPOINT_CHARS = 1_024
         private const val BILLING_DAY_ERROR = "Billing day must be from 1 to 31"
         private const val API_KEY_RECOVERY_MESSAGE = "The encrypted API key cannot be opened. Recovery is required."
+        private const val API_KEY_CLEAR_FAILURE_MESSAGE = "API key could not be cleared. Try again."
 
         fun factory(container: AppContainer): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

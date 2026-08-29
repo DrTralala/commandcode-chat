@@ -4,6 +4,9 @@ import android.content.Context
 import android.util.Base64
 import org.json.JSONObject
 
+class SecureStoragePersistenceFailure(cause: Throwable? = null) :
+    IllegalStateException("Secure storage update failed", cause)
+
 data class EncryptedBlob(val version: Int, val nonceBase64: String, val ciphertextBase64: String) {
     fun encode(): String = JSONObject().put("version", version).put("nonceBase64", nonceBase64)
         .put("ciphertextBase64", ciphertextBase64).toString()
@@ -20,13 +23,11 @@ open class EncryptedBlobStore(context: Context, private val name: String = "secu
     private val preferences = context.getSharedPreferences(name, Context.MODE_PRIVATE)
 
     open fun put(key: String, blob: EncryptedBlob) {
-        check(preferences.edit().putString(key, blob.encode()).commit()) {
-            "Encrypted wrapper could not be persisted"
-        }
+        if (!preferences.edit().putString(key, blob.encode()).commit()) throw SecureStoragePersistenceFailure()
     }
     fun get(key: String): EncryptedBlob? = preferences.getString(key, null)?.let(EncryptedBlob::decode)
     fun remove(key: String) {
-        check(preferences.edit().remove(key).commit()) { "Encrypted wrapper could not be removed" }
+        if (!preferences.edit().remove(key).commit()) throw SecureStoragePersistenceFailure()
     }
     fun rawValue(key: String): String? = preferences.getString(key, null)
     fun allRawValues(): Map<String, *> = preferences.all

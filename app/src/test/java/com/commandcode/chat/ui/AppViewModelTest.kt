@@ -10,6 +10,7 @@ import com.commandcode.chat.data.commandcode.StreamEvent
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
+import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
 import com.commandcode.chat.domain.UsageEvent
@@ -403,6 +404,18 @@ class AppViewModelTest {
     }
 
     @Test
+    fun checkedStoreRemovalFailureRetainsConfiguredKeyAndUsesSafeError() = runTest(dispatcher) {
+        val keys = FakeKeys(removeFailure = true)
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), keys = keys)
+        configureKey(viewModel)
+
+        viewModel.clearApiKey()
+
+        assertTrue(viewModel.state.value.keyConfigured)
+        assertEquals("API key could not be cleared. Try again.", viewModel.state.value.errorMessage)
+    }
+
+    @Test
     fun billingBoundsRejectZeroAndThirtyTwo() = runTest(dispatcher) {
         val viewModel = viewModel(FakeChats(), successfulSource("unused"))
         runCurrent()
@@ -463,7 +476,10 @@ class AppViewModelTest {
         budgetTicks = budgetTicks,
     )
 
-    private class FakeKeys(private val readFailure: Boolean = false) : ApiKeyStore {
+    private class FakeKeys(
+        private val readFailure: Boolean = false,
+        private val removeFailure: Boolean = false,
+    ) : ApiKeyStore {
         private var key: CharArray? = null
         val returnedKeys = mutableListOf<CharArray>()
         override fun saveApiKey(value: CharArray) { key = value.copyOf() }
@@ -471,7 +487,11 @@ class AppViewModelTest {
             if (readFailure) throw com.commandcode.chat.data.security.KeyRecoveryRequired()
             return key?.copyOf()?.also(returnedKeys::add)
         }
-        override fun clearApiKey() { key?.fill('\u0000'); key = null }
+        override fun clearApiKey() {
+            if (removeFailure) throw SecureStoragePersistenceFailure(IllegalStateException("scripted sensitive detail"))
+            key?.fill('\u0000')
+            key = null
+        }
     }
 
     private class FakeSettings : SettingsStore {

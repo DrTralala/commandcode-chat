@@ -43,8 +43,7 @@ private fun BudgetCard(label: String, window: BudgetWindow, selectedModel: ChatM
             Text(label, style = MaterialTheme.typography.titleMedium)
             Text("${window.usedCredits.toPlainString()} / ${window.capCredits.toPlainString()} credits", fontFamily = FontFamily.Monospace)
             Text(
-                "Estimated app-local ${selectedModel.displayName} equivalent remaining: " +
-                    "${equivalentRemaining(window, selectedModel).stripTrailingZeros().toPlainString()} credits",
+                equivalentRemainingLabel(equivalentRemaining(window, selectedModel), selectedModel),
                 style = MaterialTheme.typography.bodySmall,
             )
             LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
@@ -56,3 +55,6 @@ private fun BudgetCard(label: String, window: BudgetWindow, selectedModel: ChatM
 internal fun equivalentRemaining(window: BudgetWindow, model: ChatModel): BigDecimal =
     window.capCredits.subtract(window.usedCredits).max(BigDecimal.ZERO)
         .divide(model.goatMultiplier, MathContext.DECIMAL128)
+
+internal fun equivalentRemainingLabel(value: BigDecimal, model: ChatModel): String =
+    "\$${value.stripTrailingZeros().toPlainString()} estimated ${model.displayName} usage"

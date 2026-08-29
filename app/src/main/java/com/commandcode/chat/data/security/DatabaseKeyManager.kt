@@ -17,15 +17,29 @@ class DatabaseKeyManager(
         return try { block(passphrase) } finally { passphrase.fill(0) }
     }
 
-    fun initialiseIfMissing() {
-        if (store.rawValue(blobKey) != null) return
+    fun initialiseIfMissing() = cipher.serialiseAliasInitialisation {
+        if (store.rawValue(blobKey) != null) return@serialiseAliasInitialisation
         val generated = ByteArray(32)
+        val aliasExisted = cipher.hasAlias(alias)
+        var createdAlias = false
         try {
             java.security.SecureRandom().nextBytes(generated)
-            cipher.encrypt(alias, generated).also { store.put(blobKey, it) }
+            val blob = cipher.encrypt(alias, generated)
+            createdAlias = !aliasExisted
+            store.put(blobKey, blob)
         } catch (error: Exception) {
+            if (!aliasExisted && cipher.hasAlias(alias)) createdAlias = true
+            if (createdAlias) {
+                try {
+                    cipher.deleteAlias(alias)
+                } catch (cleanupError: Exception) {
+                    error.addSuppressed(cleanupError)
+                }
+            }
             throw DatabaseRecoveryRequired("Database key wrapper could not be persisted", error)
-        } finally { generated.fill(0) }
+        } finally {
+            generated.fill(0)
+        }
     }
 
     companion object { const val DB_ALIAS = "commandcode-db-key-v1"; private const val DB_KEY = "databaseKey" }

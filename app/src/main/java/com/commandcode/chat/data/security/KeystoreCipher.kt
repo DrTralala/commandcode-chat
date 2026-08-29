@@ -10,9 +10,11 @@ import javax.crypto.spec.GCMParameterSpec
 
 class KeystoreCipher {
     fun encrypt(alias: String, plaintext: ByteArray): EncryptedBlob {
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey(alias))
-        return EncryptedBlob(1, Base64.encodeToString(cipher.iv, Base64.NO_WRAP), Base64.encodeToString(cipher.doFinal(plaintext), Base64.NO_WRAP))
+        return synchronized(KEYSTORE_LOCK) {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey(alias))
+            EncryptedBlob(1, Base64.encodeToString(cipher.iv, Base64.NO_WRAP), Base64.encodeToString(cipher.doFinal(plaintext), Base64.NO_WRAP))
+        }
     }
 
     fun decrypt(alias: String, blob: EncryptedBlob): ByteArray {
@@ -40,5 +42,20 @@ class KeystoreCipher {
         return checkNotNull(store.getKey(alias, null)) { "Keystore key is unavailable" }
     }
 
-    companion object { private const val TRANSFORMATION = "AES/GCM/NoPadding" }
+    internal fun <T> serialiseAliasInitialisation(block: () -> T): T = synchronized(KEYSTORE_LOCK) { block() }
+
+    internal fun hasAlias(alias: String): Boolean =
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.containsAlias(alias)
+
+    internal fun deleteAlias(alias: String) {
+        KeyStore.getInstance("AndroidKeyStore").apply {
+            load(null)
+            if (containsAlias(alias)) deleteEntry(alias)
+        }
+    }
+
+    companion object {
+        private const val TRANSFORMATION = "AES/GCM/NoPadding"
+        private val KEYSTORE_LOCK = Any()
+    }
 }

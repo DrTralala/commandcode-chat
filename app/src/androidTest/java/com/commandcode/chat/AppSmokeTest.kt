@@ -82,7 +82,7 @@ class AppSmokeTest {
         compose.onNodeWithTag("bottom_navigation").assertIsDisplayed()
         compose.onNodeWithText("Secure chat").assertIsDisplayed()
         compose.onNodeWithTag("nav_budget").performClick()
-        compose.onNodeWithText("Estimated app-local GPT-5.6 Sol equivalent remaining: 14 credits").assertIsDisplayed()
+        compose.onNodeWithText("$14 estimated GPT-5.6 Sol usage").assertIsDisplayed()
         compose.onNodeWithTag("nav_chat").performClick()
         compose.onNodeWithTag("model_selector").performClick()
         compose.onAllNodes(SemanticsMatcher("actual model options") { node ->
@@ -108,7 +108,7 @@ class AppSmokeTest {
         }
         compose.onNodeWithTag("nav_budget").performClick()
         compose.onNodeWithText("Estimated from this app").assertIsDisplayed()
-        compose.onNodeWithText("Estimated app-local GPT-5.6 Luna equivalent remaining: 4 credits").assertIsDisplayed()
+        compose.onNodeWithText("$4 estimated GPT-5.6 Luna usage").assertIsDisplayed()
         compose.onNodeWithTag("nav_settings").performClick()
         compose.onNodeWithText("API key configured").assertIsDisplayed()
         compose.onNodeWithContentDescription("Zero data retention").performClick().assertIsOff()

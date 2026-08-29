@@ -8,6 +8,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.data.security.DatabaseKeyManager
 import com.commandcode.chat.data.security.EncryptedBlobStore
 import com.commandcode.chat.data.security.DatabaseRecoveryRequired
+import com.commandcode.chat.data.security.KeystoreCipher
 import org.junit.Test
 import org.junit.Assert.*
 import org.junit.runner.RunWith
@@ -110,6 +111,39 @@ class EncryptedDatabaseTest {
                 ChatDatabase.open(context, keyManager, databaseName)
             }
             assertFalse(context.getDatabasePath(databaseName).exists())
+            assertNull(store.rawValue(blobKey))
+            assertFalse(hasAlias(alias))
+        } finally {
+            context.deleteDatabase(databaseName)
+            deleteAlias(alias)
+            context.deleteSharedPreferences(storageName)
+        }
+    }
+
+    @Test fun failedWrapperPersistenceDoesNotRemovePreExistingAlias() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val suffix = UUID.randomUUID().toString()
+        val databaseName = "chat-failed-wrapper-existing-alias-$suffix.db"
+        val storageName = "test-failed-wrapper-existing-alias-$suffix"
+        val alias = "commandcode-test-db-existing-$suffix"
+        val blobKey = "databaseKey-$suffix"
+        val store = object : EncryptedBlobStore(context, storageName) {
+            override fun put(key: String, blob: com.commandcode.chat.data.security.EncryptedBlob) {
+                throw IllegalStateException("scripted checked persistence failure")
+            }
+        }
+        val keyManager = DatabaseKeyManager(store, alias = alias, blobKey = blobKey)
+        try {
+            KeystoreCipher().encrypt(alias, ByteArray(32))
+            assertTrue(hasAlias(alias))
+
+            assertThrows(DatabaseRecoveryRequired::class.java) {
+                ChatDatabase.open(context, keyManager, databaseName)
+            }
+
+            assertFalse(context.getDatabasePath(databaseName).exists())
+            assertNull(store.rawValue(blobKey))
+            assertTrue(hasAlias(alias))
         } finally {
             context.deleteDatabase(databaseName)
             deleteAlias(alias)
@@ -167,6 +201,9 @@ class EncryptedDatabaseTest {
         }
 
     private companion object {
+        fun hasAlias(alias: String): Boolean =
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.containsAlias(alias)
+
         fun deleteAlias(alias: String) {
             KeyStore.getInstance("AndroidKeyStore").apply {
                 load(null)
