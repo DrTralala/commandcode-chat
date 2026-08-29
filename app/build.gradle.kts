@@ -30,35 +30,17 @@ android {
 
 configurations.configureEach {
     resolutionStrategy {
-        force(
-            "androidx.compose.animation:animation-core:1.9.0",
-            "androidx.compose.animation:animation-core-android:1.9.0",
-            "androidx.compose.animation:animation:1.9.0",
-            "androidx.compose.animation:animation-android:1.9.0",
-            "androidx.compose.foundation:foundation:1.9.0",
-            "androidx.compose.foundation:foundation-android:1.9.0",
-            "androidx.compose.foundation:foundation-layout:1.9.0",
-            "androidx.compose.foundation:foundation-layout-android:1.9.0",
-            "androidx.compose.runtime:runtime:1.9.0",
-            "androidx.compose.runtime:runtime-android:1.9.0",
-            "androidx.compose.runtime:runtime-saveable:1.9.0",
-            "androidx.compose.runtime:runtime-saveable-android:1.9.0",
-            "androidx.compose.ui:ui:1.9.0",
-            "androidx.compose.ui:ui-android:1.9.0",
-            "androidx.compose.ui:ui-graphics:1.9.0",
-            "androidx.compose.ui:ui-graphics-android:1.9.0",
-            "androidx.compose.ui:ui-text:1.9.0",
-            "androidx.compose.ui:ui-text-android:1.9.0",
-            "androidx.compose.ui:ui-tooling:1.9.0",
-            "androidx.compose.ui:ui-tooling-android:1.9.0",
-            "androidx.compose.ui:ui-tooling-data:1.9.0",
-            "androidx.compose.ui:ui-tooling-data-android:1.9.0",
-            "androidx.compose.ui:ui-tooling-preview:1.9.0",
-            "androidx.compose.material:material-ripple:1.9.0",
-            "androidx.compose.material:material-ripple-android:1.9.0",
-            "androidx.compose.material:material:1.9.0",
-            "androidx.compose.material:material-android:1.9.0",
-        )
+        eachDependency {
+            if (requested.group.startsWith("androidx.compose") && requested.name != "compose-bom") {
+                val version = when {
+                    requested.group == "androidx.compose.material3" -> "1.3.2"
+                    requested.group == "androidx.compose.material" && requested.name.startsWith("material-icons-core") -> "1.6.0"
+                    else -> "1.9.0"
+                }
+                useVersion(version)
+                because("Keep every Compose artefact on one AGP 8.13.2-compatible family")
+            }
+        }
     }
 }
 
@@ -73,4 +55,28 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.2")
     debugImplementation("androidx.compose.ui:ui-tooling:1.9.0")
     testImplementation("junit:junit:4.13.2")
+}
+
+tasks.register("verifyComposeDependencyFamily") {
+    group = "verification"
+    description = "Fails if resolved Compose artefacts drift into incompatible families."
+    doLast {
+        val unexpected = configurations.getByName("debugRuntimeClasspath").incoming.resolutionResult.allComponents
+            .mapNotNull { component ->
+                val id = component.moduleVersion ?: return@mapNotNull null
+                when {
+                    id.group == "androidx.compose" && id.name == "compose-bom" && id.version != "2026.08.00" ->
+                        "${id.group}:${id.name}:${id.version}"
+                    id.group == "androidx.compose.material" && id.name == "material-icons-core" && id.version != "1.6.0" ->
+                        "${id.group}:${id.name}:${id.version}"
+                    id.group == "androidx.compose.material3" && id.version != "1.3.2" ->
+                        "${id.group}:${id.name}:${id.version}"
+                    else -> null
+                }
+            }
+            .toSet()
+        check(unexpected.isEmpty()) {
+            "Mixed Compose dependency family detected: ${unexpected.sorted().joinToString()}."
+        }
+    }
 }
