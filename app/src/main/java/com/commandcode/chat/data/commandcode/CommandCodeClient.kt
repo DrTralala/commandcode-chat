@@ -3,7 +3,6 @@ package com.commandcode.chat.data.commandcode
 import com.commandcode.chat.domain.ChatModel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
@@ -13,7 +12,9 @@ import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okio.Buffer
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 sealed class CommandCodeException(message: String? = null) : IOException(message) {
     class Unauthorized : CommandCodeException("Invalid or expired API key")
@@ -32,7 +33,7 @@ class CommandCodeClient(
         var keyBytes: ByteArray? = null
         val request = try {
             keyBytes = keyChars.concatToString().toByteArray(Charsets.UTF_8)
-            buildRequest(keyBytes!!.toString(Charsets.UTF_8), model, messages, zdr, endpoint)
+            buildRequest(keyBytes.toString(Charsets.UTF_8), model, messages, zdr, endpoint)
         } finally {
             keyChars.fill('\u0000'); keyBytes?.fill(0)
         }
@@ -40,11 +41,19 @@ class CommandCodeClient(
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { close(e) }
             override fun onResponse(call: Call, response: Response) {
-                launch(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
-                    response.use {
-                        if (!response.isSuccessful) {
+                val owner = ResponseOwner(response)
+                val readerStarted = AtomicBoolean(false)
+                val reader = launch(Dispatchers.IO) {
+                    readerStarted.set(true)
+                    owner.use { ownedResponse ->
+                        if (!ownedResponse.isSuccessful) {
                             try {
-                                close(responseException(response.code, response.body?.string()))
+                                val bodyPrefix = if (ownedResponse.code == 422) {
+                                    readBoundedErrorBody(ownedResponse)
+                                } else {
+                                    null
+                                }
+                                close(responseException(ownedResponse.code, bodyPrefix))
                             } catch (e: IOException) {
                                 close(e)
                             }
@@ -53,7 +62,7 @@ class CommandCodeClient(
                         val parser = SseParser()
                         try {
                             withContext(Dispatchers.IO) {
-                                response.body!!.source().use { source ->
+                                ownedResponse.body.source().use { source ->
                                     var done = false
                                     while (!done && !source.exhausted()) {
                                         for (event in parser.acceptLine(source.readUtf8Line() ?: "")) {
@@ -67,6 +76,9 @@ class CommandCodeClient(
                             close()
                         } catch (e: IOException) { close(e) }
                     }
+                }
+                reader.invokeOnCompletion {
+                    if (!readerStarted.get()) owner.close()
                 }
             }
         })
@@ -88,6 +100,35 @@ class CommandCodeClient(
             code == 429 -> CommandCodeException.RateLimited()
             code in 500..599 -> CommandCodeException.ServerFailure()
             else -> CommandCodeException.ServerFailure()
+        }
+
+        private fun readBoundedErrorBody(response: Response): String? {
+            val source = response.body.source()
+            val buffer = Buffer()
+            var remaining = MAX_ERROR_BODY_BYTES
+            while (remaining > 0L) {
+                val read = source.read(buffer, minOf(remaining, 8_192L))
+                if (read == -1L) break
+                remaining -= read
+            }
+            return buffer.readUtf8()
+        }
+
+        private const val MAX_ERROR_BODY_BYTES = 16_384L
+    }
+
+    private class ResponseOwner(private val response: Response) {
+        private val closed = AtomicBoolean(false)
+
+        suspend fun <T> use(block: suspend (Response) -> T): T =
+            try {
+                block(response)
+            } finally {
+                close()
+            }
+
+        fun close() {
+            if (closed.compareAndSet(false, true)) response.close()
         }
     }
 }

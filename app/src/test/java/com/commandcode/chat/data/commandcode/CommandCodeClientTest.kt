@@ -25,6 +25,7 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import okio.BufferedSource
 import okio.Source
@@ -112,6 +113,24 @@ class CommandCodeClientTest {
         assertTrue(call.isCanceled())
     }
 
+    @Test fun `response delivered after collector cancellation is closed exactly once`() = runBlocking {
+        val body = CloseTrackingResponseBody("data: [DONE]\n\n")
+        val factory = RecordingCallFactory()
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            CommandCodeClient(callFactory = factory)
+                .stream(charArrayOf('k'), ChatModel.SOL, emptyList())
+                .collect { }
+        }
+        val call = factory.awaitCall()
+
+        withTimeout(2_000) { job.cancelAndJoin() }
+        call.respond(response(call.request(), 200, body))
+        assertTrue(body.awaitClosed())
+
+        assertEquals(1, call.cancelCount)
+        assertEquals(1, body.closeCount)
+    }
+
     @Test fun `cancellation after response delivery closes delivered response body`() = runBlocking {
         val body = BlockingTrackingResponseBody()
         val factory = RecordingCallFactory { body.releaseRead() }
@@ -161,7 +180,7 @@ class CommandCodeClientTest {
         }
     }
 
-    @Test fun `error body read failure closes response without leaking body content`() = runBlocking {
+    @Test fun `non-zdr status does not read or leak error body content`() = runBlocking {
         val secret = "SENTINEL_SECRET_RESPONSE_BODY"
         val body = ThrowingTrackingResponseBody(secret)
         val factory = RecordingCallFactory()
@@ -178,10 +197,32 @@ class CommandCodeClientTest {
         call.respond(response(call.request(), 401, body))
         val failure = result.await().exceptionOrNull()
 
-        assertEquals(IOException::class.java, failure?.javaClass)
-        assertEquals("scripted response read failure", failure?.message)
+        assertEquals(CommandCodeException.Unauthorized::class.java, failure?.javaClass)
         assertFalse(failure.toString().contains(secret))
         assertTrue(body.closed)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test fun `zdr error identification reads only bounded body prefix`() = runBlocking {
+        val body = LargeTrackingResponseBody(
+            "{\"code\":\"cmd_zdr_no_providers\"}" + "x".repeat(1_000_000),
+        )
+        val factory = RecordingCallFactory()
+        val result = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching {
+                withTimeout(2_000) {
+                    CommandCodeClient(callFactory = factory)
+                        .stream(charArrayOf('k'), ChatModel.SOL, emptyList())
+                        .toList()
+                }
+            }
+        }
+        val call = factory.awaitCall()
+
+        call.respond(response(call.request(), 422, body))
+
+        assertEquals(CommandCodeException.ZdrUnavailable::class.java, result.await().exceptionOrNull()?.javaClass)
+        assertTrue("read ${body.bytesRead} bytes", body.bytesRead <= 16_384L)
         assertEquals(1, body.closeCount)
     }
 
@@ -307,6 +348,54 @@ class CommandCodeClientTest {
         }
     }
 
+    private class CloseTrackingResponseBody(content: String) : ResponseBody() {
+        private val closedLatch = CountDownLatch(1)
+        private val buffer = Buffer().writeUtf8(content)
+        @Volatile var closeCount = 0
+            private set
+
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = buffer.size
+        override fun source(): BufferedSource = buffer
+        override fun close() {
+            closeCount++
+            closedLatch.countDown()
+            super.close()
+        }
+
+        fun awaitClosed(): Boolean = closedLatch.await(2, TimeUnit.SECONDS)
+    }
+
+    private class LargeTrackingResponseBody(content: String) : ResponseBody() {
+        private val bytes = content.toByteArray()
+        private var offset = 0
+        @Volatile var bytesRead = 0L
+            private set
+        @Volatile var closeCount = 0
+            private set
+        private val responseSource = object : Source {
+            override fun read(sink: Buffer, byteCount: Long): Long {
+                if (offset == bytes.size) return -1
+                val count = minOf(byteCount.toInt(), bytes.size - offset)
+                sink.write(bytes, offset, count)
+                offset += count
+                bytesRead += count
+                return count.toLong()
+            }
+
+            override fun timeout(): Timeout = Timeout.NONE
+            override fun close() = Unit
+        }.buffer()
+
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = bytes.size.toLong()
+        override fun source(): BufferedSource = responseSource
+        override fun close() {
+            closeCount++
+            super.close()
+        }
+    }
+
     private fun response(request: Request, code: Int, body: ResponseBody): Response =
         Response.Builder()
             .request(request)
@@ -316,6 +405,4 @@ class CommandCodeClientTest {
             .body(body)
             .build()
 
-    private fun String.toResponseBody(): ResponseBody =
-        ResponseBody.create(null, this)
 }
