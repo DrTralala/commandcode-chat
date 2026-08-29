@@ -15,6 +15,8 @@ class KeystoreCipher {
         return EncryptedBlob(1, Base64.encodeToString(cipher.iv, Base64.NO_WRAP), Base64.encodeToString(cipher.doFinal(plaintext), Base64.NO_WRAP))
     }
 
+    fun hasKey(alias: String): Boolean = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.containsAlias(alias)
+
     fun decrypt(alias: String, blob: EncryptedBlob): ByteArray {
         require(blob.version == 1) { "Unsupported encrypted blob version" }
         val cipher = Cipher.getInstance(TRANSFORMATION)

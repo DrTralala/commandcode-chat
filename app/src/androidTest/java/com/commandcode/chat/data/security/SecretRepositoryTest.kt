@@ -15,7 +15,7 @@ class SecretRepositoryTest {
         val repository = SecretRepository(store)
         repository.clearApiKey()
         repository.saveApiKey("fake-test-key".toCharArray())
-        assertFalse(store.rawValue("apiKey").orEmpty().contains("fake-test-key"))
+        assertFalse(store.allRawValues().values.any { it.toString().contains("fake-test-key") })
         assertArrayEquals("fake-test-key".toCharArray(), repository.readApiKey())
         repository.clearApiKey()
         assertNull(store.rawValue("apiKey"))

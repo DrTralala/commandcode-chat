@@ -23,4 +23,5 @@ class EncryptedBlobStore(context: Context, private val name: String = "secure_se
     fun get(key: String): EncryptedBlob? = preferences.getString(key, null)?.let(EncryptedBlob::decode)
     fun remove(key: String) { preferences.edit().remove(key).apply() }
     fun rawValue(key: String): String? = preferences.getString(key, null)
+    fun allRawValues(): Map<String, *> = preferences.all
 }

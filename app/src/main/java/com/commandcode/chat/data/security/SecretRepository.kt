@@ -13,8 +13,10 @@ class SecretRepository(
 
     fun readApiKey(): CharArray? {
         val blob = try { store.get(API_KEY) } catch (error: Exception) { throw KeyRecoveryRequired(error) } ?: return null
-        return try { cipher.decrypt(API_ALIAS, blob).toString(Charsets.UTF_8).toCharArray() }
+        if (!cipher.hasKey(API_ALIAS)) throw KeyRecoveryRequired()
+        val plaintext = try { cipher.decrypt(API_ALIAS, blob) }
         catch (error: Exception) { throw KeyRecoveryRequired(error) }
+        return try { plaintext.toString(Charsets.UTF_8).toCharArray() } finally { plaintext.fill(0) }
     }
 
     fun clearApiKey() = store.remove(API_KEY)

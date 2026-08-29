@@ -5,6 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import com.commandcode.chat.data.security.DatabaseKeyManager
+import com.commandcode.chat.data.security.DatabaseRecoveryRequired
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 
 @Database(entities = [ConversationEntity::class, MessageEntity::class, UsageEventEntity::class], version = 1, exportSchema = true)
@@ -16,13 +17,21 @@ abstract class ChatDatabase : RoomDatabase() {
     companion object {
         fun open(context: Context, keyManager: DatabaseKeyManager): ChatDatabase {
             System.loadLibrary("sqlcipher")
+            if (!context.getDatabasePath("chat.db").exists()) keyManager.initialiseIfMissing()
             return keyManager.withPassphrase { passphrase ->
-                val database = Room.databaseBuilder(context, ChatDatabase::class.java, "chat.db")
-                    .openHelperFactory(SupportOpenHelperFactory(passphrase))
-                    .fallbackToDestructiveMigration(false)
+                try {
+                    // SQLCipher 4.18.0's factory retains the supplied array and exposes no
+                    // clearing/close hook for it. Give it its own lifetime-managed copy; the
+                    // manager clears the temporary decrypted array after Room consumes it.
+                    val factoryPassphrase = passphrase.copyOf()
+                    val database = Room.databaseBuilder(context, ChatDatabase::class.java, "chat.db")
+                    .openHelperFactory(SupportOpenHelperFactory(factoryPassphrase))
                     .build()
-                database.openHelper.writableDatabase
-                database
+                    database.openHelper.writableDatabase
+                    database
+                } catch (error: Exception) {
+                    throw DatabaseRecoveryRequired("Encrypted database requires recovery", error)
+                }
             }
         }
     }
