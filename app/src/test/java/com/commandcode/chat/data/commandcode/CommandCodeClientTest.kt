@@ -3,6 +3,7 @@ package com.commandcode.chat.data.commandcode
 import com.commandcode.chat.domain.ChatModel
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import org.junit.Assert.assertEquals
@@ -29,8 +30,32 @@ class CommandCodeClientTest {
         server.enqueue(MockResponse(body = body))
         server.start()
         try {
-            val events = CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).toList()
+            val events = withTimeout(2_000) { CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).toList() }
             assertEquals(101, events.size)
+        } finally { server.close() }
+    }
+
+    @Test fun `required statuses map to distinct exceptions`() = runBlocking {
+        val cases = listOf(401 to CommandCodeException.Unauthorized::class, 403 to CommandCodeException.Forbidden::class,
+            422 to CommandCodeException.ZdrUnavailable::class, 429 to CommandCodeException.RateLimited::class, 500 to CommandCodeException.ServerFailure::class)
+        val server = MockWebServer()
+        cases.forEach { (code, _) -> server.enqueue(MockResponse(code = code, body = if (code == 422) "cmd_zdr_no_providers" else "safe")) }
+        server.start()
+        try {
+            cases.forEach { (_, type) ->
+                val failure = runCatching { withTimeout(2_000) { CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).toList() } }.exceptionOrNull()
+                assertTrue(type.isInstance(failure))
+            }
+        } finally { server.close() }
+    }
+
+    @Test fun `done completes while response remains open`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse.Builder().body("data: [DONE]\n\n").inTunnel().build())
+        server.start()
+        try {
+            val events = withTimeout(2_000) { CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).toList() }
+            assertEquals(listOf(StreamEvent.Done), events)
         } finally { server.close() }
     }
 }

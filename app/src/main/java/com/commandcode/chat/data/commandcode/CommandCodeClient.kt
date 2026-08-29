@@ -2,6 +2,7 @@ package com.commandcode.chat.data.commandcode
 
 import com.commandcode.chat.domain.ChatModel
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import okhttp3.Call
@@ -17,7 +18,6 @@ sealed class CommandCodeException(message: String? = null) : IOException(message
     class ZdrUnavailable : CommandCodeException("ZDR is unavailable")
     class RateLimited : CommandCodeException("Request rate or plan limit reached")
     class ServerFailure : CommandCodeException("Command Code service failure")
-    class StreamCancelled : CommandCodeException("Stream collector could not accept an event")
 }
 
 class CommandCodeClient(
@@ -34,35 +34,34 @@ class CommandCodeClient(
             keyChars.fill('\u0000'); keyBytes?.fill(0)
         }
         val call = httpClient.newCall(request)
-        fun emitEvent(event: StreamEvent) {
-            if (trySend(event).isFailure) close(CommandCodeException.StreamCancelled())
-        }
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { close(e) }
             override fun onResponse(call: Call, response: Response) {
-                response.use {
+                launch {
+                    response.use {
                     if (!response.isSuccessful) {
                         try {
                             close(responseException(response.code, response.body?.string()))
                         } catch (e: IOException) {
                             close(e)
                         }
-                        return
+                            return@use
                     }
-                    val parser = SseParser()
-                    try {
-                        response.body!!.source().use { source ->
-                            var done = false
-                            while (!done && !source.exhausted()) {
-                                for (event in parser.acceptLine(source.readUtf8Line() ?: "")) {
-                                    emitEvent(event)
-                                    if (event === StreamEvent.Done) { done = true; break }
+                        val parser = SseParser()
+                        try {
+                            response.body!!.source().use { source ->
+                                var done = false
+                                while (!done && !source.exhausted()) {
+                                    for (event in parser.acceptLine(source.readUtf8Line() ?: "")) {
+                                        send(event)
+                                        if (event === StreamEvent.Done) { done = true; break }
+                                    }
                                 }
+                                if (!done) for (event in parser.finish()) send(event)
                             }
-                            if (!done) parser.finish().forEach(::emitEvent)
-                        }
-                        close()
-                    } catch (e: IOException) { close(e) }
+                            close()
+                        } catch (e: IOException) { close(e) }
+                    }
                 }
             }
         })
