@@ -2,7 +2,10 @@ package com.commandcode.chat.data.commandcode
 
 import com.commandcode.chat.domain.ChatModel
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import okhttp3.Call
@@ -37,27 +40,29 @@ class CommandCodeClient(
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { close(e) }
             override fun onResponse(call: Call, response: Response) {
-                launch {
+                launch(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
                     response.use {
-                    if (!response.isSuccessful) {
-                        try {
-                            close(responseException(response.code, response.body?.string()))
-                        } catch (e: IOException) {
-                            close(e)
-                        }
+                        if (!response.isSuccessful) {
+                            try {
+                                close(responseException(response.code, response.body?.string()))
+                            } catch (e: IOException) {
+                                close(e)
+                            }
                             return@use
-                    }
+                        }
                         val parser = SseParser()
                         try {
-                            response.body!!.source().use { source ->
-                                var done = false
-                                while (!done && !source.exhausted()) {
-                                    for (event in parser.acceptLine(source.readUtf8Line() ?: "")) {
-                                        send(event)
-                                        if (event === StreamEvent.Done) { done = true; break }
+                            withContext(Dispatchers.IO) {
+                                response.body!!.source().use { source ->
+                                    var done = false
+                                    while (!done && !source.exhausted()) {
+                                        for (event in parser.acceptLine(source.readUtf8Line() ?: "")) {
+                                            send(event)
+                                            if (event === StreamEvent.Done) { done = true; break }
+                                        }
                                     }
+                                    if (!done) for (event in parser.finish()) send(event)
                                 }
-                                if (!done) for (event in parser.finish()) send(event)
                             }
                             close()
                         } catch (e: IOException) { close(e) }
