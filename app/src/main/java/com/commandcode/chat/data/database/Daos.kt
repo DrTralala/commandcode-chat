@@ -22,5 +22,5 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao interface UsageEventDao {
     @Insert fun insert(value: UsageEventEntity)
-    @Query("SELECT * FROM usage_events WHERE conversationId = :conversationId ORDER BY timestamp ASC") fun observeForConversation(conversationId: String): Flow<List<UsageEventEntity>>
+    @Query("SELECT * FROM usage_events WHERE conversationId = :conversationId ORDER BY timestamp ASC, id ASC") fun observeForConversation(conversationId: String): Flow<List<UsageEventEntity>>
 }

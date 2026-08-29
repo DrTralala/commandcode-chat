@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.After
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -90,6 +91,9 @@ class ChatRepositoryTest {
         assertEquals("INTERRUPTED", assistant.status)
         assertEquals("partial", assistant.content)
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > before)
+        repository.completeTurn(turn.assistantMessageId, "late", TokenUsage(1, 0, 1))
+        assertEquals("partial", database.messages().find(turn.assistantMessageId)?.content)
+        assertEquals(0, database.usageEvents().observeForConversation(turn.conversationId).first().size)
     }
 
     @Test
@@ -118,6 +122,27 @@ class ChatRepositoryTest {
         assertTrue(database.messages().find(turn.userMessageId) == null)
         assertTrue(database.messages().find(turn.assistantMessageId) == null)
         assertTrue(database.usageEvents().observeForConversation(turn.conversationId).first().isEmpty())
+    }
+
+    @Test
+    fun seededEqualTimestampsUseIdTieBreakers() = runTest {
+        val (_, database) = testRepository()
+        database.conversations().insert(ConversationEntity("b", "B", ChatModel.SOL.apiId, 1, 10))
+        database.conversations().insert(ConversationEntity("a", "A", ChatModel.SOL.apiId, 1, 10))
+        assertEquals(listOf("a", "b"), database.conversations().observeAll().first().map { it.id })
+        database.messages().insert(MessageEntity("b", "b", "USER", "b", null, 5, "COMPLETE"))
+        database.messages().insert(MessageEntity("a", "b", "USER", "a", null, 5, "COMPLETE"))
+        assertEquals(listOf("a", "b"), database.messages().observeForConversation("b").first().map { it.id })
+    }
+
+    @Test
+    fun timestampOverflowFailsAtomically() = runTest {
+        val (repository, database) = testRepository()
+        database.conversations().insert(ConversationEntity("boundary", "boundary", ChatModel.SOL.apiId, Long.MAX_VALUE, Long.MAX_VALUE))
+        database.messages().insert(MessageEntity("existing", "boundary", "USER", "existing", null, Long.MAX_VALUE, "COMPLETE"))
+        assertTrue(runCatching { repository.beginTurn("boundary", "overflow", ChatModel.SOL) }.exceptionOrNull() is IllegalStateException)
+        assertEquals(1, database.messages().observeForConversation("boundary").first().size)
+        assertNull(database.messages().find("overflow"))
     }
 
     private fun testRepository(): Pair<ChatRepository, ChatDatabase> {

@@ -50,19 +50,20 @@ class ChatRepository(private val database: ChatDatabase) {
     suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn =
         database.withTransaction {
             val id = conversationId ?: UUID.randomUUID().toString()
-            val now = nextTimestamp(System.currentTimeMillis(), database.messages().latestCreatedAt(id) ?: Long.MIN_VALUE)
+            val userAt = nextTimestamp(System.currentTimeMillis(), database.messages().latestCreatedAt(id) ?: Long.MIN_VALUE)
+            val assistantAt = nextTimestamp(userAt, userAt)
             if (conversationId == null) {
                 database.conversations().insert(
-                    ConversationEntity(id, titleFor(text), model.apiId, now, now + 1),
+                    ConversationEntity(id, titleFor(text), model.apiId, userAt, assistantAt),
                 )
             } else {
                 val conversation = database.conversations().find(id) ?: error("Conversation not found")
-                database.conversations().touch(id, nextTimestamp(now, conversation.updatedAt))
+                database.conversations().touch(id, maxOf(assistantAt, nextTimestamp(userAt, conversation.updatedAt)))
             }
             val userId = UUID.randomUUID().toString()
             val assistantId = UUID.randomUUID().toString()
-            database.messages().insert(MessageEntity(userId, id, Role.USER, text, null, now, Status.USER_COMPLETE))
-            database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, now + 1, Status.PENDING))
+            database.messages().insert(MessageEntity(userId, id, Role.USER, text, null, userAt, Status.USER_COMPLETE))
+            database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, assistantAt, Status.PENDING))
             PendingTurn(id, userId, assistantId)
         }
 
@@ -71,7 +72,7 @@ class ChatRepository(private val database: ChatDatabase) {
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?) {
         database.withTransaction {
             val assistant = assistant(messageId)
-            if (assistant.status == Status.COMPLETE) return@withTransaction
+            if (assistant.status == Status.COMPLETE || assistant.status == Status.INTERRUPTED) return@withTransaction
             check(assistant.status == Status.PENDING || assistant.status == Status.STREAMING) { "Assistant turn is terminal" }
             if (database.messages().updateIfStatus(messageId, assistant.status, text, Status.COMPLETE) == 0) return@withTransaction
             touchConversation(assistant.conversationId)
@@ -111,7 +112,10 @@ class ChatRepository(private val database: ChatDatabase) {
         database.conversations().touch(id, nextTimestamp(System.currentTimeMillis(), conversation.updatedAt))
     }
 
-    private fun nextTimestamp(now: Long, previous: Long): Long = maxOf(now, previous + 1)
+    private fun nextTimestamp(now: Long, previous: Long): Long {
+        check(previous < Long.MAX_VALUE) { "Timestamp space exhausted" }
+        return maxOf(now, previous + 1)
+    }
 
     private fun assistant(id: String): MessageEntity =
         database.messages().find(id)?.also { check(it.role == Role.ASSISTANT) { "Message is not an assistant turn" } }
