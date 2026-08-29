@@ -24,7 +24,7 @@ sealed class CommandCodeException(message: String? = null) : IOException(message
 }
 
 class CommandCodeClient(
-    private val httpClient: OkHttpClient = OkHttpClient(),
+    private val callFactory: Call.Factory = OkHttpClient(),
     private val endpoint: String = ENDPOINT,
 ) {
     fun stream(apiKey: CharArray, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean = true): Flow<StreamEvent> = callbackFlow {
@@ -36,7 +36,7 @@ class CommandCodeClient(
         } finally {
             keyChars.fill('\u0000'); keyBytes?.fill(0)
         }
-        val call = httpClient.newCall(request)
+        val call = callFactory.newCall(request)
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { close(e) }
             override fun onResponse(call: Call, response: Response) {

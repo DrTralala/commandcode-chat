@@ -1,30 +1,74 @@
 package com.commandcode.chat.data.commandcode
 
 import com.commandcode.chat.domain.ChatModel
-import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody
+import okio.Buffer
+import okio.BufferedSource
+import okio.Source
+import okio.Timeout
+import okio.buffer
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CommandCodeClientTest {
     @Test fun `default zdr and production request are sent through shared path`() = runBlocking {
-        val server = MockWebServer()
-        server.enqueue(MockResponse(body = "data: [DONE]\n\n"))
-        server.start()
-        try {
-            val events = CommandCodeClient(endpoint = server.url("/chat").toString()).stream(charArrayOf('k'), ChatModel.LUNA, listOf(ApiMessage("user", "x"))).toList()
-            val request = server.takeRequest()
-            assertEquals("1", request.headers["x-cmd-zdr"])
-            assertTrue(request.body?.utf8()?.contains("gpt-5.6-luna") == true)
-            assertEquals(listOf(StreamEvent.Done), events)
-        } finally { server.close() }
+        val factory = RecordingCallFactory()
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeout(2_000) {
+                CommandCodeClient(callFactory = factory)
+                    .stream(charArrayOf('k'), ChatModel.LUNA, listOf(ApiMessage("user", "x")))
+                    .toList()
+            }
+        }
+        val call = factory.awaitCall()
+        call.respond(response(call.request(), 200, "data: [DONE]\n\n".toResponseBody()))
+
+        assertEquals("https://api.commandcode.ai/provider/v1/chat/completions", call.request().url.toString())
+        assertEquals("1", call.request().header("x-cmd-zdr"))
+        val requestBody = Buffer().also { call.request().body?.writeTo(it) }.readUtf8()
+        assertTrue(requestBody.contains("gpt-5.6-luna"))
+        assertEquals(listOf(StreamEvent.Done), events.await())
+    }
+
+    @Test fun `explicit false zdr omits header from production stream request`() = runBlocking {
+        val factory = RecordingCallFactory()
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeout(2_000) {
+                CommandCodeClient(callFactory = factory)
+                    .stream(charArrayOf('k'), ChatModel.SOL, emptyList(), zdr = false)
+                    .toList()
+            }
+        }
+        val call = factory.awaitCall()
+        call.respond(response(call.request(), 200, "data: [DONE]\n\n".toResponseBody()))
+
+        assertFalse(call.request().headers.names().contains("x-cmd-zdr"))
+        assertEquals(listOf(StreamEvent.Done), events.await())
     }
 
     @Test fun `many events are retained`() = runBlocking {
@@ -38,7 +82,8 @@ class CommandCodeClientTest {
                 CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).collect { received += it; delay(1) }
                 received
             }
-            assertEquals(1_001, events.size)
+            val expected = (1..1_000).map { StreamEvent.Delta(it.toString()) } + StreamEvent.Done
+            assertEquals(expected, events)
         } finally { server.close() }
     }
 
@@ -52,30 +97,90 @@ class CommandCodeClientTest {
         } finally { server.close() }
     }
 
-    @Test fun `collector cancellation closes active request`() = runBlocking {
-        val server = MockWebServer()
-        server.enqueue(MockResponse.Builder().body("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n").bodyDelay(10, java.util.concurrent.TimeUnit.SECONDS).build())
-        server.start()
-        try {
-            val flow = CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList())
-            val job = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch { flow.collect { } }
-            withTimeout(2_000) { server.takeRequest() }
-            job.cancel(); job.join()
-        } finally { server.close() }
+    @Test fun `collector cancellation cancels the exact transport call`() = runBlocking {
+        val factory = RecordingCallFactory()
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            CommandCodeClient(callFactory = factory)
+                .stream(charArrayOf('k'), ChatModel.SOL, emptyList())
+                .collect { }
+        }
+        val call = factory.awaitCall()
+
+        withTimeout(2_000) { job.cancelAndJoin() }
+
+        assertEquals(1, call.cancelCount)
+        assertTrue(call.isCanceled())
+    }
+
+    @Test fun `cancellation after response delivery closes delivered response body`() = runBlocking {
+        val body = BlockingTrackingResponseBody()
+        val factory = RecordingCallFactory { body.releaseRead() }
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            CommandCodeClient(callFactory = factory)
+                .stream(charArrayOf('k'), ChatModel.SOL, emptyList())
+                .collect { }
+        }
+        val call = factory.awaitCall()
+        val responseDelivery = launch(Dispatchers.Default) {
+            call.respond(response(call.request(), 200, body))
+        }
+        assertTrue(body.awaitReadStarted())
+
+        withTimeout(2_000) { job.cancelAndJoin() }
+        withTimeout(2_000) { responseDelivery.join() }
+
+        assertEquals(1, call.cancelCount)
+        assertTrue(body.closed)
     }
 
     @Test fun `required statuses map to distinct exceptions`() = runBlocking {
-        val cases = listOf(401, 403, 422, 429, 500)
-        val server = MockWebServer()
-        cases.forEach { code -> server.enqueue(MockResponse(code = code, body = if (code == 422) "cmd_zdr_no_providers" else "safe")) }
-        server.start()
-        try {
-            cases.forEach { code ->
-                val failure = runCatching { withTimeout(2_000) { CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).toList() } }.exceptionOrNull()
-                assertTrue(failure is CommandCodeException)
-                assertTrue(failure!!.message!!.contains(if (code == 401) "Invalid" else if (code == 403) "forbidden" else if (code == 422) "ZDR" else if (code == 429) "limit" else "failure", ignoreCase = true))
+        val cases = listOf(
+            Triple(401, "safe", CommandCodeException.Unauthorized::class.java),
+            Triple(403, "safe", CommandCodeException.Forbidden::class.java),
+            Triple(422, "cmd_zdr_no_providers", CommandCodeException.ZdrUnavailable::class.java),
+            Triple(429, "safe", CommandCodeException.RateLimited::class.java),
+            Triple(503, "safe", CommandCodeException.ServerFailure::class.java),
+        )
+
+        cases.forEach { (code, body, expectedType) ->
+            val factory = RecordingCallFactory()
+            val result = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching {
+                    withTimeout(2_000) {
+                        CommandCodeClient(callFactory = factory)
+                            .stream(charArrayOf('k'), ChatModel.SOL, emptyList())
+                            .toList()
+                    }
+                }
             }
-        } finally { server.close() }
+            val call = factory.awaitCall()
+            call.respond(response(call.request(), code, body.toResponseBody()))
+
+            assertEquals(expectedType, result.await().exceptionOrNull()?.javaClass)
+        }
+    }
+
+    @Test fun `error body read failure closes response without leaking body content`() = runBlocking {
+        val secret = "SENTINEL_SECRET_RESPONSE_BODY"
+        val body = ThrowingTrackingResponseBody(secret)
+        val factory = RecordingCallFactory()
+        val result = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching {
+                withTimeout(2_000) {
+                    CommandCodeClient(callFactory = factory)
+                        .stream(charArrayOf('k'), ChatModel.SOL, emptyList())
+                        .toList()
+                }
+            }
+        }
+        val call = factory.awaitCall()
+        call.respond(response(call.request(), 401, body))
+        val failure = result.await().exceptionOrNull()
+
+        assertEquals(IOException::class.java, failure?.javaClass)
+        assertEquals("scripted response read failure", failure?.message)
+        assertFalse(failure.toString().contains(secret))
+        assertTrue(body.closed)
     }
 
     @Test fun `done completes while response remains open`() = runBlocking {
@@ -87,4 +192,116 @@ class CommandCodeClientTest {
             assertEquals(listOf(StreamEvent.Done), events)
         } finally { server.close() }
     }
+
+    private class RecordingCallFactory(
+        private val onCancel: () -> Unit = {},
+    ) : Call.Factory {
+        private val created = CountDownLatch(1)
+        @Volatile private var recordedCall: RecordingCall? = null
+
+        override fun newCall(request: Request): Call = RecordingCall(request, onCancel).also {
+            recordedCall = it
+            created.countDown()
+        }
+
+        suspend fun awaitCall(): RecordingCall = withContext(Dispatchers.IO) {
+            assertTrue("Call was not created", created.await(2, TimeUnit.SECONDS))
+            checkNotNull(recordedCall)
+        }
+    }
+
+    private class RecordingCall(
+        private val recordedRequest: Request,
+        private val onCancel: () -> Unit,
+    ) : Call by OkHttpClient().newCall(recordedRequest) {
+        private val enqueued = CountDownLatch(1)
+        @Volatile private var callback: Callback? = null
+        @Volatile var cancelCount: Int = 0
+            private set
+
+        override fun request(): Request = recordedRequest
+
+        override fun enqueue(responseCallback: Callback) {
+            callback = responseCallback
+            enqueued.countDown()
+        }
+
+        override fun cancel() {
+            cancelCount++
+            onCancel()
+        }
+
+        override fun isCanceled(): Boolean = cancelCount > 0
+
+        fun respond(response: Response) {
+            assertTrue("Call was not enqueued", enqueued.await(2, TimeUnit.SECONDS))
+            checkNotNull(callback).onResponse(this, response)
+        }
+    }
+
+    private class BlockingTrackingResponseBody : ResponseBody() {
+        private val readStarted = CountDownLatch(1)
+        private val readRelease = CountDownLatch(1)
+        @Volatile var closed: Boolean = false
+            private set
+        private val responseSource = object : Source {
+            override fun read(sink: Buffer, byteCount: Long): Long {
+                readStarted.countDown()
+                try {
+                    readRelease.await()
+                } catch (e: InterruptedException) {
+                    throw IOException("interrupted scripted read", e)
+                }
+                return -1
+            }
+
+            override fun timeout(): Timeout = Timeout.NONE
+            override fun close() { closed = true }
+        }.buffer()
+
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = -1
+        override fun source(): BufferedSource = responseSource
+
+        fun awaitReadStarted(): Boolean = readStarted.await(2, TimeUnit.SECONDS)
+        fun releaseRead() = readRelease.countDown()
+    }
+
+    private class ThrowingTrackingResponseBody(
+        private val secret: String,
+    ) : ResponseBody() {
+        @Volatile var closed: Boolean = false
+            private set
+        private val responseSource = object : Source {
+            private var secretEmitted = false
+
+            override fun read(sink: Buffer, byteCount: Long): Long {
+                if (!secretEmitted) {
+                    secretEmitted = true
+                    sink.writeUtf8(secret)
+                    return secret.toByteArray().size.toLong()
+                }
+                throw IOException("scripted response read failure")
+            }
+
+            override fun timeout(): Timeout = Timeout.NONE
+            override fun close() { closed = true }
+        }.buffer()
+
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = secret.length.toLong()
+        override fun source(): BufferedSource = responseSource
+    }
+
+    private fun response(request: Request, code: Int, body: ResponseBody): Response =
+        Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(code)
+            .message("scripted")
+            .body(body)
+            .build()
+
+    private fun String.toResponseBody(): ResponseBody =
+        ResponseBody.create(null, this)
 }
