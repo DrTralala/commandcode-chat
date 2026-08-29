@@ -67,9 +67,15 @@ tasks.register("verifyComposeDependencyFamily") {
                 when {
                     id.group == "androidx.compose" && id.name == "compose-bom" && id.version != "2026.08.00" ->
                         "${id.group}:${id.name}:${id.version}"
-                    id.group == "androidx.compose.material" && id.name == "material-icons-core" && id.version != "1.6.0" ->
+                    id.group == "androidx.compose.material" && id.name.startsWith("material-icons-core") && id.version != "1.6.0" ->
                         "${id.group}:${id.name}:${id.version}"
                     id.group == "androidx.compose.material3" && id.version != "1.3.2" ->
+                        "${id.group}:${id.name}:${id.version}"
+                    id.group.startsWith("androidx.compose") &&
+                        id.group != "androidx.compose.material3" &&
+                        !(id.group == "androidx.compose.material" && id.name.startsWith("material-icons-core")) &&
+                        !(id.group == "androidx.compose" && id.name == "compose-bom") &&
+                        id.version != "1.9.0" ->
                         "${id.group}:${id.name}:${id.version}"
                     else -> null
                 }
@@ -79,4 +85,8 @@ tasks.register("verifyComposeDependencyFamily") {
             "Mixed Compose dependency family detected: ${unexpected.sorted().joinToString()}."
         }
     }
+}
+
+tasks.named("check") {
+    dependsOn("verifyComposeDependencyFamily")
 }
