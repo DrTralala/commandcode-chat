@@ -6,8 +6,6 @@ import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
-import java.math.BigDecimal
-import java.time.Instant
 import java.util.UUID
 
 data class Conversation(
@@ -51,8 +49,8 @@ class ChatRepository(private val database: ChatDatabase) {
                     ConversationEntity(id, titleFor(text), model.apiId, now, now + 1),
                 )
             } else {
-                check(database.conversations().find(id) != null) { "Conversation not found" }
-                database.conversations().touch(id, now + 1)
+                val conversation = database.conversations().find(id) ?: error("Conversation not found")
+                database.conversations().touch(id, nextTimestamp(now, conversation.updatedAt))
             }
             val userId = UUID.randomUUID().toString()
             val assistantId = UUID.randomUUID().toString()
@@ -67,19 +65,21 @@ class ChatRepository(private val database: ChatDatabase) {
         database.withTransaction {
             val assistant = assistant(messageId)
             database.messages().update(assistant.copy(content = text, status = "COMPLETE"))
-            database.conversations().touch(assistant.conversationId, System.currentTimeMillis())
+            touchConversation(assistant.conversationId)
             val tokenUsage = usage
             val estimate = tokenUsage?.let { BudgetCalculator.estimate(requireModel(assistant), it) }
-            database.usageEvents().insert(
-                UsageEventEntity(
-                    id = UUID.randomUUID().toString(), requestId = null,
-                    conversationId = assistant.conversationId, modelId = assistant.modelId!!,
-                    timestamp = System.currentTimeMillis(), inputTokens = tokenUsage?.inputTokens,
-                    cachedInputTokens = tokenUsage?.cachedInputTokens, outputTokens = tokenUsage?.outputTokens,
-                    estimatedModelCost = estimate?.modelCost?.toPlainString(),
-                    estimatedGoatCredits = estimate?.goatCredits?.toPlainString(), usageComplete = tokenUsage != null,
-                ),
-            )
+            if (tokenUsage != null) {
+                database.usageEvents().insert(
+                    UsageEventEntity(
+                        id = UUID.randomUUID().toString(), requestId = null,
+                        conversationId = assistant.conversationId, modelId = assistant.modelId!!,
+                        timestamp = System.currentTimeMillis(), inputTokens = tokenUsage.inputTokens,
+                        cachedInputTokens = tokenUsage.cachedInputTokens, outputTokens = tokenUsage.outputTokens,
+                        estimatedModelCost = estimate!!.modelCost.toPlainString(),
+                        estimatedGoatCredits = estimate.goatCredits.toPlainString(), usageComplete = true,
+                    ),
+                )
+            }
         }
     }
 
@@ -92,9 +92,16 @@ class ChatRepository(private val database: ChatDatabase) {
         database.withTransaction {
             val message = assistant(messageId)
             database.messages().update(message.copy(content = text, status = status))
-            database.conversations().touch(message.conversationId, System.currentTimeMillis())
+            touchConversation(message.conversationId)
         }
     }
+
+    private fun touchConversation(id: String) {
+        val conversation = database.conversations().find(id) ?: error("Conversation not found")
+        database.conversations().touch(id, nextTimestamp(System.currentTimeMillis(), conversation.updatedAt))
+    }
+
+    private fun nextTimestamp(now: Long, previous: Long): Long = maxOf(now, previous + 1)
 
     private fun assistant(id: String): MessageEntity =
         database.messages().find(id)?.also { check(it.role == "ASSISTANT") { "Message is not an assistant turn" } }
