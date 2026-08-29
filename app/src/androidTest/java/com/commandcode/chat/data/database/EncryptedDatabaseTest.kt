@@ -2,6 +2,7 @@ package com.commandcode.chat.data.database
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase as FrameworkSQLiteDatabase
+import android.database.sqlite.SQLiteDatabaseCorruptException
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.data.security.DatabaseKeyManager
@@ -28,8 +29,12 @@ class EncryptedDatabaseTest {
         assertEquals("Test", reopened.conversations().find("conversation-1")?.title)
         reopened.close()
 
-        assertThrows(Exception::class.java) {
-            FrameworkSQLiteDatabase.openDatabase(databaseFile.path, null, FrameworkSQLiteDatabase.OPEN_READONLY).close()
+        assertThrows(SQLiteDatabaseCorruptException::class.java) {
+            FrameworkSQLiteDatabase.openDatabase(databaseFile.path, null, FrameworkSQLiteDatabase.OPEN_READONLY).use { frameworkDatabase ->
+                frameworkDatabase.rawQuery("SELECT name FROM sqlite_master", null).use { cursor ->
+                    cursor.moveToFirst()
+                }
+            }
         }
     }
 }
