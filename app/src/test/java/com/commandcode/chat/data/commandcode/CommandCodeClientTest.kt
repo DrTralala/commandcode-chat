@@ -131,6 +131,7 @@ class CommandCodeClientTest {
 
         assertEquals(1, call.cancelCount)
         assertTrue(body.closed)
+        assertEquals(1, body.closeCount)
     }
 
     @Test fun `required statuses map to distinct exceptions`() = runBlocking {
@@ -181,6 +182,7 @@ class CommandCodeClientTest {
         assertEquals("scripted response read failure", failure?.message)
         assertFalse(failure.toString().contains(secret))
         assertTrue(body.closed)
+        assertEquals(1, body.closeCount)
     }
 
     @Test fun `done completes while response remains open`() = runBlocking {
@@ -244,6 +246,8 @@ class CommandCodeClientTest {
         private val readRelease = CountDownLatch(1)
         @Volatile var closed: Boolean = false
             private set
+        @Volatile var closeCount: Int = 0
+            private set
         private val responseSource = object : Source {
             override fun read(sink: Buffer, byteCount: Long): Long {
                 readStarted.countDown()
@@ -262,6 +266,10 @@ class CommandCodeClientTest {
         override fun contentType(): MediaType? = null
         override fun contentLength(): Long = -1
         override fun source(): BufferedSource = responseSource
+        override fun close() {
+            closeCount++
+            super.close()
+        }
 
         fun awaitReadStarted(): Boolean = readStarted.await(2, TimeUnit.SECONDS)
         fun releaseRead() = readRelease.countDown()
@@ -271,6 +279,8 @@ class CommandCodeClientTest {
         private val secret: String,
     ) : ResponseBody() {
         @Volatile var closed: Boolean = false
+            private set
+        @Volatile var closeCount: Int = 0
             private set
         private val responseSource = object : Source {
             private var secretEmitted = false
@@ -291,6 +301,10 @@ class CommandCodeClientTest {
         override fun contentType(): MediaType? = null
         override fun contentLength(): Long = secret.length.toLong()
         override fun source(): BufferedSource = responseSource
+        override fun close() {
+            closeCount++
+            super.close()
+        }
     }
 
     private fun response(request: Request, code: Int, body: ResponseBody): Response =
