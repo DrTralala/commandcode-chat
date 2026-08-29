@@ -33,6 +33,13 @@ data class PendingTurn(
 )
 
 class ChatRepository(private val database: ChatDatabase) {
+    private object Status {
+        const val USER_COMPLETE = "COMPLETE"
+        const val PENDING = "PENDING"
+        const val STREAMING = "STREAMING"
+        const val COMPLETE = "COMPLETE"
+        const val INTERRUPTED = "INTERRUPTED"
+    }
     fun observeConversations(): Flow<List<Conversation>> = database.conversations().observeAll()
         .map { rows -> rows.map { it.toDomain() } }
 
@@ -54,24 +61,26 @@ class ChatRepository(private val database: ChatDatabase) {
             }
             val userId = UUID.randomUUID().toString()
             val assistantId = UUID.randomUUID().toString()
-            database.messages().insert(MessageEntity(userId, id, "USER", text, null, now, "COMPLETE"))
-            database.messages().insert(MessageEntity(assistantId, id, "ASSISTANT", "", model.apiId, now + 1, "PENDING"))
+            database.messages().insert(MessageEntity(userId, id, Role.USER, text, null, now, Status.USER_COMPLETE))
+            database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, now + 1, Status.PENDING))
             PendingTurn(id, userId, assistantId)
         }
 
-    suspend fun checkpointAssistant(messageId: String, text: String) = updateAssistant(messageId, text, "STREAMING")
+    suspend fun checkpointAssistant(messageId: String, text: String) = updateAssistant(messageId, text, Status.STREAMING)
 
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?) {
         database.withTransaction {
             val assistant = assistant(messageId)
-            database.messages().update(assistant.copy(content = text, status = "COMPLETE"))
+            if (assistant.status == Status.COMPLETE) return@withTransaction
+            check(assistant.status == Status.PENDING || assistant.status == Status.STREAMING) { "Assistant turn is terminal" }
+            if (database.messages().updateIfStatus(messageId, assistant.status, text, Status.COMPLETE) == 0) return@withTransaction
             touchConversation(assistant.conversationId)
             val tokenUsage = usage
             val estimate = tokenUsage?.let { BudgetCalculator.estimate(requireModel(assistant), it) }
             if (tokenUsage != null) {
                 database.usageEvents().insert(
                     UsageEventEntity(
-                        id = UUID.randomUUID().toString(), requestId = null,
+                        id = UUID.randomUUID().toString(), requestId = messageId,
                         conversationId = assistant.conversationId, modelId = assistant.modelId!!,
                         timestamp = System.currentTimeMillis(), inputTokens = tokenUsage.inputTokens,
                         cachedInputTokens = tokenUsage.cachedInputTokens, outputTokens = tokenUsage.outputTokens,
@@ -85,13 +94,14 @@ class ChatRepository(private val database: ChatDatabase) {
 
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String) {
         // The reason is intentionally not persisted: it may contain transport details or secrets.
-        updateAssistant(messageId, partialText, "INTERRUPTED")
+        updateAssistant(messageId, partialText, Status.INTERRUPTED)
     }
 
     private suspend fun updateAssistant(messageId: String, text: String, status: String) {
         database.withTransaction {
             val message = assistant(messageId)
-            database.messages().update(message.copy(content = text, status = status))
+            if (message.status == Status.COMPLETE || message.status == Status.INTERRUPTED) return@withTransaction
+            if (database.messages().updateIfStatus(messageId, message.status, text, status) == 0) return@withTransaction
             touchConversation(message.conversationId)
         }
     }
@@ -104,7 +114,7 @@ class ChatRepository(private val database: ChatDatabase) {
     private fun nextTimestamp(now: Long, previous: Long): Long = maxOf(now, previous + 1)
 
     private fun assistant(id: String): MessageEntity =
-        database.messages().find(id)?.also { check(it.role == "ASSISTANT") { "Message is not an assistant turn" } }
+        database.messages().find(id)?.also { check(it.role == Role.ASSISTANT) { "Message is not an assistant turn" } }
             ?: error("Message not found")
 
     private fun requireModel(message: MessageEntity): ChatModel =
@@ -114,7 +124,24 @@ class ChatRepository(private val database: ChatDatabase) {
     private fun MessageEntity.toDomain() = Message(id, conversationId, role, content, modelId?.let(ChatModel::fromApiId), createdAt, status)
 
     private fun titleFor(text: String): String {
-        val normalised = text.trim().replace(Regex("\\s+"), " ")
+        val normalised = buildString {
+            var pendingSpace = false
+            text.codePoints().forEach { codePoint ->
+                val character = codePoint.toChar()
+                val whitespace = Character.isWhitespace(character) || Character.isSpaceChar(character)
+                if (whitespace) pendingSpace = isNotEmpty()
+                else {
+                    if (pendingSpace) append(' ')
+                    appendCodePoint(codePoint)
+                    pendingSpace = false
+                }
+            }
+        }
         return normalised.codePoints().limit(48).toArray().let { String(it, 0, it.size) }
+    }
+
+    private object Role {
+        const val USER = "USER"
+        const val ASSISTANT = "ASSISTANT"
     }
 }

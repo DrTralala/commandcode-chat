@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao interface ConversationDao {
     @Insert fun insert(value: ConversationEntity)
-    @Query("SELECT * FROM conversations ORDER BY updatedAt DESC") fun observeAll(): Flow<List<ConversationEntity>>
+    @Query("SELECT * FROM conversations ORDER BY updatedAt DESC, id ASC") fun observeAll(): Flow<List<ConversationEntity>>
     @Query("SELECT * FROM conversations WHERE id = :id") fun find(id: String): ConversationEntity?
     @Query("UPDATE conversations SET updatedAt = :updatedAt WHERE id = :id") fun touch(id: String, updatedAt: Long)
     @Delete fun delete(value: ConversationEntity)
@@ -15,7 +15,8 @@ import kotlinx.coroutines.flow.Flow
     @Insert fun insert(value: MessageEntity)
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt ASC, id ASC") fun observeForConversation(conversationId: String): Flow<List<MessageEntity>>
     @Query("SELECT * FROM messages WHERE id = :id") fun find(id: String): MessageEntity?
-    @Update fun update(value: MessageEntity)
+    @Query("UPDATE messages SET content = :content, status = :newStatus WHERE id = :id AND status = :expectedStatus")
+    fun updateIfStatus(id: String, expectedStatus: String, content: String, newStatus: String): Int
 }
 
 @Dao interface UsageEventDao {

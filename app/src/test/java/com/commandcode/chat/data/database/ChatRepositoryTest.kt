@@ -9,31 +9,53 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.util.concurrent.CopyOnWriteArrayList
 
 @RunWith(RobolectricTestRunner::class)
 class ChatRepositoryTest {
+    private val databases = CopyOnWriteArrayList<ChatDatabase>()
+
+    @After
+    fun closeDatabases() {
+        databases.forEach { runCatching { it.close() } }
+        databases.clear()
+    }
     @Test
     fun beginTurnCreatesConversationAndOrderedPendingRows() = runTest {
         val (repository, database) = testRepository()
 
         val turn = repository.beginTurn(null, "  hello   world  ", ChatModel.SOL)
 
-        assertEquals("hello world", repository.observeConversations().first().single().title)
+        val conversation = repository.observeConversations().first().single()
+        assertEquals(turn.conversationId, conversation.id)
+        assertEquals("hello world", conversation.title)
+        assertEquals(ChatModel.SOL, conversation.defaultModel)
+        val rows = repository.observeMessages(turn.conversationId).first()
         assertEquals(
             listOf("USER", "ASSISTANT"),
-            repository.observeMessages(turn.conversationId).first().map { it.role },
+            rows.map { it.role },
         )
-        assertEquals("PENDING", repository.observeMessages(turn.conversationId).first()[1].status)
-        database.close()
+        assertEquals(turn.userMessageId, rows[0].id)
+        assertEquals("  hello   world  ", rows[0].content)
+        assertEquals("COMPLETE", rows[0].status)
+        assertEquals(turn.assistantMessageId, rows[1].id)
+        assertEquals("", rows[1].content)
+        assertEquals(ChatModel.SOL, rows[1].model)
+        assertEquals("PENDING", rows[1].status)
     }
 
     @Test
     fun completeTurnPersistsUsageWithCalculatedCostsAndNullUsageDoesNotCreateEvent() = runTest {
         val (repository, database) = testRepository()
         val turn = repository.beginTurn(null, "hello", ChatModel.LUNA)
+        val before = database.conversations().find(turn.conversationId)!!.updatedAt
+        repository.checkpointAssistant(turn.assistantMessageId, "streamed")
+        assertEquals("STREAMING", database.messages().find(turn.assistantMessageId)?.status)
+        assertEquals("streamed", database.messages().find(turn.assistantMessageId)?.content)
         repository.completeTurn(turn.assistantMessageId, "answer", TokenUsage(1_000_000, 200_000, 1_000_000))
         val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
         assertEquals(1_000_000L, event.inputTokens)
@@ -41,12 +63,20 @@ class ChatRepositoryTest {
         assertEquals(1_000_000L, event.outputTokens)
         assertEquals("1.364", event.estimatedModelCost)
         assertEquals("4.774", event.estimatedGoatCredits)
+        assertEquals(turn.assistantMessageId, event.requestId)
+        assertEquals(ChatModel.LUNA.apiId, event.modelId)
+        assertEquals("answer", database.messages().find(turn.assistantMessageId)?.content)
         assertEquals("COMPLETE", database.messages().find(turn.assistantMessageId)?.status)
+        assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > before)
+        repository.completeTurn(turn.assistantMessageId, "duplicate", TokenUsage(9, 0, 9))
+        assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
+        repository.checkpointAssistant(turn.assistantMessageId, "stale")
+        repository.interruptTurn(turn.assistantMessageId, "stale", "stale")
+        assertEquals("answer", database.messages().find(turn.assistantMessageId)?.content)
 
         val turnWithoutUsage = repository.beginTurn(turn.conversationId, "next", ChatModel.LUNA)
         repository.completeTurn(turnWithoutUsage.assistantMessageId, "done", null)
         assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
-        database.close()
     }
 
     @Test
@@ -59,7 +89,6 @@ class ChatRepositoryTest {
         assertEquals("INTERRUPTED", assistant.status)
         assertEquals("partial", assistant.content)
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > before)
-        database.close()
     }
 
     @Test
@@ -72,7 +101,10 @@ class ChatRepositoryTest {
         val first = repository.observeMessages(turn.conversationId).first().map { it.id }
         val second = repository.observeMessages(turn.conversationId).first().map { it.id }
         assertEquals(first, second)
-        database.close()
+        val next = repository.beginTurn(turn.conversationId, "next\u00a0turn\u2003now", ChatModel.SOL)
+        val rows = repository.observeMessages(turn.conversationId).first()
+        assertEquals(listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId), rows.map { it.id })
+        assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > conversation.updatedAt)
     }
 
     @Test
@@ -84,7 +116,6 @@ class ChatRepositoryTest {
         assertTrue(database.messages().find(turn.userMessageId) == null)
         assertTrue(database.messages().find(turn.assistantMessageId) == null)
         assertTrue(database.usageEvents().observeForConversation(turn.conversationId).first().isEmpty())
-        database.close()
     }
 
     private fun testRepository(): Pair<ChatRepository, ChatDatabase> {
@@ -92,6 +123,7 @@ class ChatRepositoryTest {
         val database = Room.inMemoryDatabaseBuilder(context, ChatDatabase::class.java)
             .allowMainThreadQueries()
             .build()
+        databases += database
         return ChatRepository(database) to database
     }
 }
