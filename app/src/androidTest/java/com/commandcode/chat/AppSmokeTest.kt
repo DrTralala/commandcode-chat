@@ -13,6 +13,7 @@ import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextClearance
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.After
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -56,8 +57,8 @@ class AppSmokeTest {
         compose.onNodeWithText("Secure chat").assertIsDisplayed()
         compose.onNodeWithTag("model_selector").performClick()
         compose.onNodeWithTag("model_menu").onChildren().assertCountEquals(2)
-        compose.onAllNodesWithText("GPT-5.6 Sol").fetchSemanticsNodes().also { assert(it.isNotEmpty()) }
-        compose.onAllNodesWithText("GPT-5.6 Luna").fetchSemanticsNodes().also { assert(it.isNotEmpty()) }
+        assertTrue(compose.onAllNodesWithText("GPT-5.6 Sol").fetchSemanticsNodes().isNotEmpty())
+        assertTrue(compose.onAllNodesWithText("GPT-5.6 Luna").fetchSemanticsNodes().isNotEmpty())
         compose.onNodeWithText("GPT-5.6 Luna").performClick()
 
         compose.onNodeWithTag("nav_history").performClick()
