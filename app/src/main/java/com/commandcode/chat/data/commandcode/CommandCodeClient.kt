@@ -9,7 +9,6 @@ import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okio.BufferedSource
 import java.io.IOException
 
 sealed class CommandCodeException(message: String? = null) : IOException(message) {
@@ -18,33 +17,49 @@ sealed class CommandCodeException(message: String? = null) : IOException(message
     class ZdrUnavailable : CommandCodeException("ZDR is unavailable")
     class RateLimited : CommandCodeException("Request rate or plan limit reached")
     class ServerFailure : CommandCodeException("Command Code service failure")
+    class StreamCancelled : CommandCodeException("Stream collector could not accept an event")
 }
 
-class CommandCodeClient(private val httpClient: OkHttpClient = OkHttpClient()) {
-    fun stream(apiKey: CharArray, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean): Flow<StreamEvent> = callbackFlow {
+class CommandCodeClient(
+    private val httpClient: OkHttpClient = OkHttpClient(),
+    private val endpoint: String = ENDPOINT,
+) {
+    fun stream(apiKey: CharArray, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean = true): Flow<StreamEvent> = callbackFlow {
         val keyChars = apiKey.copyOf()
         var keyBytes: ByteArray? = null
         val request = try {
             keyBytes = keyChars.concatToString().toByteArray(Charsets.UTF_8)
-            Request.Builder().url(ENDPOINT)
-                .post(CommandCodeRequestFactory.create(model, messages))
-                .header("Authorization", "Bearer ${keyBytes!!.toString(Charsets.UTF_8)}")
-                .apply { if (zdr) header("x-cmd-zdr", "1") }
-                .build()
+            buildRequest(keyBytes!!.toString(Charsets.UTF_8), model, messages, zdr, endpoint)
         } finally {
             keyChars.fill('\u0000'); keyBytes?.fill(0)
         }
         val call = httpClient.newCall(request)
+        fun emitEvent(event: StreamEvent) {
+            if (trySend(event).isFailure) close(CommandCodeException.StreamCancelled())
+        }
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) { close(e) }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    if (!response.isSuccessful) { close(responseException(response.code, response.body?.string())); return }
+                    if (!response.isSuccessful) {
+                        try {
+                            close(responseException(response.code, response.body?.string()))
+                        } catch (e: IOException) {
+                            close(e)
+                        }
+                        return
+                    }
                     val parser = SseParser()
                     try {
                         response.body!!.source().use { source ->
-                            while (!source.exhausted()) parser.acceptLine(source.readUtf8Line() ?: "").forEach { trySend(it).isSuccess }
-                            parser.finish().forEach { trySend(it).isSuccess }
+                            var done = false
+                            while (!done && !source.exhausted()) {
+                                for (event in parser.acceptLine(source.readUtf8Line() ?: "")) {
+                                    emitEvent(event)
+                                    if (event === StreamEvent.Done) { done = true; break }
+                                }
+                            }
+                            if (!done) parser.finish().forEach(::emitEvent)
                         }
                         close()
                     } catch (e: IOException) { close(e) }
@@ -56,11 +71,12 @@ class CommandCodeClient(private val httpClient: OkHttpClient = OkHttpClient()) {
 
     companion object {
         private const val ENDPOINT = "https://api.commandcode.ai/provider/v1/chat/completions"
-        internal fun requestForTesting(apiKey: CharArray, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean): Request {
-            val key = apiKey.concatToString()
-            return Request.Builder().url(ENDPOINT).post(CommandCodeRequestFactory.create(model, messages))
-                .header("Authorization", "Bearer $key").apply { if (zdr) header("x-cmd-zdr", "1") }.build()
-        }
+        internal fun requestForTesting(apiKey: CharArray, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean = true): Request =
+            buildRequest(apiKey.concatToString(), model, messages, zdr)
+
+        private fun buildRequest(apiKey: String, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean, endpoint: String = ENDPOINT): Request =
+            Request.Builder().url(endpoint).post(CommandCodeRequestFactory.create(model, messages))
+                .header("Authorization", "Bearer $apiKey").apply { if (zdr) header("x-cmd-zdr", "1") }.build()
         private fun responseException(code: Int, body: String?): CommandCodeException = when {
             code == 401 -> CommandCodeException.Unauthorized()
             code == 403 -> CommandCodeException.Forbidden()
