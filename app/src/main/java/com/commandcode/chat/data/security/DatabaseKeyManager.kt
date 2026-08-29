@@ -22,13 +22,28 @@ class DatabaseKeyManager(
         val generated = ByteArray(32)
         val aliasExisted = cipher.hasAlias(alias)
         var createdAlias = false
+        var wrapperPersistenceAttempted = false
         try {
             java.security.SecureRandom().nextBytes(generated)
             val blob = cipher.encrypt(alias, generated)
             createdAlias = !aliasExisted
+            wrapperPersistenceAttempted = true
             store.put(blobKey, blob)
         } catch (error: Exception) {
-            if (!aliasExisted && cipher.hasAlias(alias)) createdAlias = true
+            if (!aliasExisted && !createdAlias) {
+                try {
+                    createdAlias = cipher.hasAlias(alias)
+                } catch (trackingError: Exception) {
+                    error.addSuppressed(trackingError)
+                }
+            }
+            if (wrapperPersistenceAttempted) {
+                try {
+                    store.remove(blobKey)
+                } catch (cleanupError: Exception) {
+                    error.addSuppressed(cleanupError)
+                }
+            }
             if (createdAlias) {
                 try {
                     cipher.deleteAlias(alias)

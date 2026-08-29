@@ -26,7 +26,7 @@ open class EncryptedBlobStore(context: Context, private val name: String = "secu
         if (!preferences.edit().putString(key, blob.encode()).commit()) throw SecureStoragePersistenceFailure()
     }
     fun get(key: String): EncryptedBlob? = preferences.getString(key, null)?.let(EncryptedBlob::decode)
-    fun remove(key: String) {
+    open fun remove(key: String) {
         if (!preferences.edit().remove(key).commit()) throw SecureStoragePersistenceFailure()
     }
     fun rawValue(key: String): String? = preferences.getString(key, null)

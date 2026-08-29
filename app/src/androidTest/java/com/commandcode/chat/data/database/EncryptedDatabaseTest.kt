@@ -6,9 +6,11 @@ import android.database.sqlite.SQLiteDatabaseCorruptException
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.data.security.DatabaseKeyManager
+import com.commandcode.chat.data.security.EncryptedBlob
 import com.commandcode.chat.data.security.EncryptedBlobStore
 import com.commandcode.chat.data.security.DatabaseRecoveryRequired
 import com.commandcode.chat.data.security.KeystoreCipher
+import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
 import org.junit.Test
 import org.junit.Assert.*
 import org.junit.runner.RunWith
@@ -100,16 +102,13 @@ class EncryptedDatabaseTest {
         val storageName = "test-failed-wrapper-$suffix"
         val alias = "commandcode-test-db-$suffix"
         val blobKey = "databaseKey-$suffix"
-        val store = object : EncryptedBlobStore(context, storageName) {
-            override fun put(key: String, blob: com.commandcode.chat.data.security.EncryptedBlob) {
-                throw IllegalStateException("scripted checked persistence failure")
-            }
-        }
+        val store = InstallingThenFailingStore(context, storageName)
         val keyManager = DatabaseKeyManager(store, alias = alias, blobKey = blobKey)
         try {
             assertThrows(DatabaseRecoveryRequired::class.java) {
                 ChatDatabase.open(context, keyManager, databaseName)
             }
+            assertTrue(store.wrapperWasObservableBeforeFailure)
             assertFalse(context.getDatabasePath(databaseName).exists())
             assertNull(store.rawValue(blobKey))
             assertFalse(hasAlias(alias))
@@ -127,11 +126,7 @@ class EncryptedDatabaseTest {
         val storageName = "test-failed-wrapper-existing-alias-$suffix"
         val alias = "commandcode-test-db-existing-$suffix"
         val blobKey = "databaseKey-$suffix"
-        val store = object : EncryptedBlobStore(context, storageName) {
-            override fun put(key: String, blob: com.commandcode.chat.data.security.EncryptedBlob) {
-                throw IllegalStateException("scripted checked persistence failure")
-            }
-        }
+        val store = InstallingThenFailingStore(context, storageName)
         val keyManager = DatabaseKeyManager(store, alias = alias, blobKey = blobKey)
         try {
             KeystoreCipher().encrypt(alias, ByteArray(32))
@@ -141,9 +136,37 @@ class EncryptedDatabaseTest {
                 ChatDatabase.open(context, keyManager, databaseName)
             }
 
+            assertTrue(store.wrapperWasObservableBeforeFailure)
             assertFalse(context.getDatabasePath(databaseName).exists())
             assertNull(store.rawValue(blobKey))
             assertTrue(hasAlias(alias))
+        } finally {
+            context.deleteDatabase(databaseName)
+            deleteAlias(alias)
+            context.deleteSharedPreferences(storageName)
+        }
+    }
+
+    @Test fun wrapperRollbackFailureIsSuppressedWithoutHidingPrimaryPersistenceFailure() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val suffix = UUID.randomUUID().toString()
+        val databaseName = "chat-failed-wrapper-rollback-$suffix.db"
+        val storageName = "test-failed-wrapper-rollback-$suffix"
+        val alias = "commandcode-test-db-rollback-$suffix"
+        val blobKey = "databaseKey-$suffix"
+        val store = InstallingThenFailingStore(context, storageName, failRemovalAfterApplying = true)
+        val keyManager = DatabaseKeyManager(store, alias = alias, blobKey = blobKey)
+        try {
+            val failure = assertThrows(DatabaseRecoveryRequired::class.java) {
+                ChatDatabase.open(context, keyManager, databaseName)
+            }
+
+            assertTrue(failure.cause is SecureStoragePersistenceFailure)
+            assertEquals(1, failure.cause!!.suppressed.size)
+            assertTrue(failure.cause!!.suppressed.single() is SecureStoragePersistenceFailure)
+            assertFalse(context.getDatabasePath(databaseName).exists())
+            assertNull(store.rawValue(blobKey))
+            assertFalse(hasAlias(alias))
         } finally {
             context.deleteDatabase(databaseName)
             deleteAlias(alias)
@@ -190,6 +213,27 @@ class EncryptedDatabaseTest {
             context.deleteDatabase(databaseName)
             deleteAlias()
             context.deleteSharedPreferences(storageName)
+        }
+    }
+
+    private class InstallingThenFailingStore(
+        context: Context,
+        name: String,
+        private val failRemovalAfterApplying: Boolean = false,
+    ) : EncryptedBlobStore(context, name) {
+        var wrapperWasObservableBeforeFailure = false
+
+        override fun put(key: String, blob: EncryptedBlob) {
+            super.put(key, blob)
+            wrapperWasObservableBeforeFailure = rawValue(key) != null
+            throw SecureStoragePersistenceFailure(IllegalStateException("scripted checked persistence failure"))
+        }
+
+        override fun remove(key: String) {
+            super.remove(key)
+            if (failRemovalAfterApplying) {
+                throw SecureStoragePersistenceFailure(IllegalStateException("scripted rollback failure"))
+            }
         }
     }
 
