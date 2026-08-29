@@ -49,8 +49,8 @@ class ChatRepository(private val database: ChatDatabase) {
 
     suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn =
         database.withTransaction {
-            val now = System.currentTimeMillis()
             val id = conversationId ?: UUID.randomUUID().toString()
+            val now = nextTimestamp(System.currentTimeMillis(), database.messages().latestCreatedAt(id) ?: Long.MIN_VALUE)
             if (conversationId == null) {
                 database.conversations().insert(
                     ConversationEntity(id, titleFor(text), model.apiId, now, now + 1),

@@ -46,6 +46,7 @@ class ChatRepositoryTest {
         assertEquals("", rows[1].content)
         assertEquals(ChatModel.SOL, rows[1].model)
         assertEquals("PENDING", rows[1].status)
+        assertTrue(rows[1].createdAt > rows[0].createdAt)
     }
 
     @Test
@@ -104,6 +105,7 @@ class ChatRepositoryTest {
         val next = repository.beginTurn(turn.conversationId, "next\u00a0turn\u2003now", ChatModel.SOL)
         val rows = repository.observeMessages(turn.conversationId).first()
         assertEquals(listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId), rows.map { it.id })
+        assertTrue(rows.zipWithNext().all { (a, b) -> b.createdAt > a.createdAt })
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > conversation.updatedAt)
     }
 
