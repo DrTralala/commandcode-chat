@@ -67,7 +67,7 @@ dependencies {
     ksp("androidx.room:room-compiler:2.8.4")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
-    androidTestImplementation("androidx.room:room-testing:2.7.2")
+    androidTestImplementation("androidx.room:room-testing:2.8.4")
     debugImplementation("androidx.compose.ui:ui-tooling:1.9.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20250517")
