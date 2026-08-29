@@ -85,7 +85,10 @@ class AppViewModelTest {
     @Test
     fun eofWithoutDoneInterruptsPartial() = runTest(dispatcher) {
         val chats = FakeChats()
-        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(StreamEvent.Delta("partial")) })
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(
+            StreamEvent.Delta("partial"),
+            StreamEvent.Usage(TokenUsage(1, 0, 1)),
+        ) })
         configureKey(viewModel)
 
         viewModel.send("hello")
