@@ -1,46 +1,8 @@
-import java.net.URI
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
-}
-
-val commandCodeChatServiceUrl = providers.gradleProperty("commandCodeChatServiceUrl").orNull
-val debugServiceUrl = commandCodeChatServiceUrl ?: "http://10.0.2.2:8080"
-val releaseServiceUrl = commandCodeChatServiceUrl ?: "https://invalid.invalid"
-
-fun buildConfigStringLiteral(value: String): String = buildString {
-    append('"')
-    value.forEach { character ->
-        when (character) {
-            '\\' -> append("\\\\")
-            '"' -> append("\\\"")
-            '\n' -> append("\\n")
-            '\r' -> append("\\r")
-            '\t' -> append("\\t")
-            '\b' -> append("\\b")
-            '\u000C' -> append("\\f")
-            else -> append(character)
-        }
-    }
-    append('"')
-}
-
-fun validateReleaseServiceUrl(value: String) {
-    val uri = try {
-        URI(value)
-    } catch (error: Exception) {
-        throw GradleException("commandCodeChatServiceUrl must be a valid HTTPS URL", error)
-    }
-    if (!uri.scheme.equals("https", ignoreCase = true) || uri.host.isNullOrBlank() ||
-        uri.userInfo != null || uri.query != null || uri.fragment != null
-    ) {
-        throw GradleException(
-            "commandCodeChatServiceUrl must be an HTTPS URL with a host and no user-info, query, or fragment",
-        )
-    }
 }
 
 ksp {
@@ -69,37 +31,82 @@ android {
     }
     buildFeatures {
         compose = true
-        buildConfig = true
     }
     sourceSets["main"].assets.srcDir(rootProject.layout.projectDirectory.dir("catalogue"))
-    buildTypes {
-        debug {
-            buildConfigField("String", "COMMAND_CODE_CHAT_SERVICE_URL", buildConfigStringLiteral(debugServiceUrl))
-            manifestPlaceholders["usesCleartextTraffic"] = true
-        }
-        release {
-            buildConfigField("String", "COMMAND_CODE_CHAT_SERVICE_URL", buildConfigStringLiteral(releaseServiceUrl))
-            manifestPlaceholders["usesCleartextTraffic"] = false
-        }
-    }
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
 
-tasks.register("verifyReleaseServiceUrl") {
+tasks.register("verifyNoServiceUrlConfiguration") {
     group = "verification"
-    description = "Validates the trusted HTTPS service URL used by release builds."
+    description = "Fails if Android sources or generated configuration contain an intermediary service URL."
+    dependsOn("processDebugMainManifest")
     doLast {
-        validateReleaseServiceUrl(commandCodeChatServiceUrl ?: throw GradleException(
-            "commandCodeChatServiceUrl must be an explicit HTTPS URL for release builds",
-        ))
-    }
-}
+        val forbiddenTokens = listOf(
+            "COMMAND_CODE_CHAT_SERVICE" + "_URL",
+            "commandCodeChatService" + "Url",
+        )
+        val cleartextManifestPlaceholder = Regex(
+            """android:usesCleartextTraffic\s*=\s*"\$\{[^\"]+}""",
+        )
+        val textExtensions = setOf("java", "json", "js", "kt", "kts", "properties", "pro", "xml")
+        val files = linkedSetOf<File>()
+        files += projectDir.resolve("build.gradle.kts")
+        projectDir.listFiles()
+            ?.filter { it.isFile && it.extension in textExtensions }
+            ?.let(files::addAll)
+        listOf(
+            projectDir.resolve("src"),
+            layout.buildDirectory.dir("generated").get().asFile,
+            layout.buildDirectory.dir("intermediates").get().asFile,
+        ).filter(File::isDirectory).forEach { root ->
+            root.walkTopDown()
+                .filter { it.isFile && it.extension in textExtensions }
+                .forEach(files::add)
+        }
 
-tasks.matching { it.name == "preReleaseBuild" }.configureEach {
-    dependsOn("verifyReleaseServiceUrl")
+        val violations = files.flatMap { file ->
+            val content = file.readText()
+            val relativePath = file.relativeTo(projectDir).invariantSeparatorsPath
+            buildList {
+                forbiddenTokens.filter(content::contains).forEach { token ->
+                    add("$relativePath contains $token")
+                }
+                if (cleartextManifestPlaceholder.containsMatchIn(content)) {
+                    add("$relativePath contains a cleartext manifest placeholder")
+                }
+            }
+        }
+        check(violations.isEmpty()) {
+            "Obsolete Android service URL configuration found:\n${violations.joinToString("\n") { "- $it" }}"
+        }
+
+        val mergedDebugManifest = layout.buildDirectory.dir("intermediates").get().asFile
+            .walkTopDown()
+            .filter { file ->
+                file.isFile &&
+                    file.name == "AndroidManifest.xml" &&
+                    file.path.contains("merged_manifest") &&
+                    file.path.contains("processDebugMainManifest") &&
+                    file.path.contains("${File.separator}debug${File.separator}")
+            }
+            .firstOrNull()
+        check(mergedDebugManifest != null) {
+            "Merged debug manifest was not produced by processDebugMainManifest."
+        }
+        val mergedManifestText = mergedDebugManifest.readText()
+        val cleartextValue = Regex(
+            """android:usesCleartextTraffic\s*=\s*"([^\"]+)""",
+        ).find(mergedManifestText)?.groupValues?.get(1)
+        check(cleartextValue == null || cleartextValue == "false") {
+            "Merged debug manifest must disable cleartext traffic, but resolved to $cleartextValue."
+        }
+        check(!cleartextManifestPlaceholder.containsMatchIn(mergedManifestText)) {
+            "Merged debug manifest contains an unresolved cleartext placeholder."
+        }
+    }
 }
 
 configurations.configureEach {
@@ -184,4 +191,5 @@ tasks.register("verifyComposeDependencyFamily") {
 
 tasks.named("check") {
     dependsOn("verifyComposeDependencyFamily")
+    dependsOn("verifyNoServiceUrlConfiguration")
 }
