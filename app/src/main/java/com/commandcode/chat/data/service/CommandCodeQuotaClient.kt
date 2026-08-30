@@ -1,14 +1,13 @@
 package com.commandcode.chat.data.service
 
-import com.commandcode.chat.BuildConfig
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
+import java.time.Clock
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Call
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -50,34 +49,19 @@ internal class ClientKeyMaterial private constructor(
     }
 }
 
-class CommandCodeServiceClient(
-    baseUrl: String = BuildConfig.COMMAND_CODE_CHAT_SERVICE_URL,
+class CommandCodeQuotaClient(
     private val callFactory: Call.Factory = DEFAULT_CALL_FACTORY,
-) : ModelCatalogueApi, QuotaApi {
-    private val modelsEndpoint: HttpUrl = baseUrl.toHttpUrl().newBuilder()
-        .encodedPath("/v1/goat/models")
-        .query(null)
-        .build()
-    private val quotaEndpoint: HttpUrl = baseUrl.toHttpUrl().newBuilder()
-        .encodedPath("/v1/goat/quota")
-        .query(null)
-        .build()
+    private val clock: Clock = Clock.systemUTC(),
+) : QuotaApi {
+    private val endpoint = "https://api.commandcode.ai/alpha/billing/credits".toHttpUrl()
     private var keyMaterialFactory: ClientKeyMaterialFactory = ClientKeyMaterialFactory(ClientKeyMaterial::from)
 
     internal constructor(
-        baseUrl: String,
         callFactory: Call.Factory,
+        clock: Clock,
         keyMaterialFactory: ClientKeyMaterialFactory,
-    ) : this(baseUrl, callFactory) {
+    ) : this(callFactory, clock) {
         this.keyMaterialFactory = keyMaterialFactory
-    }
-
-    override suspend fun fetchModels(): ModelCatalogueSnapshot = withContext(Dispatchers.IO) {
-        execute(
-            Request.Builder().url(modelsEndpoint).get().header("Accept", "application/json").build(),
-            ModelCatalogueCodec.MAX_CATALOGUE_BYTES,
-            ModelCatalogueCodec::decode,
-        )
     }
 
     override suspend fun fetchQuota(apiKey: CharArray): QuotaSnapshot {
@@ -86,13 +70,11 @@ class CommandCodeServiceClient(
             return withContext(Dispatchers.IO) {
                 execute(
                     Request.Builder()
-                        .url(quotaEndpoint)
+                        .url(endpoint)
                         .get()
                         .header("Accept", "application/json")
                         .header("Authorization", keyMaterial.bearer)
                         .build(),
-                    QuotaSnapshotCodec.MAX_QUOTA_BYTES,
-                    QuotaSnapshotCodec::decode,
                 )
             }
         } finally {
@@ -100,17 +82,15 @@ class CommandCodeServiceClient(
         }
     }
 
-    private suspend fun <T> execute(
-        request: Request,
-        maxBytes: Int,
-        decode: (String) -> T,
-    ): T = withContext(Dispatchers.IO) {
+    private suspend fun execute(request: Request): QuotaSnapshot = withContext(Dispatchers.IO) {
         try {
             callFactory.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw statusFailure(response.code)
-                val text = readResponse(response.body, maxBytes)
+                val body: okhttp3.ResponseBody? = response.body
+                if (body == null) throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
+                val text = readResponse(body)
                 try {
-                    decode(text)
+                    CommandCodeQuotaResponseCodec.decode(text, clock.instant())
                 } catch (_: Exception) {
                     throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
                 }
@@ -126,7 +106,8 @@ class CommandCodeServiceClient(
         }
     }
 
-    private fun readResponse(body: okhttp3.ResponseBody, maxBytes: Int): String {
+    private fun readResponse(body: okhttp3.ResponseBody): String {
+        val maxBytes = QuotaSnapshotCodec.MAX_QUOTA_BYTES
         if (body.contentLength() > maxBytes) {
             throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
         }
@@ -135,10 +116,7 @@ class CommandCodeServiceClient(
         var total = 0L
         val probeLimit = maxBytes.toLong() + 1
         while (total < probeLimit) {
-            val count = source.read(
-                output,
-                minOf(8_192L, probeLimit - total),
-            )
+            val count = source.read(output, minOf(8_192L, probeLimit - total))
             if (count == -1L) break
             if (count == 0L) continue
             total += count
