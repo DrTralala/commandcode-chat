@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.commandcode.chat.data.service.UNREPORTED_PLAN_ID
 import com.commandcode.chat.ui.BudgetFreshness
 import com.commandcode.chat.ui.BudgetUiState
 import java.math.BigDecimal
@@ -37,6 +38,9 @@ internal fun formatQuotaTimestamp(instant: Instant, zone: ZoneId = ZoneId.system
 
 private fun formatCredits(value: Double): String =
     BigDecimal.valueOf(value).stripTrailingZeros().toPlainString()
+
+internal fun formatPlanLabel(planId: String): String =
+    if (planId == UNREPORTED_PLAN_ID) "Plan unavailable" else "Plan ID: $planId"
 
 internal fun presentedBudgetFreshness(budget: BudgetUiState): BudgetFreshness =
     if (budget.freshness == BudgetFreshness.STALE && budget.snapshot == null) {
@@ -83,7 +87,7 @@ fun BudgetScreen(budget: BudgetUiState, onRefresh: () -> Unit) {
         }
         budget.snapshot?.let { snapshot ->
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Plan ID: ${snapshot.planId}")
+                Text(formatPlanLabel(snapshot.planId))
                 Text("Limited: ${if (snapshot.limited) "Yes" else "No"}")
             }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {

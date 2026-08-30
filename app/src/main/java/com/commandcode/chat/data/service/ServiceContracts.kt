@@ -35,6 +35,8 @@ data class QuotaSnapshot(
     val freeCredits: Double,
 )
 
+internal const val UNREPORTED_PLAN_ID: String = "unreported"
+
 interface QuotaApi {
     suspend fun fetchQuota(apiKey: CharArray): QuotaSnapshot
 }

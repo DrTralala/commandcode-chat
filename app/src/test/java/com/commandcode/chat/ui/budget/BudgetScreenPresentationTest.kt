@@ -1,5 +1,6 @@
 package com.commandcode.chat.ui.budget
 
+import com.commandcode.chat.data.service.UNREPORTED_PLAN_ID
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.RemainingQuota
 import com.commandcode.chat.data.service.UsedQuota
@@ -11,6 +12,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class BudgetScreenPresentationTest {
+    @Test
+    fun unreportedPlanUsesUnavailableLabelWithoutExposingTheSentinel() {
+        assertEquals("Plan unavailable", formatPlanLabel(UNREPORTED_PLAN_ID))
+        assertEquals("Plan ID: goat", formatPlanLabel("goat"))
+    }
+
     @Test
     fun progressUsesConsumedMonthlyFractionAndClampsUsedQuotas() {
         assertEquals(0.4f, consumedQuotaFraction(42.0, 70.0))

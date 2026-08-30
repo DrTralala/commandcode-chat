@@ -5,6 +5,7 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -12,6 +13,7 @@ import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.RemainingQuota
+import com.commandcode.chat.data.service.UNREPORTED_PLAN_ID
 import com.commandcode.chat.data.service.UsedQuota
 import com.commandcode.chat.ui.BudgetFreshness
 import com.commandcode.chat.ui.BudgetUiState
@@ -46,6 +48,25 @@ class BudgetScreenComposeTest {
         compose.onNodeWithTag("budget_refresh").assertIsDisplayed().performClick()
         compose.waitForIdle()
         assertEquals(2, refreshCalls)
+    }
+
+    @Test
+    fun currentQuotaSchemaDoesNotExposeTheInternalPlanSentinel() {
+        compose.setContent {
+            MaterialTheme {
+                BudgetScreen(
+                    budget = BudgetUiState(
+                        snapshot = testSnapshot(planId = UNREPORTED_PLAN_ID),
+                        freshness = BudgetFreshness.LIVE,
+                    ),
+                    onRefresh = {},
+                )
+            }
+        }
+        compose.waitForIdle()
+
+        compose.onNodeWithText("Plan unavailable").assertIsDisplayed()
+        compose.onAllNodesWithText(UNREPORTED_PLAN_ID).assertCountEquals(0)
     }
 
     @Test
@@ -147,9 +168,9 @@ class BudgetScreenComposeTest {
         assertEquals(expected, actual, 0.001f)
     }
 
-    private fun testSnapshot() = QuotaSnapshot(
+    private fun testSnapshot(planId: String = "goat-pro") = QuotaSnapshot(
         fetchedAt = Instant.parse("2026-08-30T12:00:00Z"),
-        planId = "goat-pro",
+        planId = planId,
         limited = true,
         monthly = RemainingQuota(remaining = 42.0, cap = 70.0),
         fiveHour = UsedQuota(

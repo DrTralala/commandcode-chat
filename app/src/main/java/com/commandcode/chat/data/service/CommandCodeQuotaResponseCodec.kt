@@ -7,7 +7,10 @@ import org.json.JSONTokener
 
 internal object CommandCodeQuotaResponseCodec {
     private val ROOT_KEYS = setOf("credits", "windowLimits")
-    private val CREDIT_KEYS = setOf("planId", "monthlyCredits", "purchasedCredits", "freeCredits")
+    private val LEGACY_CREDIT_KEYS =
+        setOf("planId", "monthlyCredits", "purchasedCredits", "freeCredits")
+    private val CURRENT_CREDIT_KEYS =
+        setOf("creditThreshold", "monthlyCredits", "purchasedCredits", "freeCredits")
     private val WINDOW_LIMIT_KEYS = setOf("limited", "fiveHour", "weekly")
     private val WINDOW_KEYS = setOf("used", "cap", "resetAt")
     private const val MONTHLY_CAP = 70.0
@@ -29,7 +32,15 @@ internal object CommandCodeQuotaResponseCodec {
         requireKeys(root, ROOT_KEYS)
         val credits = objectValue(root, "credits")
         val windowLimits = objectValue(root, "windowLimits")
-        requireKeys(credits, CREDIT_KEYS)
+        val creditKeys = credits.keys().asSequence().toSet()
+        val planId = when (creditKeys) {
+            LEGACY_CREDIT_KEYS -> stringValue(credits, "planId")
+            CURRENT_CREDIT_KEYS -> {
+                amountValue(credits, "creditThreshold")
+                UNREPORTED_PLAN_ID
+            }
+            else -> throw IllegalArgumentException("Unexpected quota response fields")
+        }
         requireKeys(windowLimits, WINDOW_LIMIT_KEYS)
         val fiveHour = objectValue(windowLimits, "fiveHour")
         val weekly = objectValue(windowLimits, "weekly")
@@ -38,7 +49,7 @@ internal object CommandCodeQuotaResponseCodec {
 
         val snapshot = QuotaSnapshot(
             fetchedAt = fetchedAt,
-            planId = stringValue(credits, "planId"),
+            planId = planId,
             limited = booleanValue(windowLimits, "limited"),
             monthly = RemainingQuota(
                 remaining = amountValue(credits, "monthlyCredits"),

@@ -65,6 +65,51 @@ class CommandCodeQuotaClientTest {
     }
 
     @Test
+    fun translatesTheCurrentCreditThresholdSchemaWithoutInventingAPlan() = runBlocking {
+        val quota = clientFor(CURRENT_UPSTREAM_JSON).fetchQuota("test-key".toCharArray())
+
+        assertEquals("unreported", quota.planId)
+        assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
+        assertEquals(4.5, quota.fiveHour.used, 0.0)
+        assertEquals(22.75, quota.weekly.used, 0.0)
+    }
+
+    @Test
+    fun preservesTheLegacyUpstreamPlanId() = runBlocking {
+        val quota = clientFor(UPSTREAM_JSON).fetchQuota("test-key".toCharArray())
+
+        assertEquals("goat", quota.planId)
+    }
+
+    @Test
+    fun rejectsMixedPartialAndExtendedCurrentCreditSchemas() = runBlocking {
+        val invalidBodies = listOf(
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("credits").put("planId", "goat")
+            }.toString(),
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("credits").remove("creditThreshold")
+            }.toString(),
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("credits").put("extra", 1)
+            }.toString(),
+        )
+
+        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
+    }
+
+    @Test
+    fun rejectsInvalidCreditThresholdValues() = runBlocking {
+        val invalidBodies = listOf(
+            CURRENT_UPSTREAM_JSON.replace("\"creditThreshold\":10", "\"creditThreshold\":-1"),
+            CURRENT_UPSTREAM_JSON.replace("\"creditThreshold\":10", "\"creditThreshold\":\"10\""),
+            CURRENT_UPSTREAM_JSON.replace("\"creditThreshold\":10", "\"creditThreshold\":1e10000"),
+        )
+
+        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
+    }
+
+    @Test
     fun rejectsMissingAndExtraRootAndNestedFields() = runBlocking {
         val invalidBodies = buildList {
             add(JSONObject(UPSTREAM_JSON).apply { remove("credits") }.toString())
@@ -450,6 +495,10 @@ class CommandCodeQuotaClientTest {
         private val KEY = "test-command-code-key".toCharArray()
         private const val UPSTREAM_JSON =
             "{\"credits\":{\"planId\":\"goat\",\"monthlyCredits\":42.5,\"purchasedCredits\":9.5,\"freeCredits\":3.25}," +
+                "\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":4.5,\"cap\":14.0,\"resetAt\":1800000001234}," +
+                "\"weekly\":{\"used\":22.75,\"cap\":35.0,\"resetAt\":1800000005678}}}"
+        private const val CURRENT_UPSTREAM_JSON =
+            "{\"credits\":{\"creditThreshold\":10,\"monthlyCredits\":42.5,\"purchasedCredits\":9.5,\"freeCredits\":3.25}," +
                 "\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":4.5,\"cap\":14.0,\"resetAt\":1800000001234}," +
                 "\"weekly\":{\"used\":22.75,\"cap\":35.0,\"resetAt\":1800000005678}}}"
     }
