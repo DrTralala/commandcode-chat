@@ -19,6 +19,7 @@ import okio.Buffer
 import okio.BufferedSource
 import okio.ForwardingSource
 import okio.buffer
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -72,6 +73,86 @@ class CommandCodeQuotaClientTest {
         assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
         assertEquals(4.5, quota.fiveHour.used, 0.0)
         assertEquals(22.75, quota.weekly.used, 0.0)
+    }
+
+    @Test
+    fun translatesCurrentSchemaWithKnownStatusExtensions() = runBlocking {
+        val quota = clientFor(EXTENDED_CURRENT_UPSTREAM_JSON)
+            .fetchQuota("test-key".toCharArray())
+
+        assertEquals(UNREPORTED_PLAN_ID, quota.planId)
+        assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
+        assertEquals(4.5, quota.fiveHour.used, 0.0)
+        assertEquals(22.75, quota.weekly.used, 0.0)
+    }
+
+    @Test
+    fun acceptsEachKnownStatusExtensionIndependently() = runBlocking {
+        val bodies = listOf(
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("credits").put("belowThreshold", true)
+            }.toString(),
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").put("exceeded", false)
+            }.toString(),
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").put("exceeded", JSONObject.NULL)
+            }.toString(),
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").getJSONObject("fiveHour").put("exceeded", true)
+            }.toString(),
+            JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").getJSONObject("weekly").put("exceeded", false)
+            }.toString(),
+        )
+
+        bodies.forEach { body ->
+            assertEquals(UNREPORTED_PLAN_ID, clientFor(body).fetchQuota("test-key".toCharArray()).planId)
+        }
+    }
+
+    @Test
+    fun rejectsInvalidKnownStatusExtensionTypes() = runBlocking {
+        val invalidBooleanValues = listOf<Any>("false", 1, JSONObject(), JSONArray(), JSONObject.NULL)
+        val strictLocations = listOf<(JSONObject, Any) -> Unit>(
+            { root, value -> root.getJSONObject("credits").put("belowThreshold", value) },
+            { root, value -> root.getJSONObject("windowLimits").getJSONObject("fiveHour").put("exceeded", value) },
+            { root, value -> root.getJSONObject("windowLimits").getJSONObject("weekly").put("exceeded", value) },
+        )
+        val invalidBodies = buildList {
+            strictLocations.forEach { insert ->
+                invalidBooleanValues.forEach { value ->
+                    add(JSONObject(CURRENT_UPSTREAM_JSON).also { insert(it, value) }.toString())
+                }
+            }
+            invalidBooleanValues.filterNot { it == JSONObject.NULL }.forEach { value ->
+                add(JSONObject(CURRENT_UPSTREAM_JSON).apply {
+                    getJSONObject("windowLimits").put("exceeded", value)
+                }.toString())
+            }
+        }
+
+        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
+    }
+
+    @Test
+    fun rejectsUnknownFieldsAlongsideKnownStatusExtensions() = runBlocking {
+        val invalidBodies = listOf(
+            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("credits").put("unknown", false)
+            }.toString(),
+            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").put("unknown", false)
+            }.toString(),
+            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").getJSONObject("fiveHour").put("unknown", false)
+            }.toString(),
+            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
+                getJSONObject("windowLimits").getJSONObject("weekly").put("unknown", false)
+            }.toString(),
+        )
+
+        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
     }
 
     @Test
@@ -501,5 +582,13 @@ class CommandCodeQuotaClientTest {
             "{\"credits\":{\"creditThreshold\":10,\"monthlyCredits\":42.5,\"purchasedCredits\":9.5,\"freeCredits\":3.25}," +
                 "\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":4.5,\"cap\":14.0,\"resetAt\":1800000001234}," +
                 "\"weekly\":{\"used\":22.75,\"cap\":35.0,\"resetAt\":1800000005678}}}"
+        private val EXTENDED_CURRENT_UPSTREAM_JSON = JSONObject(CURRENT_UPSTREAM_JSON).apply {
+            getJSONObject("credits").put("belowThreshold", false)
+            getJSONObject("windowLimits").apply {
+                put("exceeded", JSONObject.NULL)
+                getJSONObject("fiveHour").put("exceeded", false)
+                getJSONObject("weekly").put("exceeded", true)
+            }
+        }.toString()
     }
 }

@@ -11,8 +11,11 @@ internal object CommandCodeQuotaResponseCodec {
         setOf("planId", "monthlyCredits", "purchasedCredits", "freeCredits")
     private val CURRENT_CREDIT_KEYS =
         setOf("creditThreshold", "monthlyCredits", "purchasedCredits", "freeCredits")
+    private val CREDIT_STATUS_KEYS = setOf("belowThreshold")
     private val WINDOW_LIMIT_KEYS = setOf("limited", "fiveHour", "weekly")
+    private val WINDOW_LIMIT_STATUS_KEYS = setOf("exceeded")
     private val WINDOW_KEYS = setOf("used", "cap", "resetAt")
+    private val WINDOW_STATUS_KEYS = setOf("exceeded")
     private const val MONTHLY_CAP = 70.0
 
     fun decode(text: String, fetchedAt: Instant): QuotaSnapshot = try {
@@ -33,7 +36,8 @@ internal object CommandCodeQuotaResponseCodec {
         val credits = objectValue(root, "credits")
         val windowLimits = objectValue(root, "windowLimits")
         val creditKeys = credits.keys().asSequence().toSet()
-        val planId = when (creditKeys) {
+        val requiredCreditKeys = creditKeys - CREDIT_STATUS_KEYS
+        val planId = when (requiredCreditKeys) {
             LEGACY_CREDIT_KEYS -> stringValue(credits, "planId")
             CURRENT_CREDIT_KEYS -> {
                 amountValue(credits, "creditThreshold")
@@ -41,11 +45,16 @@ internal object CommandCodeQuotaResponseCodec {
             }
             else -> throw IllegalArgumentException("Unexpected quota response fields")
         }
-        requireKeys(windowLimits, WINDOW_LIMIT_KEYS)
+        requireAllowedKeys(credits, requiredCreditKeys, CREDIT_STATUS_KEYS)
+        validateOptionalBoolean(credits, "belowThreshold", allowNull = false)
+        requireAllowedKeys(windowLimits, WINDOW_LIMIT_KEYS, WINDOW_LIMIT_STATUS_KEYS)
         val fiveHour = objectValue(windowLimits, "fiveHour")
         val weekly = objectValue(windowLimits, "weekly")
-        requireKeys(fiveHour, WINDOW_KEYS)
-        requireKeys(weekly, WINDOW_KEYS)
+        requireAllowedKeys(fiveHour, WINDOW_KEYS, WINDOW_STATUS_KEYS)
+        requireAllowedKeys(weekly, WINDOW_KEYS, WINDOW_STATUS_KEYS)
+        validateOptionalBoolean(windowLimits, "exceeded", allowNull = true)
+        validateOptionalBoolean(fiveHour, "exceeded", allowNull = false)
+        validateOptionalBoolean(weekly, "exceeded", allowNull = false)
 
         val snapshot = QuotaSnapshot(
             fetchedAt = fetchedAt,
@@ -80,6 +89,25 @@ internal object CommandCodeQuotaResponseCodec {
     private fun requireKeys(objectValue: JSONObject, expected: Set<String>) {
         require(objectValue.keys().asSequence().toSet() == expected) {
             "Unexpected quota response fields"
+        }
+    }
+
+    private fun requireAllowedKeys(
+        objectValue: JSONObject,
+        required: Set<String>,
+        optional: Set<String>,
+    ) {
+        val actual = objectValue.keys().asSequence().toSet()
+        require(actual.containsAll(required) && actual.all { it in required || it in optional }) {
+            "Unexpected quota response fields"
+        }
+    }
+
+    private fun validateOptionalBoolean(objectValue: JSONObject, key: String, allowNull: Boolean) {
+        if (!objectValue.has(key)) return
+        val value = objectValue.get(key)
+        require(value is Boolean || (allowNull && value == JSONObject.NULL)) {
+            "$key must be a boolean${if (allowNull) " or null" else ""}"
         }
     }
 
