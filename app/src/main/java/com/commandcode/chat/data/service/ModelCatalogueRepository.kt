@@ -3,40 +3,22 @@ package com.commandcode.chat.data.service
 import android.content.Context
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class ModelCatalogueRepository(
     context: Context,
-    private val api: ModelCatalogueApi,
-    private val store: ModelCatalogueStore = ServiceSnapshotStore(context),
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ModelCatalogueSource {
     private val applicationContext = context.applicationContext
     private var activeSnapshot: ModelCatalogueSnapshot? = null
 
-    override suspend fun loadLocal(): ModelCatalogueSnapshot = withContext(ioDispatcher) {
+    override suspend fun loadLocal(): ModelCatalogueSnapshot = withContext(Dispatchers.IO) {
         activeSnapshot ?: run {
-            val bundled = readBundledSnapshot()
-            val cached = runCatching {
-                store.loadModels()?.let(ModelCatalogueCodec::validate)
-            }.getOrNull()
-            val selected = if (cached != null && cached.generatedAt > bundled.generatedAt) cached else bundled
-            activeSnapshot = selected
-            selected
+            readBundledSnapshot().also { activeSnapshot = it }
         }
     }
 
-    override suspend fun refresh(): ModelCatalogueSnapshot {
-        loadLocal()
-        val refreshed = ModelCatalogueCodec.validate(api.fetchModels())
-        withContext(ioDispatcher) {
-            store.saveModels(refreshed)
-            activeSnapshot = refreshed
-        }
-        return refreshed
-    }
+    override suspend fun refresh(): ModelCatalogueSnapshot = loadLocal()
 
     private fun readBundledSnapshot(): ModelCatalogueSnapshot {
         val bytes = applicationContext.assets.open(BUNDLED_ASSET).use(::readBounded)

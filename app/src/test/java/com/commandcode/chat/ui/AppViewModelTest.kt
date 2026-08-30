@@ -446,6 +446,19 @@ class AppViewModelTest {
     }
 
     @Test
+    fun successfulLocalCatalogueRefreshKeepsAllModelsWithoutAnError() = runTest(dispatcher) {
+        val catalogue = FakeCatalogue(local = catalogueSnapshot(models = catalogueModels()))
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
+
+        advanceUntilIdle()
+
+        assertEquals(44, viewModel.state.value.models.size)
+        assertEquals(catalogue.local.models, viewModel.state.value.models)
+        assertEquals(1, catalogue.refreshCalls)
+        assertNull(viewModel.state.value.errorMessage)
+    }
+
+    @Test
     fun remoteCatalogueSuccessReplacesLocalModels() = runTest(dispatcher) {
         val remote = listOf(ChatModel.SOL, model("remote"))
         val catalogue = FakeCatalogue(

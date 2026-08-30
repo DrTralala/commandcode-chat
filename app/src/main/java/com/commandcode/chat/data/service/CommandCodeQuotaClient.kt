@@ -13,6 +13,42 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okio.Buffer
 
+class ServiceException(val kind: Kind) : IOException() {
+    enum class Kind { UNAUTHORIZED, FORBIDDEN, RATE_LIMITED, TIMEOUT, BAD_RESPONSE, UNAVAILABLE }
+}
+
+internal fun interface ClientKeyMaterialFactory {
+    fun create(apiKey: CharArray): ClientKeyMaterial
+}
+
+internal class ClientKeyMaterial private constructor(
+    internal val copiedChars: CharArray,
+    internal val copiedBytes: ByteArray,
+) {
+    internal val bearer: String
+        get() = "Bearer ${copiedBytes.toString(Charsets.UTF_8)}"
+
+    internal fun wipe() {
+        copiedBytes.fill(0)
+        copiedChars.fill('\u0000')
+    }
+
+    companion object {
+        internal fun from(apiKey: CharArray): ClientKeyMaterial {
+            val copiedChars = apiKey.copyOf()
+            var copiedBytes = ByteArray(0)
+            return try {
+                copiedBytes = copiedChars.concatToString().toByteArray(Charsets.UTF_8)
+                ClientKeyMaterial(copiedChars, copiedBytes)
+            } catch (failure: Throwable) {
+                copiedBytes.fill(0)
+                copiedChars.fill('\u0000')
+                throw failure
+            }
+        }
+    }
+}
+
 class CommandCodeQuotaClient(
     private val callFactory: Call.Factory = DEFAULT_CALL_FACTORY,
     private val clock: Clock = Clock.systemUTC(),

@@ -15,15 +15,6 @@ data class ModelCatalogueSnapshot(
     val models: List<ChatModel>,
 )
 
-interface ModelCatalogueApi {
-    suspend fun fetchModels(): ModelCatalogueSnapshot
-}
-
-interface ModelCatalogueStore {
-    fun loadModels(): ModelCatalogueSnapshot?
-    fun saveModels(snapshot: ModelCatalogueSnapshot)
-}
-
 interface ModelCatalogueSource {
     suspend fun loadLocal(): ModelCatalogueSnapshot
     suspend fun refresh(): ModelCatalogueSnapshot

@@ -4,9 +4,9 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
-import java.io.IOException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -21,101 +21,17 @@ class ModelCatalogueRepositoryTest {
 
     @Test
     fun bundledAssetLoadsTheCanonicalCatalogueInOrder() = runTest {
-        val loaded = repository().loadLocal()
-
-        assertEquals(1, loaded.schemaVersion)
-        assertEquals("2026-08-30", loaded.catalogueVersion)
-        assertEquals(1788048000000L, loaded.generatedAt)
-        assertEquals(EXPECTED_IDS, loaded.models.map(ChatModel::apiId))
-        assertEquals(EXPECTED_DISPLAY_NAMES, loaded.models.map(ChatModel::displayName))
-        assertTrue(loaded.models.all { it.apiFamily == ApiFamily.OPENAI_CHAT })
-    }
-
-    @Test
-    fun newerValidCacheWinsOverTheBundledCatalogue() = runTest {
-        val cached = snapshot(generatedAt = 1788048000001L, models = listOf(model("cached/model")))
-        val store = MemoryStore(cached)
-
-        assertEquals(cached, repository(store = store).loadLocal())
-    }
-
-    @Test
-    fun olderCacheIsIgnored() = runTest {
-        val store = MemoryStore(snapshot(generatedAt = 1788047999999L, models = listOf(model("old/model"))))
-
-        val loaded = repository(store = store).loadLocal()
-
-        assertEquals(EXPECTED_IDS, loaded.models.map(ChatModel::apiId))
-    }
-
-    @Test
-    fun malformedCacheIsIgnored() = runTest {
-        val store = MemoryStore(snapshot(schemaVersion = 2, generatedAt = 1788048000001L, models = listOf(model("bad/model"))))
-
-        val loaded = repository(store = store).loadLocal()
-
-        assertEquals(EXPECTED_IDS, loaded.models.map(ChatModel::apiId))
-    }
-
-    @Test
-    fun validRemoteDataIsSavedAndReturned() = runTest {
-        val remote = snapshot(generatedAt = 1788048001000L, models = listOf(model("remote/model")))
-        val store = MemoryStore()
-        val api = FakeApi(Result.success(remote))
-        val repository = repository(api = api, store = store)
-
-        repository.loadLocal()
-        assertEquals(remote, repository.refresh())
-        assertEquals(remote, store.snapshot)
-    }
-
-    @Test
-    fun failedRemoteDataLeavesTheActiveLocalSnapshotUntouched() = runTest {
-        val store = MemoryStore()
-        val api = FakeApi(Result.failure(IOException()))
-        val repository = repository(api = api, store = store)
+        val repository = ModelCatalogueRepository(context)
         val local = repository.loadLocal()
+        val refreshed = repository.refresh()
 
-        val failure = runCatching { repository.refresh() }.exceptionOrNull()
-        assertTrue(failure is IOException)
-        assertEquals(local, repository.loadLocal())
-        assertEquals(null, store.snapshot)
-    }
-
-    @Test
-    fun invalidRemoteDataLeavesTheActiveLocalSnapshotUntouched() = runTest {
-        val local = snapshot(generatedAt = 1788048001000L, models = listOf(model("local/model")))
-        val store = MemoryStore(local)
-        val duplicate = snapshot(
-            generatedAt = 1788048002000L,
-            models = listOf(model("same"), model("same")),
-        )
-        val repository = repository(api = FakeApi(Result.success(duplicate)), store = store)
-
-        assertEquals(local, repository.loadLocal())
-        val failure = runCatching { repository.refresh() }.exceptionOrNull()
-        assertTrue(failure is IllegalArgumentException)
-        assertEquals(local, repository.loadLocal())
-        assertEquals(local, store.snapshot)
-    }
-
-    @Test
-    fun emptyAndSolLessRemoteCataloguesLeaveTheActiveSnapshotUntouched() = runTest {
-        val invalidSnapshots = listOf(
-            ModelCatalogueSnapshot(1, "empty", 1788048002000L, emptyList()),
-            ModelCatalogueSnapshot(1, "sol-less", 1788048002000L, listOf(model("remote/model"))),
-        )
-
-        invalidSnapshots.forEach { invalid ->
-            val store = MemoryStore()
-            val repository = repository(api = FakeApi(Result.success(invalid)), store = store)
-            val local = repository.loadLocal()
-
-            val failure = runCatching { repository.refresh() }.exceptionOrNull()
-            assertTrue(failure is IllegalArgumentException)
-            assertEquals(local, repository.loadLocal())
-            assertEquals(null, store.snapshot)
-        }
+        assertSame(local, refreshed)
+        assertEquals(1, refreshed.schemaVersion)
+        assertEquals("2026-08-30", refreshed.catalogueVersion)
+        assertEquals(1788048000000L, refreshed.generatedAt)
+        assertEquals(EXPECTED_IDS, refreshed.models.map(ChatModel::apiId))
+        assertEquals(EXPECTED_DISPLAY_NAMES, refreshed.models.map(ChatModel::displayName))
+        assertTrue(refreshed.models.all { it.apiFamily == ApiFamily.OPENAI_CHAT })
     }
 
     @Test
@@ -130,45 +46,6 @@ class ModelCatalogueRepositoryTest {
         assertThrows(IllegalArgumentException::class.java) {
             ModelCatalogueCodec.validate(invalid)
         }
-    }
-
-    @Test
-    fun remoteCatalogueWithMoreThanOneHundredModelsIsRejected() = runTest {
-        val oversized = snapshot(
-            generatedAt = 1788048002000L,
-            models = List(101) { index -> model("model-$index") },
-        )
-        val repository = repository(api = FakeApi(Result.success(oversized)))
-
-        val failure = runCatching { repository.refresh() }.exceptionOrNull()
-        assertTrue(failure is IllegalArgumentException)
-    }
-
-    @Test
-    fun oversizedEncodedRemoteCatalogueLeavesActiveAndCachedSnapshotsUntouched() = runTest {
-        val local = snapshot(
-            generatedAt = 1788048000001L,
-            models = listOf(model("local/model")),
-        )
-        val store = EncodingMemoryStore(local)
-        val oversized = snapshot(
-            generatedAt = 1788048002000L,
-            models = listOf(
-                ChatModel(
-                    apiId = "remote/model",
-                    displayName = "x".repeat(ModelCatalogueCodec.MAX_CATALOGUE_BYTES),
-                    apiFamily = ApiFamily.OPENAI_CHAT,
-                ),
-            ),
-        )
-        val repository = repository(api = FakeApi(Result.success(oversized)), store = store)
-
-        assertEquals(local, repository.loadLocal())
-        val failure = runCatching { repository.refresh() }.exceptionOrNull()
-
-        assertTrue(failure is IllegalArgumentException)
-        assertEquals(local, repository.loadLocal())
-        assertEquals(local, store.snapshot)
     }
 
     @Test
@@ -189,11 +66,6 @@ class ModelCatalogueRepositoryTest {
         }
     }
 
-    private fun repository(
-        api: ModelCatalogueApi = FakeApi(Result.success(snapshot(models = listOf(model("unused"))))),
-        store: ModelCatalogueStore = MemoryStore(),
-    ) = ModelCatalogueRepository(context, api, store)
-
     private fun snapshot(
         schemaVersion: Int = 1,
         generatedAt: Long = 1788048000000L,
@@ -206,31 +78,6 @@ class ModelCatalogueRepositoryTest {
     )
 
     private fun model(id: String) = ChatModel(id, "Display $id", ApiFamily.OPENAI_CHAT)
-
-    private class FakeApi(private var result: Result<ModelCatalogueSnapshot>) : ModelCatalogueApi {
-        override suspend fun fetchModels(): ModelCatalogueSnapshot = result.getOrThrow()
-    }
-
-    private class MemoryStore(initial: ModelCatalogueSnapshot? = null) : ModelCatalogueStore {
-        var snapshot: ModelCatalogueSnapshot? = initial
-
-        override fun loadModels(): ModelCatalogueSnapshot? = snapshot
-
-        override fun saveModels(snapshot: ModelCatalogueSnapshot) {
-            this.snapshot = snapshot
-        }
-    }
-
-    private class EncodingMemoryStore(initial: ModelCatalogueSnapshot? = null) : ModelCatalogueStore {
-        var snapshot: ModelCatalogueSnapshot? = initial
-
-        override fun loadModels(): ModelCatalogueSnapshot? = snapshot
-
-        override fun saveModels(snapshot: ModelCatalogueSnapshot) {
-            ModelCatalogueCodec.encode(snapshot)
-            this.snapshot = snapshot
-        }
-    }
 
     companion object {
         private val EXPECTED_IDS = listOf(

@@ -12,9 +12,10 @@ import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.DatabaseKeyManager
 import com.commandcode.chat.data.security.EncryptedBlobStore
 import com.commandcode.chat.data.security.SecretRepository
-import com.commandcode.chat.data.service.CommandCodeServiceClient
+import com.commandcode.chat.data.service.CommandCodeQuotaClient
 import com.commandcode.chat.data.service.ModelCatalogueRepository
 import com.commandcode.chat.data.service.ModelCatalogueSource
+import com.commandcode.chat.data.service.QuotaApi
 import com.commandcode.chat.data.service.QuotaRepository
 import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.data.service.ServiceSnapshotStore
@@ -64,17 +65,13 @@ fun interface StreamSource {
     fun stream(apiKey: CharArray, model: ChatModel, messages: List<ApiMessage>, zdr: Boolean): Flow<StreamEvent>
 }
 
-/** Application-scoped dependencies. Optional factories are narrow offline-test seams. */
+/** Application-scoped dependencies. The quota API factory is a narrow offline-test seam. */
 class AppContainer(
     context: Context,
     databaseFactory: (Context, DatabaseKeyManager) -> ChatDatabase = ChatDatabase::open,
     clientFactory: () -> CommandCodeClient = ::CommandCodeClient,
     streamSourceFactory: ((CommandCodeClient) -> StreamSource)? = null,
-    serviceClientFactory: (String, Call.Factory) -> CommandCodeServiceClient = { baseUrl, calls ->
-        CommandCodeServiceClient(baseUrl, calls)
-    },
-    modelCatalogueFactory: ((Context, CommandCodeServiceClient, ServiceSnapshotStore) -> ModelCatalogueSource)? = null,
-    quotaFactory: ((Context, CommandCodeServiceClient, ServiceSnapshotStore) -> QuotaSource)? = null,
+    quotaApiFactory: (Call.Factory) -> QuotaApi = { CommandCodeQuotaClient(it) },
 ) {
     private val applicationContext = context.applicationContext
     private val encryptedStore = EncryptedBlobStore(applicationContext)
@@ -89,21 +86,13 @@ class AppContainer(
         .connectTimeout(5, TimeUnit.SECONDS)
         .callTimeout(10, TimeUnit.SECONDS)
         .build()
-    private val commandCodeServiceClient = serviceClientFactory(
-        BuildConfig.COMMAND_CODE_CHAT_SERVICE_URL,
-        serviceHttpClient,
-    )
     private val serviceSnapshotStore = ServiceSnapshotStore(applicationContext)
-    val modelCatalogue: ModelCatalogueSource = modelCatalogueFactory?.invoke(
+    val modelCatalogue: ModelCatalogueSource = ModelCatalogueRepository(applicationContext)
+    val quota: QuotaSource = QuotaRepository(
         applicationContext,
-        commandCodeServiceClient,
+        quotaApiFactory(serviceHttpClient),
         serviceSnapshotStore,
-    ) ?: ModelCatalogueRepository(applicationContext, commandCodeServiceClient, serviceSnapshotStore)
-    val quota: QuotaSource = quotaFactory?.invoke(
-        applicationContext,
-        commandCodeServiceClient,
-        serviceSnapshotStore,
-    ) ?: QuotaRepository(applicationContext, commandCodeServiceClient, serviceSnapshotStore)
+    )
     val apiKeyStore: ApiKeyStore = object : ApiKeyStore {
         override fun saveApiKey(value: CharArray) = secretRepository.saveApiKey(value)
         override fun readApiKey(): CharArray? = secretRepository.readApiKey()

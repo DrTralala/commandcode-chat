@@ -2,8 +2,6 @@ package com.commandcode.chat.data.service
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
-import com.commandcode.chat.domain.ApiFamily
-import com.commandcode.chat.domain.ChatModel
 import java.io.IOException
 import java.time.Instant
 import kotlinx.coroutines.test.runTest
@@ -69,26 +67,15 @@ class QuotaRepositoryTest {
     }
 
     @Test
-    fun clearRemovesOnlyQuotaDataAndRetainsTheModelCache() = runTest {
+    fun clearRemovesQuotaData() = runTest {
         val store = ServiceSnapshotStore(context)
         clearPreferences()
-        val model = ModelCatalogueSnapshot(
-            schemaVersion = 1,
-            catalogueVersion = "test",
-            generatedAt = 1,
-            models = listOf(
-                ChatModel.SOL,
-                ChatModel("model/id", "Model", ApiFamily.OPENAI_CHAT),
-            ),
-        )
         try {
-            store.saveModels(model)
             store.saveQuota(snapshot())
 
             QuotaRepository(context, FakeApi(Result.failure(IOException())), store).clear()
 
             assertNull(store.loadQuota())
-            assertEquals(model, store.loadModels())
         } finally {
             clearPreferences()
         }
