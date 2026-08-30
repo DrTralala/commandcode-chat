@@ -1,3 +1,48 @@
+import java.io.File
+import javax.xml.XMLConstants
+import javax.xml.parsers.DocumentBuilderFactory
+import org.w3c.dom.Element
+
+private val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
+private val MAX_ALLOWLISTED_FILE_BYTES = 2L * 1024L * 1024L
+
+private fun assertAllowlistedFile(file: File) {
+    check(file.isFile) { "Allow-listed Android configuration file is missing: ${file.path}" }
+    check(file.length() <= MAX_ALLOWLISTED_FILE_BYTES) {
+        "Allow-listed Android configuration file is too large to inspect safely: ${file.path}"
+    }
+}
+
+private fun readAllowlistedText(file: File): String {
+    assertAllowlistedFile(file)
+    return file.readText()
+}
+
+private fun applicationCleartextTraffic(file: File, requireApplication: Boolean): String? {
+    assertAllowlistedFile(file)
+    val factory = DocumentBuilderFactory.newInstance().apply {
+        isNamespaceAware = true
+        setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+        setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+        setFeature("http://xml.org/sax/features/external-general-entities", false)
+        setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+        setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+        setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "")
+        setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "")
+        isXIncludeAware = false
+        isExpandEntityReferences = false
+    }
+    val document = factory.newDocumentBuilder().parse(file)
+    val applications = document.getElementsByTagName("application")
+    check(applications.length <= 1 && (!requireApplication || applications.length == 1)) {
+        "Expected exactly one application element in ${file.path}."
+    }
+    if (applications.length == 0) return null
+    val application = applications.item(0) as? Element
+        ?: error("Application element in ${file.path} is not an XML element.")
+    return application.getAttributeNodeNS(ANDROID_NAMESPACE, "usesCleartextTraffic")?.value
+}
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -48,63 +93,56 @@ tasks.register("verifyNoServiceUrlConfiguration") {
             "COMMAND_CODE_CHAT_SERVICE" + "_URL",
             "commandCodeChatService" + "Url",
         )
-        val cleartextManifestPlaceholder = Regex(
-            """android:usesCleartextTraffic\s*=\s*"\$\{[^\"]+}""",
-        )
-        val textExtensions = setOf("java", "json", "js", "kt", "kts", "properties", "pro", "xml")
-        val files = linkedSetOf<File>()
-        files += projectDir.resolve("build.gradle.kts")
-        projectDir.listFiles()
-            ?.filter { it.isFile && it.extension in textExtensions }
-            ?.let(files::addAll)
-        listOf(
-            projectDir.resolve("src"),
-            layout.buildDirectory.dir("generated").get().asFile,
-            layout.buildDirectory.dir("intermediates").get().asFile,
-        ).filter(File::isDirectory).forEach { root ->
+        val sourceRoots = listOf("main", "debug", "release", "androidTest")
+            .map { projectDir.resolve("src/$it") }
+            .filter(File::isDirectory)
+        val sourceFiles = sourceRoots.flatMap { root ->
             root.walkTopDown()
-                .filter { it.isFile && it.extension in textExtensions }
-                .forEach(files::add)
+                .filter { it.isFile && it.extension in setOf("java", "kt", "xml") }
+                .toList()
         }
-
+        val sourceManifestFiles = sourceFiles.filter { it.name == "AndroidManifest.xml" }
+        val buildConfigFiles = listOf(
+            projectDir.resolve("build/generated/source/buildConfig/debug/com/commandcode/chat/BuildConfig.java"),
+            projectDir.resolve("build/generated/source/buildConfig/release/com/commandcode/chat/BuildConfig.java"),
+            projectDir.resolve("build/generated/source/buildConfig/androidTest/debug/com/commandcode/chat/test/BuildConfig.java"),
+        ).filter(File::isFile)
+        val files = (listOf(projectDir.resolve("build.gradle.kts")) + sourceFiles + buildConfigFiles).distinct()
         val violations = files.flatMap { file ->
-            val content = file.readText()
+            val content = readAllowlistedText(file)
             val relativePath = file.relativeTo(projectDir).invariantSeparatorsPath
-            buildList {
-                forbiddenTokens.filter(content::contains).forEach { token ->
-                    add("$relativePath contains $token")
-                }
-                if (cleartextManifestPlaceholder.containsMatchIn(content)) {
-                    add("$relativePath contains a cleartext manifest placeholder")
-                }
-            }
+            forbiddenTokens.filter(content::contains).map { token -> "$relativePath contains $token" }
         }
         check(violations.isEmpty()) {
             "Obsolete Android service URL configuration found:\n${violations.joinToString("\n") { "- $it" }}"
         }
 
-        val mergedDebugManifest = layout.buildDirectory.dir("intermediates").get().asFile
-            .walkTopDown()
-            .filter { file ->
-                file.isFile &&
-                    file.name == "AndroidManifest.xml" &&
-                    file.path.contains("merged_manifest") &&
-                    file.path.contains("processDebugMainManifest") &&
-                    file.path.contains("${File.separator}debug${File.separator}")
-            }
-            .firstOrNull()
+        val mergedDebugManifest = tasks.named("processDebugMainManifest").get().outputs.files.files
+            .filter { it.isFile && it.name == "AndroidManifest.xml" }
+            .singleOrNull()
         check(mergedDebugManifest != null) {
             "Merged debug manifest was not produced by processDebugMainManifest."
         }
-        val mergedManifestText = mergedDebugManifest.readText()
-        val cleartextValue = Regex(
-            """android:usesCleartextTraffic\s*=\s*"([^\"]+)""",
-        ).find(mergedManifestText)?.groupValues?.get(1)
-        check(cleartextValue == null || cleartextValue == "false") {
-            "Merged debug manifest must disable cleartext traffic, but resolved to $cleartextValue."
+        val mergedManifestText = readAllowlistedText(mergedDebugManifest)
+        val mergedViolations = forbiddenTokens.filter(mergedManifestText::contains)
+        check(mergedViolations.isEmpty()) {
+            "Obsolete Android service URL configuration found in merged debug manifest: " +
+                mergedViolations.joinToString()
         }
-        check(!cleartextManifestPlaceholder.containsMatchIn(mergedManifestText)) {
-            "Merged debug manifest contains an unresolved cleartext placeholder."
+        val sourceManifestPlaceholders = sourceManifestFiles.mapNotNull { manifest ->
+            val cleartextValue = applicationCleartextTraffic(manifest, requireApplication = false)
+            if (cleartextValue?.startsWith("$" + "{") == true) {
+                "${manifest.relativeTo(projectDir).invariantSeparatorsPath} contains a cleartext manifest placeholder"
+            } else {
+                null
+            }
+        }
+        check(sourceManifestPlaceholders.isEmpty()) {
+            sourceManifestPlaceholders.joinToString("\n")
+        }
+        val cleartextValue = applicationCleartextTraffic(mergedDebugManifest, requireApplication = true)
+        check(cleartextValue == null || cleartextValue == "false") {
+            "Merged debug manifest application must omit usesCleartextTraffic or set it to false, but resolved to $cleartextValue."
         }
     }
 }
