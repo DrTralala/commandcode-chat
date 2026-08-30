@@ -1,8 +1,46 @@
+import java.net.URI
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
+}
+
+val commandCodeChatServiceUrl = providers.gradleProperty("commandCodeChatServiceUrl").orNull
+val debugServiceUrl = commandCodeChatServiceUrl ?: "http://10.0.2.2:8080"
+val releaseServiceUrl = commandCodeChatServiceUrl ?: "https://invalid.invalid"
+
+fun buildConfigStringLiteral(value: String): String = buildString {
+    append('"')
+    value.forEach { character ->
+        when (character) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            '\b' -> append("\\b")
+            '\u000C' -> append("\\f")
+            else -> append(character)
+        }
+    }
+    append('"')
+}
+
+fun validateReleaseServiceUrl(value: String) {
+    val uri = try {
+        URI(value)
+    } catch (error: Exception) {
+        throw GradleException("commandCodeChatServiceUrl must be a valid HTTPS URL", error)
+    }
+    if (!uri.scheme.equals("https", ignoreCase = true) || uri.host.isNullOrBlank() ||
+        uri.userInfo != null || uri.query != null || uri.fragment != null
+    ) {
+        throw GradleException(
+            "commandCodeChatServiceUrl must be an HTTPS URL with a host and no user-info, query, or fragment",
+        )
+    }
 }
 
 ksp {
@@ -29,8 +67,39 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+    sourceSets["main"].assets.srcDir(rootProject.layout.projectDirectory.dir("catalogue"))
+    buildTypes {
+        debug {
+            buildConfigField("String", "COMMAND_CODE_CHAT_SERVICE_URL", buildConfigStringLiteral(debugServiceUrl))
+            manifestPlaceholders["usesCleartextTraffic"] = true
+        }
+        release {
+            buildConfigField("String", "COMMAND_CODE_CHAT_SERVICE_URL", buildConfigStringLiteral(releaseServiceUrl))
+            manifestPlaceholders["usesCleartextTraffic"] = false
+        }
+    }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+}
+
+tasks.register("verifyReleaseServiceUrl") {
+    group = "verification"
+    description = "Validates the trusted HTTPS service URL used by release builds."
+    doLast {
+        validateReleaseServiceUrl(commandCodeChatServiceUrl ?: throw GradleException(
+            "commandCodeChatServiceUrl must be an explicit HTTPS URL for release builds",
+        ))
+    }
+}
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn("verifyReleaseServiceUrl")
 }
 
 configurations.configureEach {

@@ -1,7 +1,6 @@
 package com.commandcode.chat
 
 import android.content.Context
-import com.commandcode.chat.data.budget.BudgetCalculator
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeClient
 import com.commandcode.chat.data.commandcode.StreamEvent
@@ -13,14 +12,21 @@ import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.DatabaseKeyManager
 import com.commandcode.chat.data.security.EncryptedBlobStore
 import com.commandcode.chat.data.security.SecretRepository
+import com.commandcode.chat.data.service.CommandCodeServiceClient
+import com.commandcode.chat.data.service.ModelCatalogueRepository
+import com.commandcode.chat.data.service.ModelCatalogueSource
+import com.commandcode.chat.data.service.QuotaRepository
+import com.commandcode.chat.data.service.QuotaSource
+import com.commandcode.chat.data.service.ServiceSnapshotStore
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
-import com.commandcode.chat.domain.UsageEvent
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.Flow
+import okhttp3.Call
+import okhttp3.OkHttpClient
 
 interface SettingsStore {
     var zdr: Boolean
-    var billingDay: Int
 }
 
 interface ApiKeyStore {
@@ -33,7 +39,6 @@ interface ChatStore {
     fun observeConversations(): Flow<List<Conversation>>
     fun observeMessages(conversationId: String): Flow<List<Message>>
     suspend fun messagesSnapshot(conversationId: String): List<Message>
-    fun observeUsageEvents(): Flow<List<UsageEvent>>
     suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn
     suspend fun checkpointAssistant(messageId: String, text: String)
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
@@ -48,18 +53,10 @@ class AppSettings(context: Context) : SettingsStore {
         get() = preferences.getBoolean(KEY_ZDR, true)
         set(value) { preferences.edit().putBoolean(KEY_ZDR, value).apply() }
 
-    override var billingDay: Int
-        get() = preferences.getInt(KEY_BILLING_DAY, 1).coerceIn(1, 31)
-        set(value) {
-            require(value in 1..31) { "billingDay must be in 1..31" }
-            preferences.edit().putInt(KEY_BILLING_DAY, value).apply()
-        }
-
     internal fun resetForTests() { preferences.edit().clear().commit() }
 
     private companion object {
         const val KEY_ZDR = "zdr"
-        const val KEY_BILLING_DAY = "billingDay"
     }
 }
 
@@ -73,6 +70,11 @@ class AppContainer(
     databaseFactory: (Context, DatabaseKeyManager) -> ChatDatabase = ChatDatabase::open,
     clientFactory: () -> CommandCodeClient = ::CommandCodeClient,
     streamSourceFactory: ((CommandCodeClient) -> StreamSource)? = null,
+    serviceClientFactory: (String, Call.Factory) -> CommandCodeServiceClient = { baseUrl, calls ->
+        CommandCodeServiceClient(baseUrl, calls)
+    },
+    modelCatalogueFactory: ((Context, CommandCodeServiceClient, ServiceSnapshotStore) -> ModelCatalogueSource)? = null,
+    quotaFactory: ((Context, CommandCodeServiceClient, ServiceSnapshotStore) -> QuotaSource)? = null,
 ) {
     private val applicationContext = context.applicationContext
     private val encryptedStore = EncryptedBlobStore(applicationContext)
@@ -81,7 +83,27 @@ class AppContainer(
     val chatDatabase = databaseFactory(applicationContext, DatabaseKeyManager(encryptedStore))
     val chatRepository = ChatRepository(chatDatabase)
     val commandCodeClient = clientFactory()
-    val budgetCalculator = BudgetCalculator
+    private val serviceHttpClient = OkHttpClient.Builder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.SECONDS)
+        .build()
+    private val commandCodeServiceClient = serviceClientFactory(
+        BuildConfig.COMMAND_CODE_CHAT_SERVICE_URL,
+        serviceHttpClient,
+    )
+    private val serviceSnapshotStore = ServiceSnapshotStore(applicationContext)
+    val modelCatalogue: ModelCatalogueSource = modelCatalogueFactory?.invoke(
+        applicationContext,
+        commandCodeServiceClient,
+        serviceSnapshotStore,
+    ) ?: ModelCatalogueRepository(applicationContext, commandCodeServiceClient, serviceSnapshotStore)
+    val quota: QuotaSource = quotaFactory?.invoke(
+        applicationContext,
+        commandCodeServiceClient,
+        serviceSnapshotStore,
+    ) ?: QuotaRepository(applicationContext, commandCodeServiceClient, serviceSnapshotStore)
     val apiKeyStore: ApiKeyStore = object : ApiKeyStore {
         override fun saveApiKey(value: CharArray) = secretRepository.saveApiKey(value)
         override fun readApiKey(): CharArray? = secretRepository.readApiKey()
@@ -91,7 +113,6 @@ class AppContainer(
         override fun observeConversations() = chatRepository.observeConversations()
         override fun observeMessages(conversationId: String) = chatRepository.observeMessages(conversationId)
         override suspend fun messagesSnapshot(conversationId: String) = chatRepository.messagesSnapshot(conversationId)
-        override fun observeUsageEvents() = chatRepository.observeUsageEvents()
         override suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel) =
             chatRepository.beginTurn(conversationId, text, model)
         override suspend fun checkpointAssistant(messageId: String, text: String) =

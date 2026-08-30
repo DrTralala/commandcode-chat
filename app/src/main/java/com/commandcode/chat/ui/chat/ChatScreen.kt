@@ -31,6 +31,13 @@ import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.ui.AppUiState
 
+internal fun modelOptionTestTag(apiId: String): String = buildString {
+    append("model_option_")
+    apiId.forEach { character ->
+        append(if (character.isLetterOrDigit()) character else '_')
+    }
+}
+
 @Composable
 fun ChatScreen(
     state: AppUiState,
@@ -56,12 +63,12 @@ fun ChatScreen(
                     onDismissRequest = { menuOpen = false },
                     modifier = Modifier.testTag("model_menu"),
                 ) {
-                    ChatModel.entries.forEach { model ->
+                    state.models.forEach { model ->
                         DropdownMenuItem(
                             text = { Text(model.displayName) },
                             onClick = { onSelectModel(model); menuOpen = false },
                             modifier = Modifier
-                                .testTag("model_option_${model.name.lowercase()}")
+                                .testTag(modelOptionTestTag(model.apiId))
                                 .semantics { contentDescription = "Use ${model.displayName}" },
                         )
                     }

@@ -29,6 +29,7 @@ import com.commandcode.chat.data.database.Conversation
 @Composable
 fun HistoryScreen(
     conversations: List<Conversation>,
+    modelDisplayName: (String) -> String,
     onOpen: (String) -> Unit,
     onDelete: (String) -> Unit,
 ) {
@@ -43,7 +44,7 @@ fun HistoryScreen(
                     TextButton(onClick = { onOpen(conversation.id) }, modifier = Modifier.weight(1f)) {
                         Column(Modifier.fillMaxWidth()) {
                             Text(conversation.title)
-                            Text(conversation.defaultModel.displayName, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
+                            Text(modelDisplayName(conversation.defaultModelId), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
                         }
                     }
                     OutlinedButton(

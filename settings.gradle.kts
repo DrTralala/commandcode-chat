@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "secure-chat-poc"
 include(":app")
+include(":server")

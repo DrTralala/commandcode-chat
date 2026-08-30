@@ -8,8 +8,6 @@ import com.commandcode.chat.AppContainer
 import com.commandcode.chat.ChatStore
 import com.commandcode.chat.SettingsStore
 import com.commandcode.chat.StreamSource
-import com.commandcode.chat.data.budget.BudgetCalculator
-import com.commandcode.chat.data.budget.BudgetWindow
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeException
 import com.commandcode.chat.data.commandcode.StreamEvent
@@ -18,36 +16,37 @@ import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.KeyRecoveryRequired
 import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
+import com.commandcode.chat.data.service.ModelCatalogueSource
+import com.commandcode.chat.data.service.QuotaSnapshot
+import com.commandcode.chat.data.service.QuotaSource
+import com.commandcode.chat.data.service.ServiceException
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
-import com.commandcode.chat.domain.UsageEvent
 import java.io.IOException
-import java.math.BigDecimal
-import java.time.Duration
-import java.time.Instant
-import java.time.ZoneId
-import java.time.ZonedDateTime
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+enum class BudgetFreshness { LIVE, STALE, UNAVAILABLE }
+
 data class BudgetUiState(
-    val fiveHours: BudgetWindow = BudgetWindow(BigDecimal.ZERO, BigDecimal("14"), null, null),
-    val weekly: BudgetWindow = BudgetWindow(BigDecimal.ZERO, BigDecimal("35"), null, null),
-    val monthly: BudgetWindow = BudgetWindow(BigDecimal.ZERO, BigDecimal("70"), null, null),
-    val selectedModel: ChatModel = ChatModel.SOL,
+    val snapshot: QuotaSnapshot? = null,
+    val freshness: BudgetFreshness = BudgetFreshness.UNAVAILABLE,
+    val refreshing: Boolean = false,
+    val errorMessage: String? = null,
 )
 
 data class AppUiState(
@@ -55,8 +54,7 @@ data class AppUiState(
     val recoveryMessage: String? = null,
     val keyConfigured: Boolean = false,
     val zdr: Boolean = true,
-    val billingDay: Int = 1,
-    val billingDayError: String? = null,
+    val models: List<ChatModel> = listOf(ChatModel.SOL),
     val selectedModel: ChatModel = ChatModel.SOL,
     val conversations: List<Conversation> = emptyList(),
     val currentConversationId: String? = null,
@@ -86,61 +84,105 @@ class AppViewModel(
     private val settings: SettingsStore,
     private val chats: ChatStore,
     private val streamSource: StreamSource,
-    private val now: () -> Instant = Instant::now,
+    private val modelCatalogue: ModelCatalogueSource,
+    private val quota: QuotaSource,
     private val elapsedMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
-    private val budgetTicks: Flow<Unit>? = null,
+    private val apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
 ) : ViewModel() {
-    private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr, billingDay = settings.billingDay))
+    private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr))
     val state: StateFlow<AppUiState> = mutableState.asStateFlow()
 
     private var messageCollection: Job? = null
     private var sendJob: Job? = null
-    private var budgetTimer: Job? = null
-    private var usageEvents: List<UsageEvent> = emptyList()
+    private var quotaJob: Job? = null
+    private val keyMutationMutex = Mutex()
     private var activeTurn: ActiveTurn? = null
     private var sendTargetConversationId: String? = null
 
     init {
         viewModelScope.launch {
+            var recoveryMessage: String? = null
             val configured = try {
                 secrets.readApiKey()?.let { key ->
                     try { key.isNotEmpty() } finally { key.fill('\u0000') }
                 } ?: false
             } catch (_: KeyRecoveryRequired) {
-                mutableState.value = mutableState.value.copy(
-                    loading = false,
-                    recoveryMessage = API_KEY_RECOVERY_MESSAGE,
-                )
-                return@launch
+                recoveryMessage = API_KEY_RECOVERY_MESSAGE
+                false
             }
-            mutableState.value = mutableState.value.copy(loading = false, keyConfigured = configured)
+            val localModels = try {
+                modelCatalogue.loadLocal().models.requireSolModel()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                listOf(ChatModel.SOL)
+            }
+            val cachedQuota = try {
+                quota.loadCached()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            mutableState.value = mutableState.value.copy(
+                loading = false,
+                recoveryMessage = recoveryMessage,
+                keyConfigured = configured,
+                models = localModels,
+                selectedModel = localModels.firstOrNull {
+                    it.apiId == mutableState.value.selectedModel.apiId
+                } ?: ChatModel.SOL,
+                budget = cachedQuota?.takeIf { configured }?.let {
+                    BudgetUiState(snapshot = it, freshness = BudgetFreshness.STALE)
+                } ?: BudgetUiState(),
+            )
+            refreshModels()
+            if (configured && recoveryMessage == null) refreshQuota()
         }
         viewModelScope.launch {
             chats.observeConversations().collect { conversations ->
                 mutableState.value = mutableState.value.copy(conversations = conversations)
             }
         }
-        viewModelScope.launch {
-            chats.observeUsageEvents().collect { events ->
-                usageEvents = events
-                updateBudget()
-            }
-        }
-        budgetTicks?.let { ticks ->
-            viewModelScope.launch { ticks.collect { updateBudget() } }
-        }
     }
 
     fun saveApiKey(value: CharArray) {
-        val protectedCopy = value.copyOf()
+        val protectedCopy = apiKeyCopier(value)
         value.fill('\u0000')
-        viewModelScope.launch {
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
-                require(protectedCopy.isNotEmpty()) { "API key cannot be empty" }
-                secrets.saveApiKey(protectedCopy)
-                mutableState.value = mutableState.value.copy(keyConfigured = true, errorMessage = null)
-            } catch (error: Exception) {
-                mutableState.value = mutableState.value.copy(errorMessage = safeMessage(error))
+                keyMutationMutex.withLock {
+                    try {
+                        require(protectedCopy.isNotEmpty()) { "API key cannot be empty" }
+                        quotaJob?.cancelAndJoin()
+                        try {
+                            quota.clear()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            mutableState.value = mutableState.value.copy(
+                                budget = mutableState.value.budget.copy(
+                                    refreshing = false,
+                                    errorMessage = QUOTA_CACHE_CLEAR_FAILURE_MESSAGE,
+                                ),
+                            )
+                            return@withLock
+                        }
+                        mutableState.value = mutableState.value.copy(
+                            budget = BudgetUiState(),
+                        )
+                        secrets.saveApiKey(protectedCopy)
+                        mutableState.value = mutableState.value.copy(
+                            keyConfigured = true,
+                            errorMessage = null,
+                        )
+                        refreshQuota()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        mutableState.value = mutableState.value.copy(errorMessage = safeMessage(error))
+                    }
+                }
             } finally {
                 protectedCopy.fill('\u0000')
             }
@@ -149,11 +191,29 @@ class AppViewModel(
 
     fun clearApiKey() {
         cancel()
-        try {
-            secrets.clearApiKey()
-            mutableState.value = mutableState.value.copy(keyConfigured = false, errorMessage = null)
-        } catch (_: SecureStoragePersistenceFailure) {
-            mutableState.value = mutableState.value.copy(errorMessage = API_KEY_CLEAR_FAILURE_MESSAGE)
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            keyMutationMutex.withLock {
+                try {
+                    secrets.clearApiKey()
+                    quotaJob?.cancelAndJoin()
+                    mutableState.value = mutableState.value.copy(
+                        keyConfigured = false,
+                        budget = BudgetUiState(),
+                    )
+                    try {
+                        quota.clear()
+                        mutableState.value = mutableState.value.copy(errorMessage = null)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        mutableState.value = mutableState.value.copy(
+                            budget = BudgetUiState(errorMessage = QUOTA_CACHE_CLEAR_FAILURE_MESSAGE),
+                        )
+                    }
+                } catch (_: SecureStoragePersistenceFailure) {
+                    mutableState.value = mutableState.value.copy(errorMessage = API_KEY_CLEAR_FAILURE_MESSAGE)
+                }
+            }
         }
     }
 
@@ -162,20 +222,47 @@ class AppViewModel(
         mutableState.value = mutableState.value.copy(zdr = enabled)
     }
 
-    fun setBillingDay(day: Int) {
-        if (day !in 1..31) {
-            mutableState.value = mutableState.value.copy(billingDayError = BILLING_DAY_ERROR)
-            return
-        }
-        settings.billingDay = day
-        mutableState.value = mutableState.value.copy(billingDay = day, billingDayError = null)
-        updateBudget()
+    fun selectModel(model: ChatModel) {
+        val currentModel = mutableState.value.models.firstOrNull { it.apiId == model.apiId } ?: return
+        mutableState.value = mutableState.value.copy(selectedModel = currentModel)
     }
 
-    fun selectModel(model: ChatModel) {
-        require(model == ChatModel.SOL || model == ChatModel.LUNA)
-        mutableState.value = mutableState.value.copy(selectedModel = model)
-        updateBudget()
+    fun refreshQuota() {
+        if (!mutableState.value.keyConfigured || quotaJob?.isActive == true) return
+        quotaJob = viewModelScope.launch {
+            var apiKey: CharArray? = null
+            mutableState.value = mutableState.value.copy(
+                budget = mutableState.value.budget.copy(refreshing = true, errorMessage = null),
+            )
+            try {
+                apiKey = secrets.readApiKey() ?: throw IllegalStateException("API key unavailable")
+                val snapshot = quota.refresh(apiKey)
+                mutableState.value = mutableState.value.copy(
+                    budget = BudgetUiState(
+                        snapshot = snapshot,
+                        freshness = BudgetFreshness.LIVE,
+                    ),
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                val snapshot = mutableState.value.budget.snapshot
+                mutableState.value = mutableState.value.copy(
+                    budget = BudgetUiState(
+                        snapshot = snapshot,
+                        freshness = if (snapshot == null) BudgetFreshness.UNAVAILABLE else BudgetFreshness.STALE,
+                        errorMessage = safeQuotaMessage(error),
+                    ),
+                )
+            } finally {
+                apiKey?.fill('\u0000')
+                if (mutableState.value.budget.refreshing) {
+                    mutableState.value = mutableState.value.copy(
+                        budget = mutableState.value.budget.copy(refreshing = false),
+                    )
+                }
+            }
+        }
     }
 
     fun openConversation(id: String) {
@@ -263,6 +350,7 @@ class AppViewModel(
                     )
                     if (!registeredTurn.completionCommitted) throw TurnFailure(TurnFailureKind.COMMIT_REJECTED)
                     finishTurn(registeredTurn, errorMessage = null)
+                    refreshQuota()
                 }
             } catch (cancelled: CancellationException) {
                 if (turn?.completionCommitted != true) {
@@ -347,34 +435,34 @@ class AppViewModel(
         }
     }
 
-    private fun updateBudget() {
-        val instant = now()
-        val billingDay = mutableState.value.billingDay
-        val fiveHours = BudgetCalculator.currentWindow(usageEvents, instant, Duration.ofHours(5), BigDecimal("14"))
-        val weekly = BudgetCalculator.currentWindow(usageEvents, instant, Duration.ofDays(7), BigDecimal("35"))
-        val monthly = BudgetCalculator.monthlyWindow(
-            usageEvents,
-            ZonedDateTime.ofInstant(instant, ZoneId.systemDefault()),
-            billingDay,
-        ).copy(capCredits = BigDecimal("70"))
-        val budget = BudgetUiState(fiveHours, weekly, monthly, mutableState.value.selectedModel)
-        mutableState.value = mutableState.value.copy(budget = budget)
-        if (budgetTicks == null) scheduleBudgetRefresh(instant, budget)
+    private fun refreshModels() {
+        viewModelScope.launch {
+            try {
+                val models = modelCatalogue.refresh().models.requireSolModel()
+                val selected = models.firstOrNull {
+                    it.apiId == mutableState.value.selectedModel.apiId
+                } ?: ChatModel.SOL
+                mutableState.value = mutableState.value.copy(models = models, selectedModel = selected)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // The validated local catalogue remains active when refresh fails.
+            }
+        }
     }
 
-    private fun scheduleBudgetRefresh(instant: Instant, budget: BudgetUiState) {
-        budgetTimer?.cancel()
-        val nextReset = listOfNotNull(
-            budget.fiveHours.resetAt,
-            budget.weekly.resetAt,
-            budget.monthly.resetAt,
-        ).filter { it > instant }.minOrNull() ?: return
-        val delayMillis = Duration.between(instant, nextReset).toMillis().coerceAtLeast(1L)
-        budgetTimer = viewModelScope.launch {
-            delay(delayMillis)
-            budgetTimer = null
-            updateBudget()
-        }
+    private fun safeQuotaMessage(error: Exception): String = when ((error as? ServiceException)?.kind) {
+        ServiceException.Kind.UNAUTHORIZED -> "Quota could not be loaded: invalid or expired API key."
+        ServiceException.Kind.FORBIDDEN -> "Quota access is forbidden."
+        ServiceException.Kind.RATE_LIMITED -> "Quota is temporarily rate limited."
+        ServiceException.Kind.TIMEOUT -> "Quota request timed out. Try again."
+        ServiceException.Kind.BAD_RESPONSE -> "Quota service returned an invalid response."
+        ServiceException.Kind.UNAVAILABLE -> "Quota service is unavailable. Try again."
+        null -> "Quota could not be refreshed. Try again."
+    }
+
+    private fun List<ChatModel>.requireSolModel(): List<ChatModel> = also { models ->
+        require(models.any { it == ChatModel.SOL }) { "The active catalogue must contain GPT-5.6 Sol" }
     }
 
     private fun safeMessage(error: Exception): String = when (error) {
@@ -406,9 +494,9 @@ class AppViewModel(
     companion object {
         private const val CHECKPOINT_MILLIS = 1_000L
         private const val CHECKPOINT_CHARS = 1_024
-        private const val BILLING_DAY_ERROR = "Billing day must be from 1 to 31"
         private const val API_KEY_RECOVERY_MESSAGE = "The encrypted API key cannot be opened. Recovery is required."
         private const val API_KEY_CLEAR_FAILURE_MESSAGE = "API key could not be cleared. Try again."
+        private const val QUOTA_CACHE_CLEAR_FAILURE_MESSAGE = "Saved quota could not be cleared. Try again."
 
         fun factory(container: AppContainer): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
@@ -417,6 +505,8 @@ class AppViewModel(
                 container.settings,
                 container.chatStore,
                 container.streamSource,
+                container.modelCatalogue,
+                container.quota,
             ) as T
         }
     }

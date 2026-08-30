@@ -1,31 +1,15 @@
 package com.commandcode.chat.domain
 
-import java.math.BigDecimal
-import java.math.MathContext
+enum class ApiFamily(val wireValue: String) { OPENAI_CHAT("openai-chat") }
 
-data class TokenRates(
-    val inputPerMillion: BigDecimal,
-    val cachedInputPerMillion: BigDecimal,
-    val outputPerMillion: BigDecimal,
-)
-
-enum class ChatModel(
-    val apiId: String,
-    val displayName: String,
-    val monthlyAllowance: BigDecimal,
-    val rates: TokenRates,
-) {
-    SOL("gpt-5.6-sol", "GPT-5.6 Sol", bd("70"), TokenRates(bd("5"), bd("0.5"), bd("30"))),
-    LUNA("gpt-5.6-luna", "GPT-5.6 Luna", bd("20"), TokenRates(bd("0.2"), bd("0.02"), bd("1.2")));
-
-    val goatMultiplier: BigDecimal
-        get() = BigDecimal("70").divide(monthlyAllowance, MathContext.DECIMAL128)
+data class ChatModel(val apiId: String, val displayName: String, val apiFamily: ApiFamily) {
+    init {
+        require(apiId.isNotBlank())
+        require(displayName.isNotBlank())
+    }
 
     companion object {
-        const val RATES_EFFECTIVE_AS_OF = "2026-08-29"
-
-        fun fromApiId(apiId: String): ChatModel? = entries.singleOrNull { it.apiId == apiId }
+        val SOL = ChatModel("gpt-5.6-sol", "GPT-5.6 Sol", ApiFamily.OPENAI_CHAT)
+        val LUNA = ChatModel("gpt-5.6-luna", "GPT-5.6 Luna", ApiFamily.OPENAI_CHAT)
     }
 }
-
-private fun bd(value: String) = BigDecimal(value)

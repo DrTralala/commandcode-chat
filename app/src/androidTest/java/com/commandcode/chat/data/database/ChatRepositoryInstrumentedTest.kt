@@ -1,26 +1,23 @@
 package com.commandcode.chat.data.database
 
-import android.app.Application
-import com.commandcode.chat.domain.ChatModel
-import com.commandcode.chat.domain.TokenUsage
 import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.TokenUsage
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Assert.assertNull
 import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
-import org.robolectric.annotation.Config
 import java.util.concurrent.CopyOnWriteArrayList
 
-@RunWith(RobolectricTestRunner::class)
-@Config(application = Application::class)
-class ChatRepositoryTest {
+@RunWith(AndroidJUnit4::class)
+class ChatRepositoryInstrumentedTest {
     private val databases = CopyOnWriteArrayList<ChatDatabase>()
 
     @After
@@ -28,6 +25,7 @@ class ChatRepositoryTest {
         databases.forEach { runCatching { it.close() } }
         databases.clear()
     }
+
     @Test
     fun beginTurnCreatesConversationPendingRowsAndIncompleteUsageAnchor() = runTest {
         val startedAt = 1_777_777L
@@ -40,10 +38,7 @@ class ChatRepositoryTest {
         assertEquals("hello world", conversation.title)
         assertEquals(ChatModel.SOL.apiId, conversation.defaultModelId)
         val rows = repository.observeMessages(turn.conversationId).first()
-        assertEquals(
-            listOf("USER", "ASSISTANT"),
-            rows.map { it.role },
-        )
+        assertEquals(listOf("USER", "ASSISTANT"), rows.map { it.role })
         assertEquals(turn.userMessageId, rows[0].id)
         assertEquals("  hello   world  ", rows[0].content)
         assertEquals("COMPLETE", rows[0].status)
@@ -91,7 +86,6 @@ class ChatRepositoryTest {
         repository.checkpointAssistant(turn.assistantMessageId, "stale")
         repository.interruptTurn(turn.assistantMessageId, "stale", "stale")
         assertEquals("answer", database.messages().find(turn.assistantMessageId)?.content)
-
         assertTrue(event.usageComplete)
     }
 
@@ -161,7 +155,10 @@ class ChatRepositoryTest {
         assertEquals(first, second)
         val next = repository.beginTurn(turn.conversationId, "next\u00a0turn\u2003now", ChatModel.SOL)
         val rows = repository.observeMessages(turn.conversationId).first()
-        assertEquals(listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId), rows.map { it.id })
+        assertEquals(
+            listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId),
+            rows.map { it.id },
+        )
         assertTrue(rows.zipWithNext().all { (a, b) -> b.createdAt > a.createdAt })
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > conversation.updatedAt)
     }
@@ -186,10 +183,7 @@ class ChatRepositoryTest {
 
         val snapshot = repository.messagesSnapshot(turn.conversationId)
 
-        assertEquals(
-            listOf("first", "first answer", "second", ""),
-            snapshot.map { it.content },
-        )
+        assertEquals(listOf("first", "first answer", "second", ""), snapshot.map { it.content })
         assertEquals(second.assistantMessageId, snapshot.last().id)
     }
 
@@ -207,9 +201,16 @@ class ChatRepositoryTest {
     @Test
     fun timestampOverflowFailsAtomically() = runTest {
         val (repository, database) = testRepository()
-        database.conversations().insert(ConversationEntity("boundary", "boundary", ChatModel.SOL.apiId, Long.MAX_VALUE, Long.MAX_VALUE))
-        database.messages().insert(MessageEntity("existing", "boundary", "USER", "existing", null, Long.MAX_VALUE, "COMPLETE"))
-        assertTrue(runCatching { repository.beginTurn("boundary", "overflow", ChatModel.SOL) }.exceptionOrNull() is IllegalStateException)
+        database.conversations().insert(
+            ConversationEntity("boundary", "boundary", ChatModel.SOL.apiId, Long.MAX_VALUE, Long.MAX_VALUE),
+        )
+        database.messages().insert(
+            MessageEntity("existing", "boundary", "USER", "existing", null, Long.MAX_VALUE, "COMPLETE"),
+        )
+        assertTrue(
+            runCatching { repository.beginTurn("boundary", "overflow", ChatModel.SOL) }.exceptionOrNull() is
+                IllegalStateException,
+        )
         assertEquals(1, database.messages().observeForConversation("boundary").first().size)
         assertTrue(database.usageEvents().observeForConversation("boundary").first().isEmpty())
     }

@@ -19,3 +19,4 @@ opencode.json
 __pycache__/
 .worktrees/
 .superpowers/
+docs/

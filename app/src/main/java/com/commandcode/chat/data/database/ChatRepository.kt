@@ -1,20 +1,16 @@
 package com.commandcode.chat.data.database
 
 import androidx.room.withTransaction
-import com.commandcode.chat.data.budget.BudgetCalculator
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.TokenUsage
-import com.commandcode.chat.domain.UsageEvent
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
-import java.math.BigDecimal
-import java.time.Instant
 import java.util.UUID
 
 data class Conversation(
     val id: String,
     val title: String,
-    val defaultModel: ChatModel,
+    val defaultModelId: String,
     val createdAt: Long,
     val updatedAt: Long,
 )
@@ -24,7 +20,7 @@ data class Message(
     val conversationId: String,
     val role: String,
     val content: String,
-    val model: ChatModel?,
+    val modelId: String?,
     val createdAt: Long,
     val status: String,
 )
@@ -56,9 +52,6 @@ class ChatRepository(
     suspend fun messagesSnapshot(conversationId: String): List<Message> = database.withTransaction {
         database.messages().listForConversation(conversationId).map { it.toDomain() }
     }
-
-    fun observeUsageEvents(): Flow<List<UsageEvent>> = database.usageEvents().observeAll()
-        .map { rows -> rows.map { it.toDomain() } }
 
     suspend fun deleteConversation(id: String) {
         database.withTransaction {
@@ -113,15 +106,14 @@ class ChatRepository(
             check(assistant.status == Status.PENDING || assistant.status == Status.STREAMING) { "Assistant turn is terminal" }
             if (database.messages().updateIfStatus(messageId, assistant.status, text, Status.COMPLETE) == 0) return@withTransaction false
             touchConversation(assistant.conversationId)
-            val estimate = usage?.let { BudgetCalculator.estimateIfDetailed(requireModel(assistant), it) }
             check(
                 database.usageEvents().complete(
                     requestId = messageId,
                     inputTokens = usage?.inputTokens,
                     cachedInputTokens = usage?.cachedInputTokens,
                     outputTokens = usage?.outputTokens,
-                    estimatedModelCost = estimate?.modelCost?.toPlainString(),
-                    estimatedGoatCredits = estimate?.goatCredits?.toPlainString(),
+                    estimatedModelCost = null,
+                    estimatedGoatCredits = null,
                 ) == 1,
             ) { "Usage anchor missing" }
             true
@@ -159,22 +151,8 @@ class ChatRepository(
         database.messages().find(id)?.also { check(it.role == Role.ASSISTANT) { "Message is not an assistant turn" } }
             ?: error("Message not found")
 
-    private fun requireModel(message: MessageEntity): ChatModel =
-        message.modelId?.let(ChatModel::fromApiId) ?: error("Assistant model missing")
-
-    private fun ConversationEntity.toDomain() = Conversation(id, title, ChatModel.fromApiId(defaultModel)!!, createdAt, updatedAt)
-    private fun MessageEntity.toDomain() = Message(id, conversationId, role, content, modelId?.let(ChatModel::fromApiId), createdAt, status)
-    private fun UsageEventEntity.toDomain() = UsageEvent(
-        id = id,
-        model = ChatModel.fromApiId(modelId) ?: error("Unknown stored model"),
-        timestamp = Instant.ofEpochMilli(timestamp),
-        usage = if (usageComplete && inputTokens != null && outputTokens != null) {
-            TokenUsage(inputTokens, cachedInputTokens, outputTokens)
-        } else null,
-        estimatedModelCost = estimatedModelCost?.let(::BigDecimal),
-        estimatedGoatCredits = estimatedGoatCredits?.let(::BigDecimal),
-        usageComplete = usageComplete,
-    )
+    private fun ConversationEntity.toDomain() = Conversation(id, title, defaultModel, createdAt, updatedAt)
+    private fun MessageEntity.toDomain() = Message(id, conversationId, role, content, modelId, createdAt, status)
 
     private fun titleFor(text: String): String {
         val normalised = buildString {

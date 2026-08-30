@@ -13,7 +13,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,11 +33,8 @@ fun SettingsScreen(
     onSaveApiKey: (CharArray) -> Unit,
     onClearApiKey: () -> Unit,
     onSetZdr: (Boolean) -> Unit,
-    onSetBillingDay: (Int) -> Unit,
 ) {
     var apiKey by remember { mutableStateOf("") }
-    var billingDay by remember { mutableStateOf(state.billingDay.toString()) }
-    LaunchedEffect(state.billingDay) { billingDay = state.billingDay.toString() }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("Settings", style = MaterialTheme.typography.headlineSmall)
         Text("SECURITY CONTROL", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
@@ -71,20 +67,6 @@ fun SettingsScreen(
                     .semantics { contentDescription = "Zero data retention" },
             )
         }
-        OutlinedTextField(
-            value = billingDay,
-            onValueChange = { billingDay = it.filter(Char::isDigit).take(2) },
-            modifier = Modifier.fillMaxWidth().testTag("billing_day"),
-            label = { Text("Billing day (1–31)") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            singleLine = true,
-            isError = state.billingDayError != null,
-            supportingText = { state.billingDayError?.let { Text(it) } },
-        )
-        OutlinedButton(
-            onClick = { onSetBillingDay(billingDay.toIntOrNull() ?: 0) },
-            modifier = Modifier.fillMaxWidth().testTag("save_billing_day"),
-        ) { Text("Save billing day") }
         state.errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
 }

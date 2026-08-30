@@ -5,9 +5,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -44,6 +49,7 @@ import com.commandcode.chat.ui.chat.ChatScreen
 import com.commandcode.chat.ui.history.HistoryScreen
 import com.commandcode.chat.ui.settings.SettingsScreen
 import com.commandcode.chat.R
+import com.commandcode.chat.domain.ChatModel
 
 private val Ink = Color(0xFF0B111B)
 private val Slate = Color(0xFF131E2C)
@@ -64,10 +70,17 @@ private val AppColours = darkColorScheme(
 fun AppRoot(viewModel: AppViewModel?, startupRecovery: Boolean = false) {
     MaterialTheme(colorScheme = AppColours) {
         Surface(modifier = Modifier.fillMaxSize()) {
-            when {
-                startupRecovery -> RecoveryScreen("Encrypted local data cannot be opened on this device.")
-                viewModel == null -> RecoveryScreen("Application security could not be initialised.")
-                else -> AppContent(viewModel)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))
+                    .testTag("app_inset_content"),
+            ) {
+                when {
+                    startupRecovery -> RecoveryScreen("Encrypted local data cannot be opened on this device.")
+                    viewModel == null -> RecoveryScreen("Application security could not be initialised.")
+                    else -> AppContent(viewModel)
+                }
             }
         }
     }
@@ -114,18 +127,20 @@ private fun AppContent(viewModel: AppViewModel) {
                 composable(Route.HISTORY) {
                     HistoryScreen(
                         conversations = state.conversations,
+                        modelDisplayName = { modelId -> modelDisplayName(state.models, modelId) },
                         onOpen = { viewModel.openConversation(it); navController.navigate(Route.CHAT) },
                         onDelete = viewModel::deleteConversation,
                     )
                 }
-                composable(Route.BUDGET) { BudgetScreen(state.budget) }
+                composable(Route.BUDGET) {
+                    BudgetScreen(budget = state.budget, onRefresh = viewModel::refreshQuota)
+                }
                 composable(Route.SETTINGS) {
                     SettingsScreen(
                         state = state,
                         onSaveApiKey = viewModel::saveApiKey,
                         onClearApiKey = viewModel::clearApiKey,
                         onSetZdr = viewModel::setZdr,
-                        onSetBillingDay = viewModel::setBillingDay,
                     )
                 }
             }
@@ -210,3 +225,6 @@ internal fun navigationTarget(previouslyConfigured: Boolean, keyConfigured: Bool
     previouslyConfigured && !keyConfigured -> Route.SETTINGS
     else -> null
 }
+
+internal fun modelDisplayName(models: List<ChatModel>, modelId: String): String =
+    models.firstOrNull { it.apiId == modelId }?.displayName ?: modelId
