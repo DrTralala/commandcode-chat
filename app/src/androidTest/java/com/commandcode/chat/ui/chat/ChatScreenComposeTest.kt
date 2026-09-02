@@ -52,7 +52,16 @@ class ChatScreenComposeTest {
 
         val modelBounds = compose.onNodeWithTag("model_selector").fetchSemanticsNode().boundsInRoot
         val newChatBounds = compose.onNodeWithTag("new_chat").fetchSemanticsNode().boundsInRoot
+        val titleBounds = compose.onNodeWithText("New Chat").fetchSemanticsNode().boundsInRoot
         assertTrue("model=$modelBounds newChat=$newChatBounds", modelBounds.left < newChatBounds.left)
+        assertTrue(
+            "title=$titleBounds model=$modelBounds",
+            kotlin.math.abs(titleBounds.center.y - modelBounds.center.y) <= 1f,
+        )
+        assertTrue(
+            "title=$titleBounds newChat=$newChatBounds",
+            kotlin.math.abs(titleBounds.center.y - newChatBounds.center.y) <= 1f,
+        )
     }
 
     @Test
@@ -160,6 +169,12 @@ class ChatScreenComposeTest {
         compose.onNodeWithTag("active_assistant_response")
             .assertIsDisplayed()
             .assertContentDescriptionEquals("Assistant message")
+        compose.onNodeWithText("Question").assertIsDisplayed()
+        compose.onNodeWithText("Answer").assertIsDisplayed()
+        compose.onNodeWithText("Streaming answer").assertIsDisplayed()
+        compose.onAllNodesWithText("USER · COMPLETE").assertCountEquals(0)
+        compose.onAllNodesWithText("ASSISTANT · COMPLETE").assertCountEquals(0)
+        compose.onAllNodesWithText("ASSISTANT · STREAMING").assertCountEquals(0)
 
         assertTrue("user=$user assistant=$assistant", user.right > assistant.right)
         assertTrue("user=$user assistant=$assistant", assistant.left < user.left)

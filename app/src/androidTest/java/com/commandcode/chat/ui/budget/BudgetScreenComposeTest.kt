@@ -186,6 +186,11 @@ class BudgetScreenComposeTest {
             .fetchSemanticsNode()
         compose.onNodeWithText("Purchased credits: 12.5").fetchSemanticsNode()
         compose.onNodeWithText("Free credits: 4").fetchSemanticsNode()
+        val fiveHourBounds = compose.onNodeWithTag("budget_five_hour_progress").fetchSemanticsNode().boundsInRoot
+        val weeklyBounds = compose.onNodeWithTag("budget_weekly_progress").fetchSemanticsNode().boundsInRoot
+        val monthlyBounds = compose.onNodeWithTag("budget_monthly_progress").fetchSemanticsNode().boundsInRoot
+        assertTrue("fiveHour=$fiveHourBounds weekly=$weeklyBounds", fiveHourBounds.bottom < weeklyBounds.top)
+        assertTrue("weekly=$weeklyBounds monthly=$monthlyBounds", weeklyBounds.bottom < monthlyBounds.top)
     }
 
     private fun assertProgress(tag: String, expected: Float) {

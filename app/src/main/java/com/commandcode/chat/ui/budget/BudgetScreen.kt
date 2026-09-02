@@ -114,21 +114,6 @@ fun BudgetScreen(budget: BudgetUiState, onRefresh: () -> Unit) {
             modifier = Modifier.testTag("budget_freshness"),
         )
         budget.snapshot?.let { snapshot ->
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                val monthlyCap = snapshot.monthly.cap
-                if (monthlyCap == null) {
-                    Text("Monthly credits remaining: ${formatCredits(snapshot.monthly.remaining)}")
-                } else {
-                    Text(
-                        "${formatCredits(snapshot.monthly.remaining)} / " +
-                            "${formatCredits(monthlyCap)} credits remaining",
-                    )
-                    LinearProgressIndicator(
-                        progress = { consumedQuotaFraction(snapshot.monthly.remaining, monthlyCap) },
-                        modifier = Modifier.fillMaxWidth().testTag("budget_monthly_progress"),
-                    )
-                }
-            }
             snapshot.fiveHour?.let { fiveHour ->
                 QuotaWindow(
                     label = "Five-hour",
@@ -146,6 +131,21 @@ fun BudgetScreen(budget: BudgetUiState, onRefresh: () -> Unit) {
                     resetAt = weekly.resetAt,
                     testTag = "budget_weekly_progress",
                 )
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                val monthlyCap = snapshot.monthly.cap
+                if (monthlyCap == null) {
+                    Text("Monthly credits remaining: ${formatCredits(snapshot.monthly.remaining)}")
+                } else {
+                    Text(
+                        "${formatCredits(snapshot.monthly.remaining)} / " +
+                            "${formatCredits(monthlyCap)} credits remaining",
+                    )
+                    LinearProgressIndicator(
+                        progress = { consumedQuotaFraction(snapshot.monthly.remaining, monthlyCap) },
+                        modifier = Modifier.fillMaxWidth().testTag("budget_monthly_progress"),
+                    )
+                }
             }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("Purchased credits: ${formatCredits(snapshot.purchasedCredits)}")

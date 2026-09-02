@@ -76,7 +76,7 @@ class AppSmokeTest {
     fun firstLaunchSettingsNavigationModelsValidationAndRecreation() {
         compose.onNodeWithText("Settings").assertIsDisplayed()
         compose.onNodeWithTag("zdr_toggle").assertIsOn()
-        compose.onNodeWithContentDescription("Zero data retention").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Zero data retention (ZDR)").assertIsDisplayed()
         compose.onAllNodesWithTag("billing_day").assertCountEquals(0)
 
         compose.onNodeWithTag("api_key").performTextInput("fake-offline-key")
@@ -131,9 +131,11 @@ class AppSmokeTest {
         compose.onNodeWithTag("budget_retry").assertIsDisplayed()
         compose.onAllNodesWithText("Estimated from this app").assertCountEquals(0)
         compose.onNodeWithTag("nav_settings").performClick()
-        compose.onNodeWithText("API key configured").assertIsDisplayed()
+        compose.onNodeWithText("API key: configured").assertIsDisplayed()
+        compose.onAllNodesWithTag("api_key").assertCountEquals(0)
+        compose.onAllNodesWithTag("save_api_key").assertCountEquals(0)
         compose.onAllNodesWithTag("billing_day").assertCountEquals(0)
-        compose.onNodeWithContentDescription("Zero data retention").performClick().assertIsOff()
+        compose.onNodeWithContentDescription("Zero data retention (ZDR)").performClick().assertIsOff()
         compose.onNodeWithTag("security_zdr_status").assertTextEquals("ZDR OFF")
         compose.onNodeWithContentDescription("AMOLED dark mode").performClick().assertIsOn()
 
