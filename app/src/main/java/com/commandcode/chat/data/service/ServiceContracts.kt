@@ -20,17 +20,17 @@ interface ModelCatalogueSource {
     suspend fun refresh(): ModelCatalogueSnapshot
 }
 
-data class RemainingQuota(val remaining: Double, val cap: Double)
+data class RemainingQuota(val remaining: Double, val cap: Double?)
 
 data class UsedQuota(val used: Double, val cap: Double, val resetAt: Instant)
 
 data class QuotaSnapshot(
     val fetchedAt: Instant,
-    val planId: String,
-    val limited: Boolean,
+    val planId: String?,
+    val limited: Boolean?,
     val monthly: RemainingQuota,
-    val fiveHour: UsedQuota,
-    val weekly: UsedQuota,
+    val fiveHour: UsedQuota?,
+    val weekly: UsedQuota?,
     val purchasedCredits: Double,
     val freeCredits: Double,
 )
@@ -181,26 +181,25 @@ internal object ModelCatalogueCodec {
 }
 
 internal object QuotaSnapshotCodec {
-    const val SUPPORTED_SCHEMA_VERSION = 1
+    const val SUPPORTED_SCHEMA_VERSION = 2
     const val MAX_QUOTA_BYTES = 65_536
+
+    private const val LEGACY_SCHEMA_VERSION = 1
 
     fun validate(snapshot: QuotaSnapshot): QuotaSnapshot {
         require(epochMillis(snapshot.fetchedAt, "fetchedAt") > 0) {
             "fetchedAt must be positive"
         }
-        require(snapshot.planId.isNotBlank()) { "planId must not be blank" }
+        snapshot.planId?.let { require(it.isNotBlank()) { "planId must not be blank" } }
         requireAmount(snapshot.monthly.remaining, "monthly.remaining")
-        requireCap(snapshot.monthly.cap, "monthly.cap")
-        requireAmount(snapshot.fiveHour.used, "fiveHour.used")
-        requireCap(snapshot.fiveHour.cap, "fiveHour.cap")
-        require(epochMillis(snapshot.fiveHour.resetAt, "fiveHour.resetAt") > 0) {
-            "fiveHour.resetAt must be positive"
+        snapshot.monthly.cap?.let { requireCap(it, "monthly.cap") }
+        val hasNoWindows = snapshot.limited == null && snapshot.fiveHour == null && snapshot.weekly == null
+        val hasAllWindows = snapshot.limited != null && snapshot.fiveHour != null && snapshot.weekly != null
+        require(hasNoWindows || hasAllWindows) {
+            "Rolling quota fields must be all present or all absent"
         }
-        requireAmount(snapshot.weekly.used, "weekly.used")
-        requireCap(snapshot.weekly.cap, "weekly.cap")
-        require(epochMillis(snapshot.weekly.resetAt, "weekly.resetAt") > 0) {
-            "weekly.resetAt must be positive"
-        }
+        snapshot.fiveHour?.let { validateWindow(it, "fiveHour") }
+        snapshot.weekly?.let { validateWindow(it, "weekly") }
         requireAmount(snapshot.purchasedCredits, "purchasedCredits")
         requireAmount(snapshot.freeCredits, "freeCredits")
         return snapshot
@@ -225,31 +224,27 @@ internal object QuotaSnapshotCodec {
 
     fun encode(snapshot: QuotaSnapshot): String {
         val validated = validate(snapshot)
+        val windowLimits = if (validated.limited == null) {
+            JSONObject.NULL
+        } else {
+            val fiveHour = checkNotNull(validated.fiveHour)
+            val weekly = checkNotNull(validated.weekly)
+            JSONObject()
+                .put("limited", validated.limited)
+                .put("fiveHour", encodeWindow(fiveHour, "fiveHour"))
+                .put("weekly", encodeWindow(weekly, "weekly"))
+        }
         val encoded = JSONObject()
             .put("schemaVersion", SUPPORTED_SCHEMA_VERSION)
             .put("fetchedAt", epochMillis(validated.fetchedAt, "fetchedAt"))
-            .put("planId", validated.planId)
-            .put("limited", validated.limited)
+            .put("planId", validated.planId ?: JSONObject.NULL)
             .put(
                 "monthly",
                 JSONObject()
                     .put("remaining", validated.monthly.remaining)
-                    .put("cap", validated.monthly.cap),
+                    .put("cap", validated.monthly.cap ?: JSONObject.NULL),
             )
-            .put(
-                "fiveHour",
-                JSONObject()
-                    .put("used", validated.fiveHour.used)
-                    .put("cap", validated.fiveHour.cap)
-                    .put("resetAt", epochMillis(validated.fiveHour.resetAt, "fiveHour.resetAt")),
-            )
-            .put(
-                "weekly",
-                JSONObject()
-                    .put("used", validated.weekly.used)
-                    .put("cap", validated.weekly.cap)
-                    .put("resetAt", epochMillis(validated.weekly.resetAt, "weekly.resetAt")),
-            )
+            .put("windowLimits", windowLimits)
             .put("purchasedCredits", validated.purchasedCredits)
             .put("freeCredits", validated.freeCredits)
             .toString()
@@ -259,7 +254,13 @@ internal object QuotaSnapshotCodec {
         return encoded
     }
 
-    private fun decodeObject(root: JSONObject): QuotaSnapshot {
+    private fun decodeObject(root: JSONObject): QuotaSnapshot = when (intValue(root, "schemaVersion")) {
+        LEGACY_SCHEMA_VERSION -> decodeLegacyObject(root)
+        SUPPORTED_SCHEMA_VERSION -> decodeCurrentObject(root)
+        else -> throw IllegalArgumentException("Unsupported quota schema")
+    }
+
+    private fun decodeLegacyObject(root: JSONObject): QuotaSnapshot {
         requireKeys(
             root,
             setOf(
@@ -281,33 +282,85 @@ internal object QuotaSnapshotCodec {
         requireKeys(fiveHour, setOf("used", "cap", "resetAt"))
         requireKeys(weekly, setOf("used", "cap", "resetAt"))
 
+        val legacyPlanId = stringValue(root, "planId")
         return validate(
             QuotaSnapshot(
                 fetchedAt = Instant.ofEpochMilli(epochMillis(root, "fetchedAt")),
-                planId = stringValue(root, "planId"),
+                planId = legacyPlanId.takeUnless { it == UNREPORTED_PLAN_ID },
                 limited = booleanValue(root, "limited"),
                 monthly = RemainingQuota(
                     remaining = amountValue(monthly, "remaining"),
                     cap = capValue(monthly, "cap"),
                 ),
-                fiveHour = UsedQuota(
-                    used = amountValue(fiveHour, "used"),
-                    cap = capValue(fiveHour, "cap"),
-                    resetAt = Instant.ofEpochMilli(epochMillis(fiveHour, "resetAt")),
-                ),
-                weekly = UsedQuota(
-                    used = amountValue(weekly, "used"),
-                    cap = capValue(weekly, "cap"),
-                    resetAt = Instant.ofEpochMilli(epochMillis(weekly, "resetAt")),
-                ),
+                fiveHour = decodeWindow(fiveHour),
+                weekly = decodeWindow(weekly),
                 purchasedCredits = amountValue(root, "purchasedCredits"),
                 freeCredits = amountValue(root, "freeCredits"),
-            ).also { snapshot ->
-                require(intValue(root, "schemaVersion") == SUPPORTED_SCHEMA_VERSION) {
-                    "Unsupported quota schema"
-                }
-            },
+            ),
         )
+    }
+
+    private fun decodeCurrentObject(root: JSONObject): QuotaSnapshot {
+        requireKeys(
+            root,
+            setOf(
+                "schemaVersion",
+                "fetchedAt",
+                "planId",
+                "monthly",
+                "windowLimits",
+                "purchasedCredits",
+                "freeCredits",
+            ),
+        )
+        val monthly = objectValue(root, "monthly")
+        requireKeys(monthly, setOf("remaining", "cap"))
+        val windowsValue = root.get("windowLimits")
+        val windows = if (windowsValue === JSONObject.NULL) {
+            null
+        } else {
+            require(windowsValue is JSONObject) { "windowLimits must be an object or null" }
+            requireKeys(windowsValue, setOf("limited", "fiveHour", "weekly"))
+            windowsValue
+        }
+
+        return validate(
+            QuotaSnapshot(
+                fetchedAt = Instant.ofEpochMilli(epochMillis(root, "fetchedAt")),
+                planId = nullableStringValue(root, "planId"),
+                limited = windows?.let { booleanValue(it, "limited") },
+                monthly = RemainingQuota(
+                    remaining = amountValue(monthly, "remaining"),
+                    cap = nullableCapValue(monthly, "cap"),
+                ),
+                fiveHour = windows?.let { decodeWindow(objectValue(it, "fiveHour")) },
+                weekly = windows?.let { decodeWindow(objectValue(it, "weekly")) },
+                purchasedCredits = amountValue(root, "purchasedCredits"),
+                freeCredits = amountValue(root, "freeCredits"),
+            ),
+        )
+    }
+
+    private fun encodeWindow(window: UsedQuota, label: String): JSONObject = JSONObject()
+        .put("used", window.used)
+        .put("cap", window.cap)
+        .put("resetAt", epochMillis(window.resetAt, "$label.resetAt"))
+
+    private fun decodeWindow(window: JSONObject): UsedQuota {
+        requireKeys(window, setOf("used", "cap", "resetAt"))
+        return UsedQuota(
+            used = amountValue(window, "used"),
+            cap = capValue(window, "cap"),
+            resetAt = Instant.ofEpochMilli(epochMillis(window, "resetAt")),
+        )
+    }
+
+    private fun validateWindow(window: UsedQuota, label: String) {
+        requireAmount(window.used, "$label.used")
+        requireCap(window.cap, "$label.cap")
+        require(epochMillis(window.resetAt, "$label.resetAt") > 0) {
+            "$label.resetAt must be positive"
+        }
     }
 
     private fun objectValue(objectValue: JSONObject, key: String): JSONObject {
@@ -322,6 +375,13 @@ internal object QuotaSnapshotCodec {
     private fun stringValue(objectValue: JSONObject, key: String): String {
         val value = objectValue.get(key)
         require(value is String) { "$key must be a string" }
+        return value
+    }
+
+    private fun nullableStringValue(objectValue: JSONObject, key: String): String? {
+        val value = objectValue.get(key)
+        if (value === JSONObject.NULL) return null
+        require(value is String) { "$key must be a string or null" }
         return value
     }
 
@@ -357,6 +417,9 @@ internal object QuotaSnapshotCodec {
 
     private fun capValue(objectValue: JSONObject, key: String): Double =
         decimalValue(objectValue, key).toValidatedDouble(allowZero = false)
+
+    private fun nullableCapValue(objectValue: JSONObject, key: String): Double? =
+        if (objectValue.get(key) === JSONObject.NULL) null else capValue(objectValue, key)
 
     private fun decimalValue(objectValue: JSONObject, key: String): BigDecimal {
         val value = objectValue.get(key)

@@ -317,6 +317,68 @@ class AppViewModelTest {
     }
 
     @Test
+    fun newChatClearsSelectionMessagesAndErrorWithoutCreatingOrDeletingAConversation() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        chats.beginTurn("conversation", "existing", ChatModel.SOL)
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            throw IOException("scripted failure")
+        } })
+        configureKey(viewModel)
+        viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.send("fails")
+        advanceUntilIdle()
+        assertTrue(viewModel.state.value.messages.isNotEmpty())
+        assertTrue(viewModel.state.value.errorMessage != null)
+        val beginTurnsBefore = chats.beginTurnCalls
+
+        viewModel.newChat()
+
+        assertNull(viewModel.state.value.currentConversationId)
+        assertTrue(viewModel.state.value.messages.isEmpty())
+        assertNull(viewModel.state.value.errorMessage)
+        assertTrue(chats.lifecycleEvents.none { it.startsWith("delete:") })
+        assertEquals(beginTurnsBefore, chats.beginTurnCalls)
+    }
+
+    @Test
+    fun newChatDoesNothingWhileAResponseIsStreaming() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            emit(StreamEvent.Delta("partial"))
+            awaitCancellation()
+        } })
+        configureKey(viewModel)
+        viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.send("hello")
+        runCurrent()
+        val before = viewModel.state.value
+
+        viewModel.newChat()
+
+        assertEquals(before.currentConversationId, viewModel.state.value.currentConversationId)
+        assertEquals(before.messages, viewModel.state.value.messages)
+        assertEquals(before.streamingText, viewModel.state.value.streamingText)
+        assertTrue(viewModel.state.value.sending)
+        viewModel.cancel()
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun amoledLoadsFromSettingsAndPersistsChanges() = runTest(dispatcher) {
+        val settings = FakeSettings(amoled = true)
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), settings = settings)
+        runCurrent()
+        assertTrue(viewModel.state.value.amoled)
+
+        viewModel.setAmoled(false)
+
+        assertFalse(settings.amoled)
+        assertFalse(viewModel.state.value.amoled)
+    }
+
+    @Test
     fun immediateSecondSendUsesCommittedRepositorySnapshot() = runTest(dispatcher) {
         val chats = FakeChats()
         val requests = mutableListOf<List<ApiMessage>>()
@@ -931,10 +993,11 @@ class AppViewModelTest {
         elapsedMillis: () -> Long = { 0L },
         catalogue: FakeCatalogue = FakeCatalogue(),
         quota: FakeQuota = FakeQuota(),
+        settings: SettingsStore = FakeSettings(),
         apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
     ) = AppViewModel(
         secrets = keys,
-        settings = FakeSettings(),
+        settings = settings,
         chats = chats,
         streamSource = source,
         modelCatalogue = catalogue,
@@ -1044,8 +1107,10 @@ class AppViewModelTest {
         fun storedKey(): String? = key?.concatToString()
     }
 
-    private class FakeSettings : SettingsStore {
-        override var zdr = true
+    private class FakeSettings(
+        override var zdr: Boolean = true,
+        override var amoled: Boolean = false,
+    ) : SettingsStore {
     }
 
     private class FakeChats : ChatStore {
@@ -1062,6 +1127,7 @@ class AppViewModelTest {
         var beginTurnRelease: CompletableDeferred<Unit>? = null
         val usageCompleteByRequest = mutableMapOf<String, Boolean>()
         val deleteFailures = mutableSetOf<String>()
+        var beginTurnCalls = 0
         private var turnCount = 0
         private val deletedConversations = mutableSetOf<String>()
         private val messageOwners = mutableMapOf<String, String>()
@@ -1071,6 +1137,7 @@ class AppViewModelTest {
         override suspend fun messagesSnapshot(conversationId: String): List<Message> = messages(conversationId).value
 
         override suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn {
+            beginTurnCalls += 1
             val id = conversationId ?: "conversation"
             turnCount += 1
             val userId = "user-$turnCount"

@@ -3,14 +3,21 @@ package com.commandcode.chat.data.service
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
 import java.time.Clock
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okio.Buffer
 
 class ServiceException(val kind: Kind) : IOException() {
@@ -21,13 +28,14 @@ internal fun interface ClientKeyMaterialFactory {
     fun create(apiKey: CharArray): ClientKeyMaterial
 }
 
+internal fun interface BearerFactory {
+    fun create(keyBytes: ByteArray): String
+}
+
 internal class ClientKeyMaterial private constructor(
     internal val copiedChars: CharArray,
     internal val copiedBytes: ByteArray,
 ) {
-    internal val bearer: String
-        get() = "Bearer ${copiedBytes.toString(Charsets.UTF_8)}"
-
     internal fun wipe() {
         copiedBytes.fill(0)
         copiedChars.fill('\u0000')
@@ -37,13 +45,18 @@ internal class ClientKeyMaterial private constructor(
         internal fun from(apiKey: CharArray): ClientKeyMaterial {
             val copiedChars = apiKey.copyOf()
             var copiedBytes = ByteArray(0)
+            var encoded: ByteBuffer? = null
             return try {
-                copiedBytes = copiedChars.concatToString().toByteArray(Charsets.UTF_8)
+                encoded = Charsets.UTF_8.encode(CharBuffer.wrap(copiedChars))
+                copiedBytes = ByteArray(encoded.remaining())
+                encoded.get(copiedBytes)
                 ClientKeyMaterial(copiedChars, copiedBytes)
             } catch (failure: Throwable) {
                 copiedBytes.fill(0)
                 copiedChars.fill('\u0000')
                 throw failure
+            } finally {
+                encoded?.takeIf(ByteBuffer::hasArray)?.array()?.fill(0)
             }
         }
     }
@@ -53,57 +66,111 @@ class CommandCodeQuotaClient(
     private val callFactory: Call.Factory = DEFAULT_CALL_FACTORY,
     private val clock: Clock = Clock.systemUTC(),
 ) : QuotaApi {
-    private val endpoint = "https://api.commandcode.ai/alpha/billing/credits".toHttpUrl()
+    private val creditsEndpoint = "https://api.commandcode.ai/alpha/billing/credits".toHttpUrl()
+    private val subscriptionEndpoint = "https://api.commandcode.ai/alpha/billing/subscriptions".toHttpUrl()
     private var keyMaterialFactory: ClientKeyMaterialFactory = ClientKeyMaterialFactory(ClientKeyMaterial::from)
+    private var bearerFactory: BearerFactory = DEFAULT_BEARER_FACTORY
 
     internal constructor(
         callFactory: Call.Factory,
         clock: Clock,
         keyMaterialFactory: ClientKeyMaterialFactory,
+        bearerFactory: BearerFactory = DEFAULT_BEARER_FACTORY,
     ) : this(callFactory, clock) {
         this.keyMaterialFactory = keyMaterialFactory
+        this.bearerFactory = bearerFactory
     }
 
     override suspend fun fetchQuota(apiKey: CharArray): QuotaSnapshot {
         val keyMaterial = keyMaterialFactory.create(apiKey)
         try {
-            return withContext(Dispatchers.IO) {
-                execute(
-                    Request.Builder()
-                        .url(endpoint)
-                        .get()
-                        .header("Accept", "application/json")
-                        .header("Authorization", keyMaterial.bearer)
-                        .build(),
-                )
+            // OkHttp requires an immutable header String; mutable app-owned copies are wiped below,
+            // while this single per-fetch bearer value remains subject to garbage collection.
+            val bearer = bearerFactory.create(keyMaterial.copiedBytes)
+            val creditsRequest = request(creditsEndpoint, bearer)
+            val subscriptionRequest = request(subscriptionEndpoint, bearer)
+            return coroutineScope {
+                val credits = async(Dispatchers.IO) {
+                    execute(creditsRequest)
+                }
+                val planId = async(Dispatchers.IO) {
+                    fetchOptionalPlanId(subscriptionRequest)
+                }
+                val creditsText = credits.await()
+                val subscriptionPlanId = planId.await()
+                try {
+                    CommandCodeQuotaResponseCodec.decode(
+                        text = creditsText,
+                        fetchedAt = clock.instant(),
+                        subscriptionPlanId = subscriptionPlanId,
+                    )
+                } catch (_: Exception) {
+                    throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
+                }
             }
         } finally {
             keyMaterial.wipe()
         }
     }
 
-    private suspend fun execute(request: Request): QuotaSnapshot = withContext(Dispatchers.IO) {
-        try {
-            callFactory.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw statusFailure(response.code)
-                val body: okhttp3.ResponseBody? = response.body
-                if (body == null) throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
-                val text = readResponse(body)
+    private fun request(url: okhttp3.HttpUrl, bearer: String): Request = Request.Builder()
+        .url(url)
+        .get()
+        .header("Accept", "application/json")
+        .header("Authorization", bearer)
+        .build()
+
+    private suspend fun fetchOptionalPlanId(request: Request): String? = try {
+        CommandCodeSubscriptionResponseCodec.decodePlanId(execute(request))
+    } catch (failure: CancellationException) {
+        throw failure
+    } catch (_: Exception) {
+        null
+    }
+
+    private suspend fun execute(request: Request): String = suspendCancellableCoroutine { continuation ->
+        val call = callFactory.newCall(request)
+        continuation.invokeOnCancellation { call.cancel() }
+        val callback = object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                val mapped = mapTransportFailure(e)
+                continuation.resumeWith(Result.failure(mapped))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (!continuation.isActive) {
+                    response.close()
+                    return
+                }
                 try {
-                    CommandCodeQuotaResponseCodec.decode(text, clock.instant())
-                } catch (_: Exception) {
-                    throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
+                    val text = response.use {
+                        if (!it.isSuccessful) throw statusFailure(it.code)
+                        val body: okhttp3.ResponseBody? = it.body
+                        if (body == null) throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
+                        readResponse(body)
+                    }
+                    continuation.resumeWith(Result.success(text))
+                } catch (failure: Throwable) {
+                    val mapped = mapTransportFailure(failure)
+                    continuation.resumeWith(Result.failure(mapped))
                 }
             }
-        } catch (failure: ServiceException) {
-            throw failure
-        } catch (_: SocketTimeoutException) {
-            throw ServiceException(ServiceException.Kind.TIMEOUT)
-        } catch (_: InterruptedIOException) {
-            throw ServiceException(ServiceException.Kind.TIMEOUT)
-        } catch (_: IOException) {
-            throw ServiceException(ServiceException.Kind.UNAVAILABLE)
         }
+        try {
+            call.enqueue(callback)
+        } catch (failure: Throwable) {
+            val mapped = mapTransportFailure(failure)
+            continuation.resumeWith(Result.failure(mapped))
+        }
+    }
+
+    private fun mapTransportFailure(failure: Throwable): Throwable = when (failure) {
+        is CancellationException -> failure
+        is ServiceException -> failure
+        is SocketTimeoutException -> ServiceException(ServiceException.Kind.TIMEOUT)
+        is InterruptedIOException -> ServiceException(ServiceException.Kind.TIMEOUT)
+        is IOException -> ServiceException(ServiceException.Kind.UNAVAILABLE)
+        else -> failure
     }
 
     private fun readResponse(body: okhttp3.ResponseBody): String {
@@ -136,6 +203,22 @@ class CommandCodeQuotaClient(
     }
 
     private companion object {
+        val DEFAULT_BEARER_FACTORY = BearerFactory { bytes ->
+            val bearerBytes = ByteArray(7 + bytes.size)
+            bearerBytes[0] = 'B'.code.toByte()
+            bearerBytes[1] = 'e'.code.toByte()
+            bearerBytes[2] = 'a'.code.toByte()
+            bearerBytes[3] = 'r'.code.toByte()
+            bearerBytes[4] = 'e'.code.toByte()
+            bearerBytes[5] = 'r'.code.toByte()
+            bearerBytes[6] = ' '.code.toByte()
+            bytes.copyInto(bearerBytes, destinationOffset = 7)
+            try {
+                bearerBytes.toString(Charsets.UTF_8)
+            } finally {
+                bearerBytes.fill(0)
+            }
+        }
         val DEFAULT_CALL_FACTORY: Call.Factory = OkHttpClient.Builder()
             .followRedirects(false)
             .followSslRedirects(false)

@@ -33,6 +33,7 @@ fun SettingsScreen(
     onSaveApiKey: (CharArray) -> Unit,
     onClearApiKey: () -> Unit,
     onSetZdr: (Boolean) -> Unit,
+    onSetAmoled: (Boolean) -> Unit,
 ) {
     var apiKey by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -65,6 +66,17 @@ fun SettingsScreen(
                 modifier = Modifier
                     .testTag("zdr_toggle")
                     .semantics { contentDescription = "Zero data retention" },
+            )
+        }
+        Column {
+            Text("AMOLED dark mode")
+            Text("Use true black backgrounds and surfaces.", style = MaterialTheme.typography.bodySmall)
+            Switch(
+                checked = state.amoled,
+                onCheckedChange = onSetAmoled,
+                modifier = Modifier
+                    .testTag("amoled_toggle")
+                    .semantics { contentDescription = "AMOLED dark mode" },
             )
         }
         state.errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }

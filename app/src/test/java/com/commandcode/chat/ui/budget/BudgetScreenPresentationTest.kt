@@ -1,6 +1,5 @@
 package com.commandcode.chat.ui.budget
 
-import com.commandcode.chat.data.service.UNREPORTED_PLAN_ID
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.RemainingQuota
 import com.commandcode.chat.data.service.UsedQuota
@@ -13,9 +12,20 @@ import org.junit.Test
 
 class BudgetScreenPresentationTest {
     @Test
-    fun unreportedPlanUsesUnavailableLabelWithoutExposingTheSentinel() {
-        assertEquals("Plan unavailable", formatPlanLabel(UNREPORTED_PLAN_ID))
-        assertEquals("Plan ID: goat", formatPlanLabel("goat"))
+    fun creditValuesUseHalfUpRoundingWithAtMostTwoDecimalPlaces() {
+        assertEquals("1.23", formatCredits(1.234))
+        assertEquals("1.24", formatCredits(1.235))
+        assertEquals("1.2", formatCredits(1.2))
+        assertEquals("1", formatCredits(1.0))
+        assertEquals("0.01", formatCredits(0.005))
+    }
+
+    @Test
+    fun titleUsesKnownPlanAndSafeFallback() {
+        assertEquals("GOAT usage", budgetTitle("individual-goat"))
+        assertEquals("Pro usage", budgetTitle("individual-pro-v1"))
+        assertEquals("Command Code usage", budgetTitle(null))
+        assertEquals("Command Code usage", budgetTitle("future-plan"))
     }
 
     @Test
@@ -35,6 +45,17 @@ class BudgetScreenPresentationTest {
     }
 
     @Test
+    fun resetTimestampUsesDayMonthAndLowercaseTwelveHourTime() {
+        assertEquals(
+            "3 Sep 9:50pm",
+            formatQuotaResetTimestamp(
+                Instant.parse("2026-09-03T21:50:00Z"),
+                ZoneOffset.UTC,
+            ),
+        )
+    }
+
+    @Test
     fun staleWithoutSnapshotPresentsUnavailableRetryState() {
         assertEquals(
             BudgetFreshness.UNAVAILABLE,
@@ -50,7 +71,7 @@ class BudgetScreenPresentationTest {
 
     private fun snapshot() = QuotaSnapshot(
         fetchedAt = Instant.parse("2026-08-30T12:00:00Z"),
-        planId = "goat",
+        planId = "individual-goat",
         limited = true,
         monthly = RemainingQuota(42.0, 70.0),
         fiveHour = UsedQuota(2.0, 14.0, Instant.parse("2026-08-30T17:00:00Z")),

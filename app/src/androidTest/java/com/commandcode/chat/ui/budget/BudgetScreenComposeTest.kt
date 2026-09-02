@@ -13,12 +13,12 @@ import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.RemainingQuota
-import com.commandcode.chat.data.service.UNREPORTED_PLAN_ID
 import com.commandcode.chat.data.service.UsedQuota
 import com.commandcode.chat.ui.BudgetFreshness
 import com.commandcode.chat.ui.BudgetUiState
 import java.time.Instant
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -45,18 +45,32 @@ class BudgetScreenComposeTest {
 
         assertEquals(1, refreshCalls)
         assertTelemetry(snapshot, "Live")
+        val titleBounds = compose.onNodeWithText("GOAT usage").fetchSemanticsNode().boundsInRoot
+        val refreshBounds = compose.onNodeWithTag("budget_refresh").fetchSemanticsNode().boundsInRoot
+        assertTrue("title=$titleBounds refresh=$refreshBounds", refreshBounds.left > titleBounds.left)
+        assertTrue(
+            "title=$titleBounds refresh=$refreshBounds",
+            kotlin.math.abs(refreshBounds.center.y - titleBounds.center.y) < refreshBounds.height,
+        )
         compose.onNodeWithTag("budget_refresh").assertIsDisplayed().performClick()
         compose.waitForIdle()
         assertEquals(2, refreshCalls)
     }
 
     @Test
-    fun currentQuotaSchemaDoesNotExposeTheInternalPlanSentinel() {
+    fun quotaWithoutPlanCapOrWindowsUsesGenericConditionalPresentation() {
+        val snapshot = testSnapshot(
+            planId = null,
+            limited = null,
+            monthly = RemainingQuota(remaining = 42.0, cap = null),
+            fiveHour = null,
+            weekly = null,
+        )
         compose.setContent {
             MaterialTheme {
                 BudgetScreen(
                     budget = BudgetUiState(
-                        snapshot = testSnapshot(planId = UNREPORTED_PLAN_ID),
+                        snapshot = snapshot,
                         freshness = BudgetFreshness.LIVE,
                     ),
                     onRefresh = {},
@@ -65,8 +79,11 @@ class BudgetScreenComposeTest {
         }
         compose.waitForIdle()
 
-        compose.onNodeWithText("Plan unavailable").assertIsDisplayed()
-        compose.onAllNodesWithText(UNREPORTED_PLAN_ID).assertCountEquals(0)
+        compose.onNodeWithText("Command Code usage").assertIsDisplayed()
+        compose.onNodeWithText("Monthly credits remaining: 42").assertIsDisplayed()
+        compose.onAllNodesWithTag("budget_monthly_progress").assertCountEquals(0)
+        compose.onAllNodesWithTag("budget_five_hour_progress").assertCountEquals(0)
+        compose.onAllNodesWithTag("budget_weekly_progress").assertCountEquals(0)
     }
 
     @Test
@@ -113,7 +130,14 @@ class BudgetScreenComposeTest {
         compose.waitForIdle()
 
         assertEquals(1, refreshCalls)
-        compose.onNodeWithText("GOAT budget telemetry").assertIsDisplayed()
+        compose.onNodeWithText("Command Code usage").assertIsDisplayed()
+        val titleBounds = compose.onNodeWithText("Command Code usage").fetchSemanticsNode().boundsInRoot
+        val retryBounds = compose.onNodeWithTag("budget_retry").fetchSemanticsNode().boundsInRoot
+        assertTrue("title=$titleBounds retry=$retryBounds", retryBounds.left > titleBounds.left)
+        assertTrue(
+            "title=$titleBounds retry=$retryBounds",
+            kotlin.math.abs(retryBounds.center.y - titleBounds.center.y) < retryBounds.height,
+        )
         compose.onNodeWithTag("budget_freshness").assertIsDisplayed()
         compose.onNodeWithText("Budget unavailable").assertIsDisplayed()
         compose.onNodeWithTag("budget_retry").assertIsDisplayed().performClick()
@@ -142,21 +166,24 @@ class BudgetScreenComposeTest {
     }
 
     private fun assertTelemetry(snapshot: QuotaSnapshot, freshness: String) {
-        compose.onNodeWithText("GOAT budget telemetry").fetchSemanticsNode()
+        val fiveHour = requireNotNull(snapshot.fiveHour)
+        val weekly = requireNotNull(snapshot.weekly)
+        compose.onNodeWithText("GOAT usage").fetchSemanticsNode()
         compose.onNodeWithText(freshness).fetchSemanticsNode()
-        compose.onNodeWithText("Plan ID: ${snapshot.planId}").fetchSemanticsNode()
-        compose.onNodeWithText("Limited: Yes").fetchSemanticsNode()
+        compose.onAllNodesWithText("Limited:", substring = true).assertCountEquals(0)
         compose.onNodeWithText("42 / 70 credits remaining").fetchSemanticsNode()
         compose.onNodeWithTag("budget_monthly_progress").fetchSemanticsNode()
         assertProgress("budget_monthly_progress", 0.4f)
         compose.onNodeWithText("Five-hour: 3.2 / 14 credits used").fetchSemanticsNode()
         compose.onNodeWithTag("budget_five_hour_progress").fetchSemanticsNode()
         assertProgress("budget_five_hour_progress", 3.2f / 14f)
-        compose.onNodeWithText("Resets: ${formatQuotaTimestamp(snapshot.fiveHour.resetAt)}").fetchSemanticsNode()
+        compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(fiveHour.resetAt)}")
+            .fetchSemanticsNode()
         compose.onNodeWithText("Weekly: 8 / 100 credits used").fetchSemanticsNode()
         compose.onNodeWithTag("budget_weekly_progress").fetchSemanticsNode()
         assertProgress("budget_weekly_progress", 0.08f)
-        compose.onNodeWithText("Resets: ${formatQuotaTimestamp(snapshot.weekly.resetAt)}").fetchSemanticsNode()
+        compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(weekly.resetAt)}")
+            .fetchSemanticsNode()
         compose.onNodeWithText("Purchased credits: 12.5").fetchSemanticsNode()
         compose.onNodeWithText("Free credits: 4").fetchSemanticsNode()
     }
@@ -168,21 +195,27 @@ class BudgetScreenComposeTest {
         assertEquals(expected, actual, 0.001f)
     }
 
-    private fun testSnapshot(planId: String = "goat-pro") = QuotaSnapshot(
-        fetchedAt = Instant.parse("2026-08-30T12:00:00Z"),
-        planId = planId,
-        limited = true,
-        monthly = RemainingQuota(remaining = 42.0, cap = 70.0),
-        fiveHour = UsedQuota(
+    private fun testSnapshot(
+        planId: String? = "individual-goat",
+        limited: Boolean? = true,
+        monthly: RemainingQuota = RemainingQuota(remaining = 42.0, cap = 70.0),
+        fiveHour: UsedQuota? = UsedQuota(
             used = 3.2,
             cap = 14.0,
             resetAt = Instant.parse("2026-08-30T17:00:00Z"),
         ),
-        weekly = UsedQuota(
+        weekly: UsedQuota? = UsedQuota(
             used = 8.0,
             cap = 100.0,
             resetAt = Instant.parse("2026-09-06T12:00:00Z"),
         ),
+    ) = QuotaSnapshot(
+        fetchedAt = Instant.parse("2026-08-30T12:00:00Z"),
+        planId = planId,
+        limited = limited,
+        monthly = monthly,
+        fiveHour = fiveHour,
+        weekly = weekly,
         purchasedCredits = 12.5,
         freeCredits = 4.0,
     )

@@ -54,6 +54,7 @@ data class AppUiState(
     val recoveryMessage: String? = null,
     val keyConfigured: Boolean = false,
     val zdr: Boolean = true,
+    val amoled: Boolean = false,
     val models: List<ChatModel> = listOf(ChatModel.SOL),
     val selectedModel: ChatModel = ChatModel.SOL,
     val conversations: List<Conversation> = emptyList(),
@@ -89,7 +90,7 @@ class AppViewModel(
     private val elapsedMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     private val apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
 ) : ViewModel() {
-    private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr))
+    private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr, amoled = settings.amoled))
     val state: StateFlow<AppUiState> = mutableState.asStateFlow()
 
     private var messageCollection: Job? = null
@@ -222,6 +223,11 @@ class AppViewModel(
         mutableState.value = mutableState.value.copy(zdr = enabled)
     }
 
+    fun setAmoled(enabled: Boolean) {
+        settings.amoled = enabled
+        mutableState.value = mutableState.value.copy(amoled = enabled)
+    }
+
     fun selectModel(model: ChatModel) {
         val currentModel = mutableState.value.models.firstOrNull { it.apiId == model.apiId } ?: return
         mutableState.value = mutableState.value.copy(selectedModel = currentModel)
@@ -274,6 +280,17 @@ class AppViewModel(
                 mutableState.value = mutableState.value.copy(messages = messages)
             }
         }
+    }
+
+    fun newChat() {
+        if (mutableState.value.sending) return
+        messageCollection?.cancel()
+        messageCollection = null
+        mutableState.value = mutableState.value.copy(
+            currentConversationId = null,
+            messages = emptyList(),
+            errorMessage = null,
+        )
     }
 
     fun deleteConversation(id: String) {

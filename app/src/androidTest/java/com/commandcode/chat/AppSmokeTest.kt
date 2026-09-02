@@ -4,6 +4,7 @@ import android.graphics.RectF
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.setContent
+import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsOff
@@ -60,6 +61,7 @@ class AppSmokeTest {
         compose.activity.viewModelForTests.clearApiKey()
         compose.activity.appContainer.settings.resetForTests()
         compose.activity.viewModelForTests.setZdr(true)
+        compose.activity.viewModelForTests.setAmoled(false)
         compose.activity.recreateUiForTests()
         compose.waitForIdle()
     }
@@ -80,7 +82,7 @@ class AppSmokeTest {
         compose.onNodeWithTag("api_key").performTextInput("fake-offline-key")
         compose.onNodeWithTag("save_api_key").performClick()
         compose.onNodeWithTag("bottom_navigation").assertIsDisplayed()
-        compose.onNodeWithText("Secure chat").assertIsDisplayed()
+        compose.onNodeWithText("New Chat").assertIsDisplayed()
         compose.onNodeWithTag("nav_budget").performClick()
         compose.onNodeWithText("Budget unavailable").assertIsDisplayed()
         compose.onNodeWithTag("budget_retry").assertIsDisplayed()
@@ -92,10 +94,12 @@ class AppSmokeTest {
                 node.config[SemanticsProperties.TestTag].startsWith("model_option_")
         }).assertCountEquals(44)
         compose.onNodeWithTag("model_option_Qwen_Qwen3_8_Flash").assertIsDisplayed().performClick()
-        compose.onNodeWithText("Qwen 3.8 Flash").assertIsDisplayed()
+        compose.onNodeWithTag("model_selector")
+            .assertContentDescriptionEquals("Select chat model. Current: Qwen 3.8 Flash")
         compose.onNodeWithTag("model_selector").performClick()
         compose.onNodeWithTag("model_option_gpt_5_6_sol").performScrollTo().assertIsDisplayed().performClick()
-        compose.onNodeWithText("GPT-5.6 Sol").assertIsDisplayed()
+        compose.onNodeWithTag("model_selector")
+            .assertContentDescriptionEquals("Select chat model. Current: GPT-5.6 Sol")
 
         val seeded = runBlocking {
             compose.activity.appContainer.chatRepository.beginTurn(null, "delete me offline", ChatModel.SOL).also {
@@ -131,6 +135,7 @@ class AppSmokeTest {
         compose.onAllNodesWithTag("billing_day").assertCountEquals(0)
         compose.onNodeWithContentDescription("Zero data retention").performClick().assertIsOff()
         compose.onNodeWithTag("security_zdr_status").assertTextEquals("ZDR OFF")
+        compose.onNodeWithContentDescription("AMOLED dark mode").performClick().assertIsOn()
 
         compose.onNodeWithTag("nav_budget").performClick()
         compose.activityRule.scenario.recreate()
@@ -138,11 +143,13 @@ class AppSmokeTest {
         compose.onNodeWithText("Budget unavailable").assertIsDisplayed()
         compose.onAllNodesWithText("Estimated from this app").assertCountEquals(0)
         compose.onAllNodesWithText("Add your API key").assertCountEquals(0)
+        compose.onNodeWithTag("nav_settings").performClick()
+        compose.onNodeWithTag("amoled_toggle").assertIsOn()
 
         compose.activityRule.scenario.close()
         ActivityScenario.launch(MainActivity::class.java).use {
-            compose.waitUntil { compose.onAllNodesWithText("Secure chat").fetchSemanticsNodes().isNotEmpty() }
-            compose.onNodeWithText("Secure chat").assertIsDisplayed()
+            compose.waitUntil { compose.onAllNodesWithText("New Chat").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("New Chat").assertIsDisplayed()
             compose.onNodeWithTag("bottom_navigation").assertIsDisplayed()
         }
     }
@@ -266,6 +273,7 @@ class AppSmokeTest {
 
     private class TestSettings : SettingsStore {
         override var zdr = true
+        override var amoled = false
     }
 
     private class MutationRecordingChats : ChatStore {

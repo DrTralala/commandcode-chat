@@ -28,6 +28,7 @@ import okhttp3.OkHttpClient
 
 interface SettingsStore {
     var zdr: Boolean
+    var amoled: Boolean
 }
 
 interface ApiKeyStore {
@@ -54,10 +55,15 @@ class AppSettings(context: Context) : SettingsStore {
         get() = preferences.getBoolean(KEY_ZDR, true)
         set(value) { preferences.edit().putBoolean(KEY_ZDR, value).apply() }
 
+    override var amoled: Boolean
+        get() = preferences.getBoolean(KEY_AMOLED, false)
+        set(value) { preferences.edit().putBoolean(KEY_AMOLED, value).apply() }
+
     internal fun resetForTests() { preferences.edit().clear().commit() }
 
     private companion object {
         const val KEY_ZDR = "zdr"
+        const val KEY_AMOLED = "amoled"
     }
 }
 

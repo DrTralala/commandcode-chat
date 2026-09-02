@@ -7,7 +7,7 @@
 [![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
 
-An Android chat client for Command Code with a bundled GOAT model catalogue and live quota tracking.
+An Android chat client for Command Code with a bundled GOAT model catalogue and plan-aware quota tracking.
 
 **[Download the latest APK](https://github.com/DrTralala/commandcode-chat/releases/latest/download/CommandCodeChat.apk)**
 
@@ -32,9 +32,11 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 
 - Streams chat responses directly from Command Code.
 - Bundles a pinned, validated GOAT model catalogue in the APK.
-- Shows monthly, five-hour, and weekly quota telemetry with safe stale-data fallback.
+- Shows plan-aware credit usage, including rolling windows when the account provides them, with safe stale-data fallback.
 - Stores conversations and usage history in an encrypted local database.
 - Enables zero data retention (ZDR) by default and can fail rather than use a non-ZDR provider.
+- Offers a persistent AMOLED dark mode with true-black surfaces.
+- Uses distinct, aligned message bubbles for user and assistant messages.
 - Keeps chat, history, budget, and security settings in one native Jetpack Compose app.
 
 ## How it works
@@ -42,20 +44,22 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 The Android app calls Command Code directly:
 
 - Chat: `https://api.commandcode.ai/provider/v1/chat/completions`
-- Quota: `https://api.commandcode.ai/alpha/billing/credits`
+- Credits: `https://api.commandcode.ai/alpha/billing/credits`
+- Optional plan metadata: `https://api.commandcode.ai/alpha/billing/subscriptions`
 
-The API key is sent only to the relevant Command Code endpoint for each request. Model selection uses the bundled `catalogue/goat-models.json`; the app does not fetch a remote catalogue or require an intermediary service.
+The app reads credits and optional subscription metadata directly from Command Code. Accounts without rolling quota windows remain supported. The API key is sent only to the relevant Command Code endpoint for each request. Model selection uses the bundled `catalogue/goat-models.json`; the app does not fetch a remote catalogue or require an intermediary service.
 
 The optional Ktor `:server` module is a reference implementation for catalogue and quota routes. It is not part of the Android chat, quota, or model-selection request path and never receives Android chat prompts or responses.
 
 ## Privacy and security
 
 - The API key is encrypted at rest using an Android Keystore-backed key.
+- Mutable app-owned API-key copies used for quota requests are wiped after each fetch. OkHttp requires an immutable bearer-header `String`, so the quota client creates one such value per fetch, shares it across both requests, and leaves it subject to garbage collection rather than explicit wiping.
 - Room history and usage data are encrypted with SQLCipher using Keystore-protected key material.
 - Android backup and device-transfer rules exclude app files, databases, and preferences.
 - Cleartext traffic is disabled.
 - ZDR adds the Command Code ZDR request header; upstream providers and Command Code still process request content according to their own policies.
-- Quota uses an alpha upstream API and may change. Invalid responses are rejected rather than trusted.
+- Credits and subscription metadata use alpha upstream APIs and may change. Invalid credit responses are rejected rather than trusted; unavailable plan metadata falls back to generic usage wording.
 
 The downloadable APK is a convenience debug build. Debug signing does not provide the release-key identity guarantees of a production-signed distribution. Review the source and build it yourself when that assurance matters.
 

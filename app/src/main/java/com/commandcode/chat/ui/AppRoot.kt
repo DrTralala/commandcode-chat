@@ -1,5 +1,6 @@
 package com.commandcode.chat.ui
 
+import android.app.Activity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,6 +25,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -31,14 +33,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.view.WindowCompat
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -55,20 +63,69 @@ private val Ink = Color(0xFF0B111B)
 private val Slate = Color(0xFF131E2C)
 private val ElectricBlue = Color(0xFF2F8CFF)
 private val Amber = Color(0xFFFFB84D)
+private val MutedStatus = Color(0xFF9AA9BC)
+internal val ZdrOnColour = Color(0xFF71D6AE)
+internal val ZdrOffColour = Color(0xFFFF6B6B)
 
-private val AppColours = darkColorScheme(
+internal fun zdrStatusColour(zdr: Boolean): Color = if (zdr) ZdrOnColour else ZdrOffColour
+
+internal val StandardAppColours = darkColorScheme(
     primary = ElectricBlue,
     secondary = Amber,
     background = Ink,
     surface = Slate,
+    surfaceContainer = Slate,
+    primaryContainer = Color(0xFF123D6B),
+    secondaryContainer = Color(0xFF164744),
     onPrimary = Color.White,
     onBackground = Color(0xFFE8EEF7),
     onSurface = Color(0xFFE8EEF7),
+    onPrimaryContainer = Color(0xFFE8EEF7),
+    onSecondaryContainer = Color(0xFFE8EEF7),
+)
+
+internal val AmoledAppColours = darkColorScheme(
+    primary = ElectricBlue,
+    secondary = Amber,
+    background = Color.Black,
+    surface = Color.Black,
+    surfaceDim = Color.Black,
+    surfaceBright = Color.Black,
+    surfaceContainerLowest = Color.Black,
+    surfaceContainerLow = Color.Black,
+    surfaceContainer = Color.Black,
+    surfaceContainerHigh = Color.Black,
+    surfaceContainerHighest = Color.Black,
+    surfaceVariant = Color.Black,
+    surfaceTint = Color.Black,
+    primaryContainer = Color(0xFF082B51),
+    secondaryContainer = Color(0xFF063D3B),
+    onPrimary = Color.White,
+    onBackground = Color(0xFFF1F5FA),
+    onSurface = Color(0xFFF1F5FA),
+    onPrimaryContainer = Color(0xFFF1F5FA),
+    onSecondaryContainer = Color(0xFFF1F5FA),
 )
 
 @Composable
 fun AppRoot(viewModel: AppViewModel?, startupRecovery: Boolean = false) {
-    MaterialTheme(colorScheme = AppColours) {
+    val colours = if (viewModel != null) {
+        val state by viewModel.state.collectAsStateWithLifecycle()
+        if (state.amoled) AmoledAppColours else StandardAppColours
+    } else {
+        StandardAppColours
+    }
+    val view = LocalView.current
+    SideEffect {
+        val window = (view.context as? Activity)?.window ?: return@SideEffect
+        window.statusBarColor = colours.background.toArgb()
+        window.navigationBarColor = colours.background.toArgb()
+        WindowCompat.getInsetsController(window, view).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
+    }
+    MaterialTheme(colorScheme = colours) {
         Surface(modifier = Modifier.fillMaxSize()) {
             Box(
                 modifier = Modifier
@@ -120,6 +177,7 @@ private fun AppContent(viewModel: AppViewModel) {
                     ChatScreen(
                         state = state,
                         onSelectModel = viewModel::selectModel,
+                        onNewChat = viewModel::newChat,
                         onSend = viewModel::send,
                         onCancel = viewModel::cancel,
                     )
@@ -141,6 +199,7 @@ private fun AppContent(viewModel: AppViewModel) {
                         onSaveApiKey = viewModel::saveApiKey,
                         onClearApiKey = viewModel::clearApiKey,
                         onSetZdr = viewModel::setZdr,
+                        onSetAmoled = viewModel::setAmoled,
                     )
                 }
             }
@@ -155,7 +214,7 @@ private fun BottomPanel(navController: NavHostController) {
     val entry by navController.currentBackStackEntryAsState()
     val current = entry?.destination?.route
     NavigationBar(
-        containerColor = Slate,
+        containerColor = MaterialTheme.colorScheme.surface,
         modifier = Modifier.testTag("bottom_navigation"),
     ) {
         listOf(
@@ -182,7 +241,7 @@ private fun SecurityRail(zdr: Boolean) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF09101A))
+            .background(MaterialTheme.colorScheme.surface)
             .semantics { contentDescription = statusDescription }
             .padding(horizontal = 16.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -190,8 +249,13 @@ private fun SecurityRail(zdr: Boolean) {
     ) {
         Text("● ENCRYPTED LOCAL", color = Color(0xFF71D6AE), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
         Text(
-            if (zdr) "ZDR ON" else "ZDR OFF",
-            color = Color(0xFF9AA9BC),
+            text = buildAnnotatedString {
+                append("ZDR ")
+                withStyle(SpanStyle(color = zdrStatusColour(zdr))) {
+                    append(if (zdr) "ON" else "OFF")
+                }
+            },
+            color = MutedStatus,
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.testTag("security_zdr_status"),

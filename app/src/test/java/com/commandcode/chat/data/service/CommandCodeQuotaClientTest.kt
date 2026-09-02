@@ -6,9 +6,12 @@ import java.net.SocketTimeoutException
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
-import java.util.concurrent.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -19,39 +22,63 @@ import okio.Buffer
 import okio.BufferedSource
 import okio.ForwardingSource
 import okio.buffer
-import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class CommandCodeQuotaClientTest {
     @Test
-    fun fetchesQuotaFromTheFixedEndpointWithTheBearerKey() = runBlocking {
-        var recordedRequest: Request? = null
-        val body = TrackingResponseBody(UPSTREAM_JSON.toByteArray(Charsets.UTF_8))
-        val callFactory = scriptedCallFactory(body) { request -> recordedRequest = request }
+    fun fetchesCreditsAndSubscriptionFromFixedEndpointsWithTheSameBearerKey() = runBlocking {
+        val requests = mutableListOf<Request>()
+        var bearerConstructionCount = 0
+        val bearerFactory = BearerFactory { bytes ->
+            bearerConstructionCount++
+            "Bearer ${bytes.toString(Charsets.UTF_8)}"
+        }
+        val creditsBody = TrackingResponseBody(CURRENT_CREDITS_JSON.toByteArray(Charsets.UTF_8))
+        val subscriptionBody = TrackingResponseBody(SUBSCRIPTION_JSON.toByteArray(Charsets.UTF_8))
+        val callFactory = routedCallFactory(
+            mapOf(
+                CREDITS_PATH to ScriptedResponse(body = creditsBody),
+                SUBSCRIPTION_PATH to ScriptedResponse(body = subscriptionBody),
+            ),
+            requests,
+        )
 
-        val quota = CommandCodeQuotaClient(callFactory, Clock.fixed(FETCHED_AT, ZoneOffset.UTC))
+        val quota = CommandCodeQuotaClient(
+            callFactory,
+            Clock.fixed(FETCHED_AT, ZoneOffset.UTC),
+            ClientKeyMaterialFactory(ClientKeyMaterial::from),
+            bearerFactory,
+        )
             .fetchQuota("test-key".toCharArray())
 
-        assertEquals("https://api.commandcode.ai/alpha/billing/credits", recordedRequest?.url.toString())
-        assertEquals("GET", recordedRequest?.method)
-        assertEquals("application/json", recordedRequest?.header("Accept"))
-        assertEquals("Bearer test-key", recordedRequest?.header("Authorization"))
+        assertEquals(1, bearerConstructionCount)
+        assertEquals(setOf(CREDITS_PATH, SUBSCRIPTION_PATH), requests.map { it.url.encodedPath }.toSet())
+        assertEquals(2, requests.size)
+        requests.forEach { request ->
+            assertEquals("GET", request.method)
+            assertEquals("application/json", request.header("Accept"))
+            assertEquals("Bearer test-key", request.header("Authorization"))
+        }
         assertEquals(FETCHED_AT, quota.fetchedAt)
-        assertTrue(body.closed)
+        assertTrue(creditsBody.closed)
+        assertTrue(subscriptionBody.closed)
+        assertEquals(1, creditsBody.closeCount)
+        assertEquals(1, subscriptionBody.closeCount)
     }
 
     @Test
-    fun translatesTheUpstreamQuotaResponse() = runBlocking {
-        val quota = clientFor(UPSTREAM_JSON).fetchQuota("test-key".toCharArray())
+    fun translatesCurrentCreditsAndEnrichesThemWithTheSubscriptionPlan() = runBlocking {
+        val quota = clientFor(CURRENT_CREDITS_JSON).fetchQuota("test-key".toCharArray())
 
-        assertEquals("goat", quota.planId)
-        assertTrue(quota.limited)
+        assertEquals("individual-goat", quota.planId)
+        assertEquals(true, quota.limited)
         assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
         assertEquals(
             UsedQuota(4.5, 14.0, Instant.ofEpochMilli(1_800_000_001_234)),
@@ -62,169 +89,101 @@ class CommandCodeQuotaClientTest {
             quota.weekly,
         )
         assertEquals(9.5, quota.purchasedCredits, 0.0)
-        assertEquals(3.25, quota.freeCredits, 0.0)
+        assertEquals(0.0, quota.freeCredits, 0.0)
     }
 
     @Test
-    fun translatesTheCurrentCreditThresholdSchemaWithoutInventingAPlan() = runBlocking {
-        val quota = clientFor(CURRENT_UPSTREAM_JSON).fetchQuota("test-key".toCharArray())
+    fun acceptsMissingAndNullWindowLimits() = runBlocking {
+        val absent = "{\"credits\":{\"monthlyCredits\":42.5}}"
+        val explicitNull = "{\"credits\":{\"monthlyCredits\":42.5},\"windowLimits\":null}"
 
-        assertEquals("unreported", quota.planId)
-        assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
-        assertEquals(4.5, quota.fiveHour.used, 0.0)
-        assertEquals(22.75, quota.weekly.used, 0.0)
-    }
-
-    @Test
-    fun translatesCurrentSchemaWithKnownStatusExtensions() = runBlocking {
-        val quota = clientFor(EXTENDED_CURRENT_UPSTREAM_JSON)
-            .fetchQuota("test-key".toCharArray())
-
-        assertEquals(UNREPORTED_PLAN_ID, quota.planId)
-        assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
-        assertEquals(4.5, quota.fiveHour.used, 0.0)
-        assertEquals(22.75, quota.weekly.used, 0.0)
-    }
-
-    @Test
-    fun acceptsEachKnownStatusExtensionIndependently() = runBlocking {
-        val bodies = listOf(
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("credits").put("belowThreshold", true)
-            }.toString(),
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").put("exceeded", false)
-            }.toString(),
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").put("exceeded", JSONObject.NULL)
-            }.toString(),
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").getJSONObject("fiveHour").put("exceeded", true)
-            }.toString(),
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").getJSONObject("weekly").put("exceeded", false)
-            }.toString(),
-        )
-
-        bodies.forEach { body ->
-            assertEquals(UNREPORTED_PLAN_ID, clientFor(body).fetchQuota("test-key".toCharArray()).planId)
+        listOf(absent, explicitNull).forEach { body ->
+            val quota = clientFor(body, subscriptionBody = NO_SUBSCRIPTION_JSON).fetchQuota(KEY)
+            assertNull(quota.planId)
+            assertEquals(RemainingQuota(42.5, null), quota.monthly)
+            assertNull(quota.limited)
+            assertNull(quota.fiveHour)
+            assertNull(quota.weekly)
+            assertEquals(0.0, quota.purchasedCredits, 0.0)
+            assertEquals(0.0, quota.freeCredits, 0.0)
         }
     }
 
     @Test
-    fun rejectsInvalidKnownStatusExtensionTypes() = runBlocking {
-        val invalidBooleanValues = listOf<Any>("false", 1, JSONObject(), JSONArray(), JSONObject.NULL)
-        val strictLocations = listOf<(JSONObject, Any) -> Unit>(
-            { root, value -> root.getJSONObject("credits").put("belowThreshold", value) },
-            { root, value -> root.getJSONObject("windowLimits").getJSONObject("fiveHour").put("exceeded", value) },
-            { root, value -> root.getJSONObject("windowLimits").getJSONObject("weekly").put("exceeded", value) },
-        )
-        val invalidBodies = buildList {
-            strictLocations.forEach { insert ->
-                invalidBooleanValues.forEach { value ->
-                    add(JSONObject(CURRENT_UPSTREAM_JSON).also { insert(it, value) }.toString())
-                }
+    fun acceptsAdditiveFieldsAtEveryUpstreamObjectLevel() = runBlocking {
+        val credits = JSONObject(CURRENT_CREDITS_JSON).apply {
+            put("futureRoot", true)
+            getJSONObject("credits").put("futureCredits", JSONObject().put("state", "ok"))
+            getJSONObject("windowLimits").apply {
+                put("futureLimits", 1)
+                getJSONObject("fiveHour").put("futureWindow", false)
+                getJSONObject("weekly").put("futureWindow", false)
             }
-            invalidBooleanValues.filterNot { it == JSONObject.NULL }.forEach { value ->
-                add(JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                    getJSONObject("windowLimits").put("exceeded", value)
-                }.toString())
-            }
+        }.toString()
+        val subscription = JSONObject(SUBSCRIPTION_JSON).apply {
+            put("futureRoot", true)
+            getJSONObject("data").put("futureSubscription", "value")
+        }.toString()
+
+        val quota = clientFor(credits, subscription).fetchQuota(KEY)
+
+        assertEquals("individual-goat", quota.planId)
+        assertEquals(42.5, quota.monthly.remaining, 0.0)
+    }
+
+    @Test
+    fun subscriptionFailuresDoNotHideValidCredits() = runBlocking {
+        val unavailable = clientFor(
+            CURRENT_CREDITS_JSON,
+            subscriptionBody = "service unavailable",
+            subscriptionCode = 500,
+        ).fetchQuota(KEY)
+        val malformed = clientFor(
+            CURRENT_CREDITS_JSON,
+            subscriptionBody = "not-json",
+        ).fetchQuota(KEY)
+        val wrongPlanType = clientFor(
+            CURRENT_CREDITS_JSON,
+            subscriptionBody = "{\"data\":{\"planId\":42}}",
+        ).fetchQuota(KEY)
+
+        listOf(unavailable, malformed, wrongPlanType).forEach { quota ->
+            assertNull(quota.planId)
+            assertNull(quota.monthly.cap)
+            assertEquals(42.5, quota.monthly.remaining, 0.0)
         }
-
-        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
     }
 
     @Test
-    fun rejectsUnknownFieldsAlongsideKnownStatusExtensions() = runBlocking {
-        val invalidBodies = listOf(
-            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("credits").put("unknown", false)
-            }.toString(),
-            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").put("unknown", false)
-            }.toString(),
-            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").getJSONObject("fiveHour").put("unknown", false)
-            }.toString(),
-            JSONObject(EXTENDED_CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").getJSONObject("weekly").put("unknown", false)
-            }.toString(),
-        )
+    fun unknownSubscriptionPlanIsRetainedWithoutInventingACap() = runBlocking {
+        val quota = clientFor(
+            CURRENT_CREDITS_JSON,
+            subscriptionBody = "{\"data\":{\"planId\":\"future-plan\"}}",
+        ).fetchQuota(KEY)
 
-        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
+        assertEquals("future-plan", quota.planId)
+        assertEquals(RemainingQuota(42.5, null), quota.monthly)
     }
 
     @Test
-    fun preservesTheLegacyUpstreamPlanId() = runBlocking {
-        val quota = clientFor(UPSTREAM_JSON).fetchQuota("test-key".toCharArray())
-
-        assertEquals("goat", quota.planId)
-    }
-
-    @Test
-    fun rejectsMixedPartialAndExtendedCurrentCreditSchemas() = runBlocking {
-        val invalidBodies = listOf(
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("credits").put("planId", "goat")
-            }.toString(),
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("credits").remove("creditThreshold")
-            }.toString(),
-            JSONObject(CURRENT_UPSTREAM_JSON).apply {
-                getJSONObject("credits").put("extra", 1)
-            }.toString(),
-        )
-
-        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
-    }
-
-    @Test
-    fun rejectsInvalidCreditThresholdValues() = runBlocking {
-        val invalidBodies = listOf(
-            CURRENT_UPSTREAM_JSON.replace("\"creditThreshold\":10", "\"creditThreshold\":-1"),
-            CURRENT_UPSTREAM_JSON.replace("\"creditThreshold\":10", "\"creditThreshold\":\"10\""),
-            CURRENT_UPSTREAM_JSON.replace("\"creditThreshold\":10", "\"creditThreshold\":1e10000"),
-        )
-
-        invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
-    }
-
-    @Test
-    fun rejectsMissingAndExtraRootAndNestedFields() = runBlocking {
+    fun rejectsMissingConsumedFieldsWhileAllowingOptionalAndAdditiveFields() = runBlocking {
         val invalidBodies = buildList {
-            add(JSONObject(UPSTREAM_JSON).apply { remove("credits") }.toString())
-            add(JSONObject(UPSTREAM_JSON).apply { remove("windowLimits") }.toString())
-            add(JSONObject(UPSTREAM_JSON).apply { put("extra", 1) }.toString())
-
-            val credits = JSONObject(UPSTREAM_JSON).getJSONObject("credits")
-            listOf("planId", "monthlyCredits", "purchasedCredits", "freeCredits").forEach { key ->
-                add(JSONObject(UPSTREAM_JSON).apply {
-                    getJSONObject("credits").remove(key)
-                }.toString())
-            }
-            add(JSONObject(UPSTREAM_JSON).apply {
-                getJSONObject("credits").put("extra", 1)
+            add(JSONObject(CURRENT_CREDITS_JSON).apply { remove("credits") }.toString())
+            add(JSONObject(CURRENT_CREDITS_JSON).apply {
+                getJSONObject("credits").remove("monthlyCredits")
             }.toString())
             listOf("limited", "fiveHour", "weekly").forEach { key ->
-                add(JSONObject(UPSTREAM_JSON).apply {
+                add(JSONObject(CURRENT_CREDITS_JSON).apply {
                     getJSONObject("windowLimits").remove(key)
                 }.toString())
             }
-            add(JSONObject(UPSTREAM_JSON).apply {
-                getJSONObject("windowLimits").put("extra", 1)
-            }.toString())
             listOf("fiveHour", "weekly").forEach { window ->
                 listOf("used", "cap", "resetAt").forEach { key ->
-                    add(JSONObject(UPSTREAM_JSON).apply {
+                    add(JSONObject(CURRENT_CREDITS_JSON).apply {
                         getJSONObject("windowLimits").getJSONObject(window).remove(key)
                     }.toString())
                 }
-                add(JSONObject(UPSTREAM_JSON).apply {
-                    getJSONObject("windowLimits").getJSONObject(window).put("extra", 1)
-                }.toString())
             }
-            check(credits.length() == 4)
         }
 
         invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
@@ -232,11 +191,11 @@ class CommandCodeQuotaClientTest {
 
     @Test
     fun rejectsDuplicateEquivalentFields() = runBlocking {
-        val duplicateRoot = UPSTREAM_JSON.replace(
+        val duplicateRoot = CURRENT_CREDITS_JSON.replace(
             "\"windowLimits\":",
-            "\"credits\":{\"planId\":\"goat\",\"monthlyCredits\":42.5,\"purchasedCredits\":9.5,\"freeCredits\":3.25},\"windowLimits\":",
+            "\"credits\":{\"monthlyCredits\":42.5},\"windowLimits\":",
         )
-        val duplicateNested = UPSTREAM_JSON.replace(
+        val duplicateNested = CURRENT_CREDITS_JSON.replace(
             "\"monthlyCredits\":42.5,",
             "\"monthlyCredits\":42.5,\"monthlyCredits\":42.5,",
         )
@@ -246,16 +205,13 @@ class CommandCodeQuotaClientTest {
     }
 
     @Test
-    fun rejectsBlankPlanIdsAndWrongPrimitiveTypes() = runBlocking {
+    fun rejectsWrongPrimitiveTypesForConsumedCreditAndWindowFields() = runBlocking {
         val invalidBodies = listOf(
-            UPSTREAM_JSON.replace("\"planId\":\"goat\"", "\"planId\":\"\""),
-            UPSTREAM_JSON.replace("\"planId\":\"goat\"", "\"planId\":\"   \""),
-            UPSTREAM_JSON.replace("\"planId\":\"goat\"", "\"planId\":42"),
-            UPSTREAM_JSON.replace("\"limited\":true", "\"limited\":\"true\""),
-            UPSTREAM_JSON.replace("\"monthlyCredits\":42.5", "\"monthlyCredits\":\"42.5\""),
-            UPSTREAM_JSON.replace("\"used\":4.5", "\"used\":\"4.5\""),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":\"14.0\""),
-            UPSTREAM_JSON.replace("\"resetAt\":1800000001234", "\"resetAt\":\"1800000001234\""),
+            CURRENT_CREDITS_JSON.replace("\"limited\":true", "\"limited\":\"true\""),
+            CURRENT_CREDITS_JSON.replace("\"monthlyCredits\":42.5", "\"monthlyCredits\":\"42.5\""),
+            CURRENT_CREDITS_JSON.replace("\"used\":4.5", "\"used\":\"4.5\""),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":\"14.0\""),
+            CURRENT_CREDITS_JSON.replace("\"resetAt\":1800000001234", "\"resetAt\":\"1800000001234\""),
         )
 
         invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
@@ -264,17 +220,19 @@ class CommandCodeQuotaClientTest {
     @Test
     fun rejectsInvalidAmountsIncludingNonFiniteOverflowAndCapUnderflow() = runBlocking {
         val invalidBodies = listOf(
-            UPSTREAM_JSON.replace("\"monthlyCredits\":42.5", "\"monthlyCredits\":-1"),
-            UPSTREAM_JSON.replace("\"used\":4.5", "\"used\":-1"),
-            UPSTREAM_JSON.replace("\"purchasedCredits\":9.5", "\"purchasedCredits\":-1"),
-            UPSTREAM_JSON.replace("\"freeCredits\":3.25", "\"freeCredits\":-1"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":0"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":-1"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":NaN"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":Infinity"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":-Infinity"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":1e10000"),
-            UPSTREAM_JSON.replace("\"cap\":14.0", "\"cap\":1e-400"),
+            CURRENT_CREDITS_JSON.replace("\"monthlyCredits\":42.5", "\"monthlyCredits\":-1"),
+            CURRENT_CREDITS_JSON.replace("\"used\":4.5", "\"used\":-1"),
+            CURRENT_CREDITS_JSON.replace("\"purchasedCredits\":9.5", "\"purchasedCredits\":-1"),
+            JSONObject(CURRENT_CREDITS_JSON).apply {
+                getJSONObject("credits").put("freeCredits", -1)
+            }.toString(),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":0"),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":-1"),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":NaN"),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":Infinity"),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":-Infinity"),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":1e10000"),
+            CURRENT_CREDITS_JSON.replace("\"cap\":14.0", "\"cap\":1e-400"),
         )
 
         invalidBodies.forEachIndexed { index, body -> assertBadResponse(body, index.toString()) }
@@ -285,7 +243,7 @@ class CommandCodeQuotaClientTest {
         val invalidTimestamps = listOf("1.5", "0", "-1", "9223372036854775808", "1e10000")
         invalidTimestamps.forEachIndexed { index, timestamp ->
             assertBadResponse(
-                UPSTREAM_JSON.replace("1800000001234", timestamp),
+                CURRENT_CREDITS_JSON.replace("1800000001234", timestamp),
                 index.toString(),
             )
         }
@@ -293,8 +251,8 @@ class CommandCodeQuotaClientTest {
 
     @Test
     fun rejectsTrailingTextAndConcatenatedJson() = runBlocking {
-        assertBadResponse("$UPSTREAM_JSON trailing")
-        assertBadResponse(UPSTREAM_JSON + UPSTREAM_JSON)
+        assertBadResponse("$CURRENT_CREDITS_JSON trailing")
+        assertBadResponse(CURRENT_CREDITS_JSON + CURRENT_CREDITS_JSON)
     }
 
     @Test
@@ -302,7 +260,7 @@ class CommandCodeQuotaClientTest {
         val body = UnknownLengthResponseBody(quotaJsonOfLength(QuotaSnapshotCodec.MAX_QUOTA_BYTES))
 
         val quota = CommandCodeQuotaClient(
-            scriptedCallFactory(body),
+            creditsCallFactory(body),
             Clock.fixed(FETCHED_AT, ZoneOffset.UTC),
         ).fetchQuota("key".toCharArray())
 
@@ -317,7 +275,7 @@ class CommandCodeQuotaClientTest {
 
         val failure = assertThrows(ServiceException::class.java) {
             runBlocking {
-                CommandCodeQuotaClient(scriptedCallFactory(body), FIXED_CLOCK)
+                CommandCodeQuotaClient(creditsCallFactory(body), FIXED_CLOCK)
                     .fetchQuota("key".toCharArray())
             }
         }
@@ -332,7 +290,7 @@ class CommandCodeQuotaClientTest {
         val oversized = ByteArray(QuotaSnapshotCodec.MAX_QUOTA_BYTES + 1) { 'x'.code.toByte() }
         val knownBody = TrackingResponseBody(oversized)
         val knownFailure = assertThrows(ServiceException::class.java) {
-            runBlocking { CommandCodeQuotaClient(scriptedCallFactory(knownBody), FIXED_CLOCK).fetchQuota(KEY) }
+            runBlocking { CommandCodeQuotaClient(creditsCallFactory(knownBody), FIXED_CLOCK).fetchQuota(KEY) }
         }
         assertEquals(ServiceException.Kind.BAD_RESPONSE, knownFailure.kind)
         assertEquals(0L, knownBody.bytesRead)
@@ -340,7 +298,7 @@ class CommandCodeQuotaClientTest {
 
         val unknownBody = UnknownLengthResponseBody(oversized)
         val unknownFailure = assertThrows(ServiceException::class.java) {
-            runBlocking { CommandCodeQuotaClient(scriptedCallFactory(unknownBody), FIXED_CLOCK).fetchQuota(KEY) }
+            runBlocking { CommandCodeQuotaClient(creditsCallFactory(unknownBody), FIXED_CLOCK).fetchQuota(KEY) }
         }
         assertEquals(ServiceException.Kind.BAD_RESPONSE, unknownFailure.kind)
         assertEquals((QuotaSnapshotCodec.MAX_QUOTA_BYTES + 1).toLong(), unknownBody.bytesRead)
@@ -362,7 +320,7 @@ class CommandCodeQuotaClientTest {
             val body = TrackingResponseBody(secret.toByteArray(Charsets.UTF_8))
             val failure = assertThrows(ServiceException::class.java) {
                 runBlocking {
-                    CommandCodeQuotaClient(scriptedCallFactory(body, code = status), FIXED_CLOCK)
+                    CommandCodeQuotaClient(creditsCallFactory(body, code = status), FIXED_CLOCK)
                         .fetchQuota(KEY)
                 }
             }
@@ -418,7 +376,7 @@ class CommandCodeQuotaClientTest {
         }
 
         CommandCodeQuotaClient(
-            scriptedCallFactory(TrackingResponseBody(UPSTREAM_JSON.toByteArray(Charsets.UTF_8))),
+            creditsCallFactory(TrackingResponseBody(CURRENT_CREDITS_JSON.toByteArray(Charsets.UTF_8))),
             FIXED_CLOCK,
             successFactory,
         ).fetchQuota(successCallerKey)
@@ -436,7 +394,7 @@ class CommandCodeQuotaClientTest {
         assertThrows(ServiceException::class.java) {
             runBlocking {
                 CommandCodeQuotaClient(
-                    scriptedCallFactory(
+                    creditsCallFactory(
                         TrackingResponseBody("failure".toByteArray(Charsets.UTF_8)),
                         code = 401,
                     ),
@@ -451,7 +409,7 @@ class CommandCodeQuotaClientTest {
     }
 
     @Test
-    fun wipesClientOwnedKeyCopiesWhenTheRequestIsCancelled() = runBlocking {
+    fun parentCancellationCancelsBothCallsAndPromptlyWipesClientOwnedKeyCopies() = runBlocking {
         val callerKey = "test-command-code-key".toCharArray()
         val originalCallerKey = callerKey.copyOf()
         var material: ClientKeyMaterial? = null
@@ -459,22 +417,47 @@ class CommandCodeQuotaClientTest {
             ClientKeyMaterial.from(key).also { material = it }
         }
 
-        assertThrows(CancellationException::class.java) {
-            runBlocking {
-                CommandCodeQuotaClient(
-                    failingCallFactory(CancellationException("cancelled")),
-                    FIXED_CLOCK,
-                    factory,
-                ).fetchQuota(callerKey)
-            }
+        val callFactory = ControllableAsyncCallFactory()
+        val fetch = async {
+            CommandCodeQuotaClient(callFactory, FIXED_CLOCK, factory).fetchQuota(callerKey)
         }
 
+        callFactory.bothCallsStarted.await()
+        fetch.cancel()
+        fetch.join()
+
+        assertTrue(fetch.isCancelled)
+        assertThrows(CancellationException::class.java) { runBlocking { fetch.await() } }
+        assertEquals(1, callFactory.callFor(CREDITS_PATH).cancelCount)
+        assertEquals(1, callFactory.callFor(SUBSCRIPTION_PATH).cancelCount)
         assertClientKeyMaterialWiped(requireNotNull(material))
         assertArrayEquals(originalCallerKey, callerKey)
+
+        val lateCreditsBody = TrackingResponseBody(CURRENT_CREDITS_JSON.toByteArray(Charsets.UTF_8))
+        val lateSubscriptionBody = TrackingResponseBody(SUBSCRIPTION_JSON.toByteArray(Charsets.UTF_8))
+        callFactory.callFor(CREDITS_PATH).respond(lateCreditsBody)
+        callFactory.callFor(SUBSCRIPTION_PATH).respond(lateSubscriptionBody)
+        assertEquals(1, lateCreditsBody.closeCount)
+        assertEquals(1, lateSubscriptionBody.closeCount)
     }
 
-    private fun clientFor(body: String): CommandCodeQuotaClient = CommandCodeQuotaClient(
-        scriptedCallFactory(TrackingResponseBody(body.toByteArray(Charsets.UTF_8))),
+    private fun clientFor(
+        body: String,
+        subscriptionBody: String = SUBSCRIPTION_JSON,
+        subscriptionCode: Int = 200,
+    ): CommandCodeQuotaClient = CommandCodeQuotaClient(
+        routedCallFactory(
+            mapOf(
+                CREDITS_PATH to ScriptedResponse(
+                    body = TrackingResponseBody(body.toByteArray(Charsets.UTF_8)),
+                ),
+                SUBSCRIPTION_PATH to ScriptedResponse(
+                    code = subscriptionCode,
+                    body = TrackingResponseBody(subscriptionBody.toByteArray(Charsets.UTF_8)),
+                ),
+            ),
+            mutableListOf(),
+        ),
         FIXED_CLOCK,
     )
 
@@ -485,28 +468,96 @@ class CommandCodeQuotaClientTest {
         assertEquals(message, ServiceException.Kind.BAD_RESPONSE, failure.kind)
     }
 
-    private fun scriptedCallFactory(
+    private fun creditsCallFactory(
         body: ResponseBody,
         code: Int = 200,
-        onRequest: (Request) -> Unit = {},
+    ): Call.Factory = routedCallFactory(
+        mapOf(
+            CREDITS_PATH to ScriptedResponse(code = code, body = body),
+            SUBSCRIPTION_PATH to ScriptedResponse(
+                body = TrackingResponseBody(SUBSCRIPTION_JSON.toByteArray(Charsets.UTF_8)),
+            ),
+        ),
+        mutableListOf(),
+    )
+
+    private fun routedCallFactory(
+        responses: Map<String, ScriptedResponse>,
+        requests: MutableList<Request>,
     ): Call.Factory = object : Call.Factory {
         override fun newCall(request: Request): Call = object : Call by OkHttpClient().newCall(request) {
-            override fun execute(): Response {
-                onRequest(request)
-                return Response.Builder()
+            override fun enqueue(responseCallback: Callback) {
+                synchronized(requests) { requests += request }
+                val scripted = checkNotNull(responses[request.url.encodedPath])
+                val response = Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
-                    .code(code)
+                    .code(scripted.code)
                     .message("scripted")
-                    .body(body)
+                    .body(scripted.body)
                     .build()
+                responseCallback.onResponse(this, response)
             }
         }
     }
 
-    private fun failingCallFactory(failure: Throwable): Call.Factory = object : Call.Factory {
+    private fun failingCallFactory(failure: IOException): Call.Factory = object : Call.Factory {
         override fun newCall(request: Request): Call = object : Call by OkHttpClient().newCall(request) {
-            override fun execute(): Response = throw failure
+            override fun enqueue(responseCallback: Callback) {
+                responseCallback.onFailure(this, failure)
+            }
+        }
+    }
+
+    private class ControllableAsyncCallFactory : Call.Factory {
+        private val calls = mutableMapOf<String, ControllableAsyncCall>()
+        val bothCallsStarted = CompletableDeferred<Unit>()
+
+        override fun newCall(request: Request): Call = ControllableAsyncCall(request) {
+            synchronized(calls) {
+                calls[request.url.encodedPath] = it
+                if (calls.keys.containsAll(setOf(CREDITS_PATH, SUBSCRIPTION_PATH))) {
+                    bothCallsStarted.complete(Unit)
+                }
+            }
+        }
+
+        fun callFor(path: String): ControllableAsyncCall = synchronized(calls) {
+            checkNotNull(calls[path])
+        }
+    }
+
+    private class ControllableAsyncCall(
+        private val request: Request,
+        private val onStarted: (ControllableAsyncCall) -> Unit,
+    ) : Call by OkHttpClient().newCall(request) {
+        private lateinit var responseCallback: Callback
+        var cancelCount = 0
+            private set
+
+        override fun enqueue(responseCallback: Callback) {
+            this.responseCallback = responseCallback
+            onStarted(this)
+        }
+
+        override fun execute(): Response = error("Quota transport must use asynchronous Call.enqueue")
+
+        override fun cancel() {
+            cancelCount++
+            responseCallback.onFailure(this, IOException("scripted cancellation"))
+        }
+
+        fun respond(body: ResponseBody) {
+            responseCallback.onResponse(
+                this,
+                Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("late scripted response")
+                    .body(body)
+                    .build(),
+            )
         }
     }
 
@@ -516,7 +567,7 @@ class CommandCodeQuotaClientTest {
     }
 
     private fun quotaJsonOfLength(length: Int): ByteArray {
-        val json = UPSTREAM_JSON.toByteArray(Charsets.UTF_8)
+        val json = CURRENT_CREDITS_JSON.toByteArray(Charsets.UTF_8)
         require(json.size < length)
         return json + ByteArray(length - json.size) { ' '.code.toByte() }
     }
@@ -544,6 +595,11 @@ class CommandCodeQuotaClientTest {
             super.close()
         }
     }
+
+    private data class ScriptedResponse(
+        val code: Int = 200,
+        val body: ResponseBody,
+    )
 
     private class UnknownLengthResponseBody(content: ByteArray) : ResponseBody() {
         private val forwardingSource = object : ForwardingSource(Buffer().write(content)) {
@@ -574,21 +630,14 @@ class CommandCodeQuotaClientTest {
         private val FETCHED_AT = Instant.ofEpochMilli(1_800_000_000_000)
         private val FIXED_CLOCK = Clock.fixed(FETCHED_AT, ZoneOffset.UTC)
         private val KEY = "test-command-code-key".toCharArray()
-        private const val UPSTREAM_JSON =
-            "{\"credits\":{\"planId\":\"goat\",\"monthlyCredits\":42.5,\"purchasedCredits\":9.5,\"freeCredits\":3.25}," +
+        private const val CURRENT_CREDITS_JSON =
+            "{\"credits\":{\"monthlyCredits\":42.5,\"purchasedCredits\":9.5}," +
                 "\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":4.5,\"cap\":14.0,\"resetAt\":1800000001234}," +
                 "\"weekly\":{\"used\":22.75,\"cap\":35.0,\"resetAt\":1800000005678}}}"
-        private const val CURRENT_UPSTREAM_JSON =
-            "{\"credits\":{\"creditThreshold\":10,\"monthlyCredits\":42.5,\"purchasedCredits\":9.5,\"freeCredits\":3.25}," +
-                "\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":4.5,\"cap\":14.0,\"resetAt\":1800000001234}," +
-                "\"weekly\":{\"used\":22.75,\"cap\":35.0,\"resetAt\":1800000005678}}}"
-        private val EXTENDED_CURRENT_UPSTREAM_JSON = JSONObject(CURRENT_UPSTREAM_JSON).apply {
-            getJSONObject("credits").put("belowThreshold", false)
-            getJSONObject("windowLimits").apply {
-                put("exceeded", JSONObject.NULL)
-                getJSONObject("fiveHour").put("exceeded", false)
-                getJSONObject("weekly").put("exceeded", true)
-            }
-        }.toString()
+        private const val SUBSCRIPTION_JSON =
+            "{\"success\":true,\"data\":{\"planId\":\"individual-goat\",\"status\":\"active\",\"currentPeriodEnd\":1801000000000}}"
+        private const val NO_SUBSCRIPTION_JSON = "{\"success\":true,\"data\":null}"
+        private const val CREDITS_PATH = "/alpha/billing/credits"
+        private const val SUBSCRIPTION_PATH = "/alpha/billing/subscriptions"
     }
 }
