@@ -19,6 +19,8 @@ import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.KeyRecoveryRequired
 import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
+import com.commandcode.chat.data.security.SystemPromptStore
+import com.commandcode.chat.data.security.effectiveSystemPrompt
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.QuotaSource
@@ -53,6 +55,12 @@ import kotlinx.coroutines.withContext
 
 enum class BudgetFreshness { LIVE, STALE, UNAVAILABLE }
 
+enum class SystemPromptFeedback { SAVED, CLEARED, SAVE_FAILED, CLEAR_FAILED, LOAD_FAILED }
+
+/** Single canonical copy for an unreadable saved prompt, shared by the blocking banner and Settings feedback. */
+internal const val SYSTEM_PROMPT_UNAVAILABLE_MESSAGE =
+    "Saved system prompt could not be opened. Sending is disabled until a new prompt is saved or cleared."
+
 data class BudgetUiState(
     val snapshot: QuotaSnapshot? = null,
     val freshness: BudgetFreshness = BudgetFreshness.UNAVAILABLE,
@@ -82,6 +90,11 @@ data class AppUiState(
     val importingAttachments: Boolean = false,
     val attachmentError: AttachmentFailure? = null,
     val historySort: HistorySort = HistorySort.MOST_RECENT,
+    val systemPrompt: String = "",
+    val systemPromptLoaded: Boolean = false,
+    val systemPromptSaving: Boolean = false,
+    val systemPromptFeedback: SystemPromptFeedback? = null,
+    val systemPromptCommit: Int = 0,
 ) {
     val visibleMessages: List<Message>
         get() = if (currentConversationId == activeConversationId && activeAssistantMessageId != null) {
@@ -109,6 +122,7 @@ class AppViewModel(
     private val attachmentOperations: AttachmentOperations,
     private val elapsedMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     private val apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
+    private val systemPromptStore: SystemPromptStore,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr, amoled = settings.amoled))
     val state: StateFlow<AppUiState> = mutableState.asStateFlow()
@@ -162,6 +176,14 @@ class AppViewModel(
             } catch (error: Exception) {
                 attachmentFailure = attachmentFailureOf(error, AttachmentFailure.STORAGE)
             }
+            var systemPrompt: String? = null
+            try {
+                systemPrompt = systemPromptStore.read()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                systemPrompt = null
+            }
             mutableState.value = mutableState.value.copy(
                 loading = false,
                 recoveryMessage = recoveryMessage,
@@ -174,7 +196,11 @@ class AppViewModel(
                     BudgetUiState(snapshot = it, freshness = BudgetFreshness.STALE)
                 } ?: BudgetUiState(),
                 attachmentError = attachmentFailure,
-                errorMessage = attachmentFailure?.let(::safeAttachmentMessage),
+                errorMessage = if (systemPrompt == null) SYSTEM_PROMPT_UNAVAILABLE_MESSAGE
+                    else attachmentFailure?.let(::safeAttachmentMessage),
+                systemPrompt = systemPrompt ?: "",
+                systemPromptLoaded = systemPrompt != null,
+                systemPromptFeedback = if (systemPrompt == null) SystemPromptFeedback.LOAD_FAILED else null,
             )
             refreshModels()
             if (configured && recoveryMessage == null) refreshQuota()
@@ -215,12 +241,14 @@ class AppViewModel(
                         mutableState.value = mutableState.value.copy(
                             keyConfigured = true,
                             errorMessage = null,
-                        )
+                        ).withBlockingPromptBanner()
                         refreshQuota()
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Exception) {
-                        mutableState.value = mutableState.value.copy(errorMessage = safeMessage(error))
+                        mutableState.value = mutableState.value.copy(
+                            errorMessage = safeMessage(error),
+                        ).withBlockingPromptBanner()
                     }
                 }
             } finally {
@@ -242,7 +270,7 @@ class AppViewModel(
                     )
                     try {
                         quota.clear()
-                        mutableState.value = mutableState.value.copy(errorMessage = null)
+                        mutableState.value = mutableState.value.copy(errorMessage = null).withBlockingPromptBanner()
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {
@@ -251,7 +279,9 @@ class AppViewModel(
                         )
                     }
                 } catch (_: SecureStoragePersistenceFailure) {
-                    mutableState.value = mutableState.value.copy(errorMessage = API_KEY_CLEAR_FAILURE_MESSAGE)
+                    mutableState.value = mutableState.value.copy(
+                        errorMessage = API_KEY_CLEAR_FAILURE_MESSAGE,
+                    ).withBlockingPromptBanner()
                 }
             }
         }
@@ -265,6 +295,67 @@ class AppViewModel(
     fun setAmoled(enabled: Boolean) {
         settings.amoled = enabled
         mutableState.value = mutableState.value.copy(amoled = enabled)
+    }
+
+    fun saveSystemPrompt(value: String) {
+        val current = mutableState.value
+        if (current.systemPromptSaving) return
+        mutableState.value = current.copy(
+            systemPromptSaving = true,
+            systemPromptFeedback = null,
+        )
+        viewModelScope.launch {
+            try {
+                val effective = effectiveSystemPrompt(value)
+                systemPromptStore.save(effective)
+                val snapshot = mutableState.value
+                mutableState.value = snapshot.copy(
+                    systemPrompt = effective,
+                    systemPromptLoaded = true,
+                    systemPromptSaving = false,
+                    systemPromptFeedback = SystemPromptFeedback.SAVED,
+                    systemPromptCommit = snapshot.systemPromptCommit + 1,
+                    errorMessage = if (snapshot.errorMessage == SYSTEM_PROMPT_UNAVAILABLE_MESSAGE) null else snapshot.errorMessage,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                mutableState.value = mutableState.value.copy(
+                    systemPromptSaving = false,
+                    systemPromptFeedback = SystemPromptFeedback.SAVE_FAILED,
+                )
+            }
+        }
+    }
+
+    fun clearSystemPrompt() {
+        val current = mutableState.value
+        if (current.systemPromptSaving) return
+        mutableState.value = current.copy(
+            systemPromptSaving = true,
+            systemPromptFeedback = null,
+        )
+        viewModelScope.launch {
+            try {
+                systemPromptStore.clear()
+                val snapshot = mutableState.value
+                mutableState.value = snapshot.copy(
+                    systemPrompt = "",
+                    systemPromptLoaded = true,
+                    systemPromptSaving = false,
+                    systemPromptFeedback = SystemPromptFeedback.CLEARED,
+                    systemPromptCommit = snapshot.systemPromptCommit + 1,
+                    errorMessage = if (snapshot.errorMessage == SYSTEM_PROMPT_UNAVAILABLE_MESSAGE) null else snapshot.errorMessage,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                mutableState.value = mutableState.value.copy(
+                    systemPromptSaving = false,
+                    systemPromptFeedback = SystemPromptFeedback.CLEAR_FAILED,
+                )
+            }
+        }
     }
 
     fun updateDraft(text: String) {
@@ -378,7 +469,7 @@ class AppViewModel(
         mutableState.value = current.copy(
             attachmentError = null,
             errorMessage = if (wasAttachmentMessage) null else current.errorMessage,
-        )
+        ).withBlockingPromptBanner()
     }
 
     suspend fun loadAttachmentPreview(id: String, maxEdge: Int): Bitmap {
@@ -414,7 +505,9 @@ class AppViewModel(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                mutableState.value = mutableState.value.copy(errorMessage = "Model could not be changed. Try again.")
+                mutableState.value = mutableState.value.copy(
+                    errorMessage = "Model could not be changed. Try again.",
+                ).withBlockingPromptBanner()
             } finally {
                 messageMutationJob = null
                 applyPendingModelsIfIdle()
@@ -481,7 +574,7 @@ class AppViewModel(
             messages = emptyList(),
             draftText = "",
             pendingAttachments = emptyList(),
-            errorMessage = null,
+            errorMessage = navigationErrorMessage(mutableState.value),
             attachmentError = null,
             importingAttachments = attachmentImportJob != null,
         )
@@ -506,16 +599,39 @@ class AppViewModel(
             messages = emptyList(),
             draftText = "",
             pendingAttachments = emptyList(),
-            errorMessage = null,
+            errorMessage = navigationErrorMessage(mutableState.value),
             attachmentError = null,
             importingAttachments = attachmentImportJob != null,
         )
         messageCollection = viewModelScope.launch {
+            try {
+                chats.backfillInitialModel(id)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Best-effort backfill: the conversation still opens without it.
+            }
             chats.observeMessages(id).collectLatest { messages ->
                 mutableState.value = mutableState.value.copy(messages = messages)
             }
         }
     }
+
+    /** While the saved prompt is unavailable the blocking reason must survive navigation. */
+    private fun navigationErrorMessage(current: AppUiState): String? =
+        if (!current.systemPromptLoaded && !current.loading) SYSTEM_PROMPT_UNAVAILABLE_MESSAGE else null
+
+    /**
+     * Enforces the blocking-banner invariant: while the saved prompt is unavailable
+     * (startup load has completed and failed) the shared banner always reports that
+     * reason. An unrelated error or a success-clear must never make disabled sending
+     * look silent, and navigation must not swap the reason for other text. Heal
+     * transitions (save/clear success) set `systemPromptLoaded` in the same update
+     * and therefore bypass this helper; failing heal operations keep the banner.
+     */
+    private fun AppUiState.withBlockingPromptBanner(): AppUiState =
+        if (systemPromptLoaded || loading) this
+        else copy(errorMessage = SYSTEM_PROMPT_UNAVAILABLE_MESSAGE)
 
     private fun discardCurrentDraft() {
         val images = mutableState.value.pendingAttachments
@@ -628,7 +744,7 @@ class AppViewModel(
         mutableState.value = mutableState.value.copy(
             attachmentError = failure,
             errorMessage = safeAttachmentMessage(failure),
-        )
+        ).withBlockingPromptBanner()
     }
 
     fun deleteConversation(id: String) {
@@ -694,14 +810,14 @@ class AppViewModel(
                     publishAttachmentFailure(AttachmentFailure.CLEANUP)
                     mutableState.value = mutableState.value.copy(
                         errorMessage = ATTACHMENT_CLEANUP_WARNING,
-                    )
+                    ).withBlockingPromptBanner()
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 mutableState.value = mutableState.value.copy(
                     errorMessage = "Conversation could not be deleted. Try again.",
-                )
+                ).withBlockingPromptBanner()
             } finally {
                 deletingConversationIds -= id
                 applyPendingModelsIfIdle()
@@ -714,6 +830,14 @@ class AppViewModel(
     private fun sendOrRetry(text: String, retryUserId: String?) {
         val prompt = text.trim()
         val snapshot = mutableState.value
+        if (!snapshot.systemPromptLoaded) {
+            // Never drop an enabled send/retry silently: the only on-screen reason
+            // is the unavailable-prompt banner, so make sure it is visible.
+            if (snapshot.errorMessage != SYSTEM_PROMPT_UNAVAILABLE_MESSAGE) {
+                mutableState.value = snapshot.copy(errorMessage = SYSTEM_PROMPT_UNAVAILABLE_MESSAGE)
+            }
+            return
+        }
         if ((retryUserId == null && prompt.isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
             selectionIsFrozen() ||
             !snapshot.keyConfigured
@@ -723,6 +847,9 @@ class AppViewModel(
         }
         val selectedModel = snapshot.selectedModel
         val zdr = snapshot.zdr
+        // Capture the system prompt alongside model/ZDR so a concurrent Settings
+        // change cannot alter this in-flight request.
+        val systemPrompt = snapshot.systemPrompt
         val requestedConversationId = snapshot.currentConversationId
         val snapshotImages = if (retryUserId == null) snapshot.pendingAttachments.toList() else emptyList()
         val snapshotGeneration = draftGeneration
@@ -736,12 +863,13 @@ class AppViewModel(
                 mutableState.value = mutableState.value.copy(sending = true, streamingText = "", errorMessage = null)
                 val registered = withContext(NonCancellable) {
                     val prepared = if (retryUserId != null) attachmentOperations.prepareRetry(
-                        requireNotNull(requestedConversationId), retryUserId, selectedModel,
+                        requireNotNull(requestedConversationId), retryUserId, selectedModel, systemPrompt,
                     ) else attachmentOperations.prepareTurn(
                         requestedConversationId,
                         prompt,
                         selectedModel,
                         snapshotImages,
+                        systemPrompt,
                     )
                     val active = ActiveTurn(
                         pending = prepared.pending,
@@ -845,13 +973,15 @@ class AppViewModel(
         messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             try {
                 attachmentOperations.deleteFailedMessage(conversationId, userMessageId)
-                mutableState.value = mutableState.value.copy(errorMessage = null)
+                mutableState.value = mutableState.value.copy(errorMessage = null).withBlockingPromptBanner()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: AttachmentException) {
                 publishAttachmentFailure(error.kind)
             } catch (_: Exception) {
-                mutableState.value = mutableState.value.copy(errorMessage = "Message could not be deleted. Try again.")
+                mutableState.value = mutableState.value.copy(
+                    errorMessage = "Message could not be deleted. Try again.",
+                ).withBlockingPromptBanner()
             } finally {
                 messageMutationJob = null
                 applyPendingModelsIfIdle()
@@ -1051,6 +1181,7 @@ class AppViewModel(
                 container.modelCatalogue,
                 container.quota,
                 container.attachmentOperations,
+                systemPromptStore = container.systemPromptStore,
             ) as T
         }
     }

@@ -7,6 +7,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,7 +22,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.material3.Button
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -30,7 +32,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedIconButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -41,8 +42,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -50,6 +53,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.commandcode.chat.R
@@ -86,7 +90,36 @@ internal fun chatHeading(state: AppUiState): String {
 internal fun sendButtonEnabled(state: AppUiState): Boolean =
     !state.sending &&
         !state.importingAttachments &&
+        state.systemPromptLoaded &&
         (state.draftText.isNotBlank() || state.pendingAttachments.isNotEmpty())
+
+/** Sentence-capitalisation is an IME hint only; the draft text is never rewritten. */
+internal val composerKeyboardOptions: KeyboardOptions =
+    KeyboardOptions(capitalization = KeyboardCapitalization.Sentences)
+
+private const val COMPOSER_DISABLED_ALPHA = 0.38f
+
+/** Active draft text colour; both content and placeholder dim together while the composer is disabled. */
+internal fun composerContentColour(colours: ColorScheme, enabled: Boolean): Color =
+    if (enabled) colours.onSurface else colours.onSurface.copy(alpha = COMPOSER_DISABLED_ALPHA)
+
+/** Placeholder colour; disabled it must not read brighter than the dimmed draft text it replaces. */
+internal fun composerPlaceholderColour(colours: ColorScheme, enabled: Boolean): Color =
+    if (enabled) colours.onSurfaceVariant else colours.onSurfaceVariant.copy(alpha = COMPOSER_DISABLED_ALPHA)
+
+/** Legacy initial-model events carry the model apiId; new ones carry the display name. */
+internal fun initialModelName(content: String, modelId: String?, models: List<ChatModel>): String {
+    val catalogueId = modelId ?: content
+    return models.firstOrNull { it.apiId == catalogueId }?.displayName ?: content
+}
+
+/** Local-only timeline notice copy. SYSTEM_PROMPT_CHANGE content is private metadata, never shown. */
+internal fun noticeText(message: Message, models: List<ChatModel>): String? = when (message.role) {
+    MessageState.INITIAL_MODEL -> "Model: ${initialModelName(message.content, message.modelId, models)}"
+    MessageState.MODEL_CHANGE -> "Model changed to ${message.content}"
+    MessageState.SYSTEM_PROMPT_CHANGE -> "System Prompt changed"
+    else -> null
+}
 
 internal fun safeAttachmentDisplayName(value: String): String {
     val cleaned = buildString(value.length) {
@@ -206,10 +239,11 @@ fun ChatScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Top),
         ) {
             items(timeline, key = Message::id) { message ->
-                if (message.role == MessageState.MODEL_CHANGE) {
+                val notice = noticeText(message, state.models)
+                if (notice != null) {
                     Text(
-                        "Model changed to ${message.content}",
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("model_change_${message.id}"),
+                        notice,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("local_notice_${message.id}"),
                         style = MaterialTheme.typography.labelMedium,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -230,6 +264,17 @@ fun ChatScreen(
                         actionsEnabled = !state.sending && !state.importingAttachments,
                         onRetry = { onRetryMessage(message.id) },
                         onDelete = { onDeleteFailedMessage(message.id) },
+                    )
+                }
+            }
+            if (state.currentConversationId == null && state.messages.isEmpty() && !state.sending) {
+                item(key = "initial_model_preview") {
+                    Text(
+                        "Model: ${state.selectedModel.displayName}",
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("initial_model_preview"),
+                        style = MaterialTheme.typography.labelMedium,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
@@ -258,40 +303,101 @@ fun ChatScreen(
                 }
             }
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+        val composerEnabled = !state.sending && !state.importingAttachments
+        val composerShape = MaterialTheme.shapes.extraSmall
+        val composerOutline = if (composerEnabled) MaterialTheme.colorScheme.outline
+            else MaterialTheme.colorScheme.outlineVariant
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, composerOutline, composerShape)
+                .clip(composerShape)
+                .padding(horizontal = 4.dp, vertical = 2.dp)
+                .testTag("composer_container"),
         ) {
-            OutlinedTextField(
+            BasicTextField(
                 value = state.draftText,
                 onValueChange = onDraftChange,
-                modifier = Modifier.weight(1f).testTag("message_composer"),
-                label = { Text("Message") },
+                modifier = Modifier.fillMaxWidth().testTag("message_composer"),
+                enabled = composerEnabled,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(
+                    color = composerContentColour(MaterialTheme.colorScheme, composerEnabled),
+                ),
+                keyboardOptions = composerKeyboardOptions,
                 maxLines = composerLines,
-                enabled = !state.sending && !state.importingAttachments,
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                decorationBox = { innerTextField ->
+                    // Padding lives inside the field so its whole visible band is the
+                    // tappable/focusable surface rather than a dead inset ring.
+                    Box(Modifier.padding(horizontal = 8.dp, vertical = 10.dp)) {
+                        if (state.draftText.isEmpty()) {
+                            Text(
+                                "Message",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = composerPlaceholderColour(MaterialTheme.colorScheme, composerEnabled),
+                            )
+                        }
+                        innerTextField()
+                    }
+                },
             )
-            OutlinedIconButton(
-                onClick = onAttach,
-                enabled = !state.sending && !state.importingAttachments,
-                modifier = Modifier
-                    .size(48.dp)
-                    .testTag("attach_image")
-                    .semantics { contentDescription = "Attach image" },
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_paperclip),
-                    contentDescription = null,
+                Text(
+                    text = state.selectedModel.displayName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 8.dp)
+                        .testTag("composer_model"),
                 )
-            }
-            if (state.sending) {
-                OutlinedButton(onClick = onCancel, modifier = Modifier.testTag("cancel_send")) { Text("Cancel") }
-            } else {
-                Button(
-                    onClick = { onSend(state.draftText) },
-                    enabled = sendButtonEnabled(state),
-                    modifier = Modifier.testTag("send_message"),
-                ) { Text("Send") }
+                IconButton(
+                    onClick = onAttach,
+                    enabled = composerEnabled,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("attach_image")
+                        .semantics { contentDescription = "Attach image" },
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_paperclip),
+                        contentDescription = null,
+                    )
+                }
+                if (state.sending) {
+                    IconButton(
+                        onClick = onCancel,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("cancel_send")
+                            .semantics { contentDescription = "Cancel response" },
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_stop),
+                            contentDescription = null,
+                        )
+                    }
+                } else {
+                    IconButton(
+                        onClick = { onSend(state.draftText) },
+                        enabled = sendButtonEnabled(state),
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("send_message")
+                            .semantics { contentDescription = "Send message" },
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_send),
+                            contentDescription = null,
+                        )
+                    }
+                }
             }
         }
     }

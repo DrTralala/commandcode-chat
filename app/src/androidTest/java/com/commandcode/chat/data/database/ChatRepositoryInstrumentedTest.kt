@@ -40,15 +40,19 @@ class ChatRepositoryInstrumentedTest {
         assertEquals("hello world", conversation.title)
         assertEquals(ChatModel.SOL.apiId, conversation.defaultModelId)
         val rows = repository.observeMessages(turn.conversationId).first()
-        assertEquals(listOf("USER", "ASSISTANT"), rows.map { it.role })
-        assertEquals(turn.userMessageId, rows[0].id)
-        assertEquals("  hello   world  ", rows[0].content)
-        assertEquals("COMPLETE", rows[0].status)
-        assertEquals(turn.assistantMessageId, rows[1].id)
-        assertEquals("", rows[1].content)
-        assertEquals(ChatModel.SOL.apiId, rows[1].modelId)
-        assertEquals("PENDING", rows[1].status)
+        assertEquals(
+            listOf("INITIAL_MODEL", "USER", "ASSISTANT"),
+            rows.map { it.role },
+        )
+        assertEquals(turn.userMessageId, rows[1].id)
+        assertEquals("  hello   world  ", rows[1].content)
+        assertEquals("COMPLETE", rows[1].status)
+        assertEquals(turn.assistantMessageId, rows[2].id)
+        assertEquals("", rows[2].content)
+        assertEquals(ChatModel.SOL.apiId, rows[2].modelId)
+        assertEquals("PENDING", rows[2].status)
         assertTrue(rows[1].createdAt > rows[0].createdAt)
+        assertTrue(rows[2].createdAt > rows[1].createdAt)
         val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
         assertEquals(turn.assistantMessageId, event.requestId)
         assertEquals(turn.conversationId, event.conversationId)
@@ -162,7 +166,8 @@ class ChatRepositoryInstrumentedTest {
         val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
         val before = database.conversations().find(turn.conversationId)!!.updatedAt
         repository.interruptTurn(turn.assistantMessageId, "partial", "network failure")
-        val assistant = repository.observeMessages(turn.conversationId).first()[1]
+        val assistant = repository.observeMessages(turn.conversationId).first()
+            .first { it.role == "ASSISTANT" }
         assertEquals("INTERRUPTED", assistant.status)
         assertEquals("partial", assistant.content)
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > before)
@@ -189,7 +194,7 @@ class ChatRepositoryInstrumentedTest {
         val rows = repository.observeMessages(turn.conversationId).first()
         assertEquals(
             listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId),
-            rows.map { it.id },
+            rows.filter { it.role == "USER" || it.role == "ASSISTANT" }.map { it.id },
         )
         assertTrue(rows.zipWithNext().all { (a, b) -> b.createdAt > a.createdAt })
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > conversation.updatedAt)
@@ -215,7 +220,10 @@ class ChatRepositoryInstrumentedTest {
 
         val snapshot = repository.messagesSnapshot(turn.conversationId)
 
-        assertEquals(listOf("first", "first answer", "second", ""), snapshot.map { it.content })
+        assertEquals(
+            listOf(ChatModel.SOL.displayName, "first", "first answer", "second", ""),
+            snapshot.map { it.content },
+        )
         assertEquals(second.assistantMessageId, snapshot.last().id)
     }
 

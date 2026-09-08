@@ -61,6 +61,7 @@ class LiveStreamingInstrumentedTest {
             modelCatalogue = container.modelCatalogue,
             quota = container.quota,
             attachmentOperations = container.attachmentOperations,
+            systemPromptStore = container.systemPromptStore,
         )
         var createdConversation: String? = null
         try {

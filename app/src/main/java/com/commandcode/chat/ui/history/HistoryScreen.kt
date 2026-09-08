@@ -82,7 +82,6 @@ fun HistoryScreen(
                 Icon(painterResource(R.drawable.ic_delete), if (selecting) "Cancel deletion selection" else "Select conversations to delete")
             }
         }
-        Text("ENCRYPTED ON DEVICE", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
         if (selecting) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text("${selected.size} selected", modifier = Modifier.weight(1f))

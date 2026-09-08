@@ -35,6 +35,7 @@ import com.commandcode.chat.data.attachments.PreparedAttachmentTurn
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
+import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.service.ModelCatalogueSnapshot
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
@@ -187,6 +188,7 @@ class AttachmentPickerInstrumentedTest {
         compose.onNodeWithTag("send_message").assertIsDisplayed()
         compose.onNodeWithTag("pending_attachments").performScrollToIndex(19)
         compose.onNodeWithTag("remove_attachment_20").assertIsDisplayed()
+        val composerContainer = compose.onNodeWithTag("composer_container").fetchSemanticsNode().boundsInRoot
         val input = compose.onNodeWithTag("message_composer").fetchSemanticsNode().boundsInRoot
         val attachments = compose.onNodeWithTag("pending_attachments").fetchSemanticsNode().boundsInRoot
         assertTrue("attachments must remain above input", attachments.bottom <= input.top)
@@ -198,7 +200,7 @@ class AttachmentPickerInstrumentedTest {
             val composeHost = compose.activity.findViewById<android.view.ViewGroup>(android.R.id.content).getChildAt(0)
             val location = IntArray(2)
             composeHost.getLocationOnScreen(location)
-            val gap = visibleFrame.bottom - (location[1] + input.bottom)
+            val gap = visibleFrame.bottom - (location[1] + composerContainer.bottom)
             val maxGap = 24f * compose.activity.resources.displayMetrics.density
             assertTrue("actual composer-to-keyboard gap must be 0..${maxGap}px, was $gap", gap in 0f..maxGap)
         }
@@ -226,9 +228,11 @@ class AttachmentPickerInstrumentedTest {
         compose.onNodeWithTag("security_zdr_status").assertDoesNotExist()
         val input = compose.onNodeWithTag("message_composer").fetchSemanticsNode().boundsInRoot
         val send = compose.onNodeWithTag("send_message").fetchSemanticsNode().boundsInRoot
+        val container = compose.onNodeWithTag("composer_container").fetchSemanticsNode().boundsInRoot
         val root = compose.onNodeWithTag("app_inset_content").fetchSemanticsNode().boundsInRoot
-        assertTrue("send must share the composer row", send.center.y in input.top..input.bottom)
-        assertTrue("composer must be at the bottom of inset content: $input $root", root.bottom - input.bottom < 80f)
+        assertTrue("send must sit below the editable text", send.center.y >= input.bottom)
+        assertTrue("send must stay inside the composer", send.bottom <= container.bottom + 1f)
+        assertTrue("composer must be at the bottom of inset content: $input $root", root.bottom - container.bottom < 80f)
         compose.runOnIdle {
             androidx.core.view.WindowCompat.getInsetsController(compose.activity.window, compose.activity.window.decorView)
                 .hide(androidx.core.view.WindowInsetsCompat.Type.ime())
@@ -262,6 +266,7 @@ class AttachmentPickerInstrumentedTest {
             modelCatalogue = catalogue,
             quota = TestQuota(),
             attachmentOperations = operations,
+            systemPromptStore = TestSystemPromptStore(),
         )
         val owner = object : ActivityResultRegistryOwner {
             override val activityResultRegistry: ActivityResultRegistry = registry
@@ -303,6 +308,12 @@ class AttachmentPickerInstrumentedTest {
         override var amoled = false
     }
 
+    private class TestSystemPromptStore : SystemPromptStore {
+        override fun read(): String = ""
+        override fun save(value: String) = Unit
+        override fun clear() = Unit
+    }
+
     private class EmptyChats : ChatStore {
         override fun observeConversations(): Flow<List<Conversation>> = flowOf(emptyList())
         override fun observeMessages(conversationId: String): Flow<List<Message>> = flowOf(emptyList())
@@ -312,11 +323,13 @@ class AttachmentPickerInstrumentedTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn = error("not expected")
         override suspend fun checkpointAssistant(messageId: String, text: String) = Unit
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean = false
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
         override suspend fun deleteConversation(id: String) = Unit
+        override suspend fun backfillInitialModel(conversationId: String) = Unit
     }
 
     private class TestCatalogue(private val unverified: ChatModel) : ModelCatalogueSource {
@@ -363,6 +376,7 @@ class AttachmentPickerInstrumentedTest {
             text: String,
             model: ChatModel,
             images: List<ImageAttachment>,
+            systemPrompt: String,
         ): PreparedAttachmentTurn = error("not expected")
         override suspend fun deleteConversation(id: String) = Unit
         override suspend fun preview(id: String, maxEdge: Int): android.graphics.Bitmap {

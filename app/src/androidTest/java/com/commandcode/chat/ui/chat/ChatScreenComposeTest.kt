@@ -34,6 +34,7 @@ import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
+import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.ui.AppUiState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -205,7 +206,10 @@ class ChatScreenComposeTest {
         compose.onNodeWithText("New Chat").assertIsDisplayed()
         compose.onAllNodesWithText("LOCAL TRANSCRIPT", substring = true).assertCountEquals(0)
         compose.onAllNodesWithText("ZDR", substring = true).assertCountEquals(0)
-        compose.onNodeWithText("Send").assertIsDisplayed()
+        compose.onNodeWithTag("send_message")
+            .assertIsDisplayed()
+            .assertContentDescriptionEquals("Send message")
+        compose.onAllNodesWithText("Send").assertCountEquals(0)
         compose.onAllNodesWithText("Send securely").assertCountEquals(0)
 
         val modelBounds = compose.onNodeWithTag("model_selector").fetchSemanticsNode().boundsInRoot
@@ -552,9 +556,193 @@ class ChatScreenComposeTest {
         assertTrue(returned?.isRecycled == true)
     }
 
+    @Test
+    fun composerOutlineEnclosesTextAreaAndSendIconBelowTheEditableText() {
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(draftText = "Ready to send", messages = emptyList()),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+        val container = compose.onNodeWithTag("composer_container").fetchSemanticsNode().boundsInRoot
+        val input = compose.onNodeWithTag("message_composer").fetchSemanticsNode().boundsInRoot
+        val send = compose.onNodeWithTag("send_message").fetchSemanticsNode().boundsInRoot
+        fun inside(bounds: androidx.compose.ui.geometry.Rect) =
+            bounds.left >= container.left - 1f && bounds.right <= container.right + 1f &&
+                bounds.top >= container.top - 1f && bounds.bottom <= container.bottom + 1f
+        assertTrue("message_composer $input must be inside composer_container $container", inside(input))
+        assertTrue("send_message $send must be inside composer_container $container", inside(send))
+        assertTrue("send $send must sit below the editable text $input", send.top >= input.bottom - 1f)
+    }
+
+    @Test
+    fun longModelNameStaysCompactWithoutDisplacingTheActionIcons() {
+        val longModel = ChatModel(
+            "long/model",
+            "A very long model display name that keeps going well beyond any reasonable width",
+            ChatModel.SOL.apiFamily,
+        )
+        compose.setContent {
+            MaterialTheme {
+                Box(Modifier.height(300.dp)) {
+                    ChatScreen(
+                        state = state().copy(models = listOf(longModel), selectedModel = longModel, messages = emptyList()),
+                        onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                        onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                        onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                    )
+                }
+            }
+        }
+        val container = compose.onNodeWithTag("composer_container").fetchSemanticsNode().boundsInRoot
+        val model = compose.onNodeWithTag("composer_model").fetchSemanticsNode().boundsInRoot
+        val attach = compose.onNodeWithTag("attach_image").fetchSemanticsNode().boundsInRoot
+        val send = compose.onNodeWithTag("send_message").fetchSemanticsNode().boundsInRoot
+        compose.onNodeWithTag("send_message").assertIsDisplayed()
+        compose.onNodeWithTag("composer_model").assertIsDisplayed()
+        assertTrue("model $model must stay left of attach $attach", model.right <= attach.left + 1f)
+        assertTrue("attach $attach must stay left of send $send", attach.right <= send.left + 1f)
+        assertTrue("send $send must remain inside composer $container", send.right <= container.right + 1f)
+        assertTrue("model name must stay on one compact line", model.height <= attach.height + 1f)
+    }
+
+    @Test
+    fun stopIconReplacesSendAndRemainsAvailableWhileStreaming() {
+        var cancelled = false
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(
+                        sending = true,
+                        activeConversationId = "conversation",
+                        activeAssistantMessageId = "pending",
+                        streamingText = "Partial answer",
+                        draftText = "",
+                    ),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = { cancelled = true },
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+        compose.onNodeWithTag("send_message").assertDoesNotExist()
+        compose.onNodeWithTag("cancel_send").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("message_composer").assertIsNotEnabled()
+        compose.onNodeWithTag("attach_image").assertIsNotEnabled()
+        compose.onNodeWithTag("cancel_send").performClick()
+        assertTrue(cancelled)
+    }
+
+    @Test
+    fun emptyUnsavedChatPreviewsSelectedModelAndSavedEmptyChatDoesNot() {
+        val live = mutableStateOf(state().copy(currentConversationId = null, messages = emptyList()))
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = live.value,
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+        compose.onNodeWithTag("initial_model_preview").assertIsDisplayed()
+        compose.onNodeWithText("Model: GPT-5.6 Sol").assertIsDisplayed()
+
+        compose.runOnIdle { live.value = live.value.copy(selectedModel = ChatModel.LUNA) }
+        compose.onNodeWithText("Model: GPT-5.6 Luna").assertIsDisplayed()
+        compose.onAllNodesWithText("Model: GPT-5.6 Sol").assertCountEquals(0)
+
+        compose.runOnIdle {
+            live.value = live.value.copy(
+                currentConversationId = "conversation",
+                messages = emptyList(),
+                selectedModel = ChatModel.SOL,
+            )
+        }
+        compose.onNodeWithTag("initial_model_preview").assertDoesNotExist()
+        compose.onAllNodesWithText("Model: GPT-5.6 Sol").assertCountEquals(0)
+    }
+
+    @Test
+    fun localNoticesRenderStartingModelsChangesAndPromptSwitchCopyOnly() {
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(
+                        models = listOf(ChatModel.SOL, ChatModel.LUNA),
+                        messages = listOf(
+                            Message("initial-new", "conversation", MessageState.INITIAL_MODEL, ChatModel.SOL.displayName, ChatModel.SOL.apiId, 1L, "COMPLETE"),
+                            Message("initial-legacy", "conversation", MessageState.INITIAL_MODEL, ChatModel.LUNA.apiId, ChatModel.LUNA.apiId, 2L, "COMPLETE"),
+                            Message("changed", "conversation", MessageState.MODEL_CHANGE, ChatModel.LUNA.displayName, ChatModel.LUNA.apiId, 3L, "COMPLETE"),
+                            Message("prompt", "conversation", MessageState.SYSTEM_PROMPT_CHANGE, "fingerprint-not-rendered", null, 4L, "COMPLETE"),
+                        ),
+                    ),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+        compose.onNodeWithTag("local_notice_initial-new").assertIsDisplayed()
+        compose.onNodeWithTag("local_notice_initial-legacy").assertIsDisplayed()
+        compose.onNodeWithTag("local_notice_changed").assertIsDisplayed()
+        compose.onNodeWithTag("local_notice_prompt").assertIsDisplayed()
+        compose.onNodeWithText("Model: GPT-5.6 Sol").assertIsDisplayed()
+        compose.onNodeWithText("Model: GPT-5.6 Luna").assertIsDisplayed()
+        compose.onNodeWithText("Model changed to GPT-5.6 Luna").assertIsDisplayed()
+        compose.onNodeWithText("System Prompt changed").assertIsDisplayed()
+        compose.onAllNodesWithText("fingerprint-not-rendered").assertCountEquals(0)
+        compose.onAllNodesWithText("Model changed to GPT-5.6 Sol").assertCountEquals(0)
+    }
+
+    @Test
+    fun composerKeepsIntentionalLowercaseAndPunctuationUntransformed() {
+        compose.setContent {
+            var uiState by remember { mutableStateOf(state()) }
+            MaterialTheme {
+                ChatScreen(
+                    state = uiState,
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = { uiState = uiState.copy(draftText = it) },
+                    onAttach = {}, onRemoveAttachment = {}, onDismissAttachmentError = {},
+                    loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+        val typed = "intentional lowercase 'quoted' text stays as typed"
+        compose.onNodeWithTag("message_composer").performTextInput(typed)
+        compose.onNodeWithTag("message_composer").assert(
+            SemanticsMatcher("lowercase draft is preserved verbatim") { node ->
+                node.config[SemanticsProperties.EditableText].text == typed
+            },
+        )
+    }
+
+    @Test
+    fun sendStaysDisabledWhileTheSavedSystemPromptIsUnavailable() {
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(draftText = "hello", systemPromptLoaded = false),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+        compose.onNodeWithTag("message_composer").assertIsEnabled()
+        compose.onNodeWithTag("send_message").assertIsNotEnabled()
+    }
+
     private fun state() = AppUiState(
         loading = false,
         keyConfigured = true,
+        systemPromptLoaded = true,
         currentConversationId = "conversation",
         messages = listOf(
             Message("message", "conversation", "USER", "Hello", null, 1L, "COMPLETE"),

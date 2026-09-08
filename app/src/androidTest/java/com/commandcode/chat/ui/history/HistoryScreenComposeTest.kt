@@ -27,6 +27,7 @@ import com.commandcode.chat.data.commandcode.StreamEvent
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
+import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.service.ModelCatalogueSnapshot
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSource
@@ -70,6 +71,8 @@ class HistoryScreenComposeTest {
             }
         }
 
+        compose.onNodeWithText("History").assertIsDisplayed()
+        compose.onAllNodesWithText("ENCRYPTED ON DEVICE").assertCountEquals(0)
         compose.onNodeWithTag("history_sort").performClick()
         compose.onNodeWithText("Largest first").performClick()
         compose.waitForIdle()
@@ -137,6 +140,7 @@ class HistoryScreenComposeTest {
             modelCatalogue = TestCatalogue(),
             quota = UnavailableQuota(),
             attachmentOperations = NoopAttachmentOperations(),
+            systemPromptStore = TestSystemPromptStore(),
         )
 
         compose.setContent { AppRoot(viewModel = viewModel) }
@@ -232,11 +236,19 @@ class HistoryScreenComposeTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn = error("not expected")
         override suspend fun checkpointAssistant(messageId: String, text: String) = Unit
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean = false
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
         override suspend fun deleteConversation(id: String) = Unit
+        override suspend fun backfillInitialModel(conversationId: String) = Unit
+    }
+
+    private class TestSystemPromptStore : SystemPromptStore {
+        override fun read(): String = ""
+        override fun save(value: String) = Unit
+        override fun clear() = Unit
     }
 
     private class TestCatalogue : ModelCatalogueSource {
@@ -260,6 +272,7 @@ class HistoryScreenComposeTest {
             text: String,
             model: ChatModel,
             images: List<ImageAttachment>,
+            systemPrompt: String,
         ): PreparedAttachmentTurn = error("not expected")
         override suspend fun deleteConversation(id: String) = Unit
         override suspend fun preview(id: String, maxEdge: Int): Bitmap = error("not expected")

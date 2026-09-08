@@ -36,6 +36,26 @@ class CommandCodeRequestTest {
         assertEquals("gpt-5.6-luna", JSONObject(Buffer().also { request.body!!.writeTo(it) }.readUtf8()).getString("model"))
     }
 
+    @Test fun `text-only request keeps one leading system message then the conversation`() {
+        val request = CommandCodeClient.requestForTesting(
+            apiKey = charArrayOf('k'),
+            model = ChatModel.SOL,
+            messages = listOf(
+                ApiMessage("system", "be kind"),
+                ApiMessage("user", "Hello"),
+                ApiMessage("assistant", "Hi"),
+            ),
+            zdr = true,
+        )
+        val json = JSONObject(Buffer().also { request.body!!.writeTo(it) }.readUtf8())
+        val messages = json.getJSONArray("messages")
+        assertEquals(3, messages.length())
+        assertEquals("system", messages.getJSONObject(0).getString("role"))
+        assertEquals("be kind", messages.getJSONObject(0).getString("content"))
+        assertEquals("user", messages.getJSONObject(1).getString("role"))
+        assertEquals("assistant", messages.getJSONObject(2).getString("role"))
+    }
+
     @Test fun `image messages stream ordered multimodal content and image-only rows omit empty text`() {
         var writes = 0
         val png = ApiImage("image/png", 3) {

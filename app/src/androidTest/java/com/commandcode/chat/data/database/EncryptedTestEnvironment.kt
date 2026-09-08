@@ -80,7 +80,8 @@ internal class DatabaseChatStore(private val repository: ChatRepository) : ChatS
         text: String,
         model: ChatModel,
         attachments: List<ImageAttachment>,
-    ): PendingTurn = repository.beginTurn(conversationId, text, model, attachments)
+        systemPrompt: String,
+    ): PendingTurn = repository.beginTurn(conversationId, text, model, attachments, systemPrompt)
 
     override suspend fun checkpointAssistant(messageId: String, text: String) =
         repository.checkpointAssistant(messageId, text)
@@ -93,7 +94,8 @@ internal class DatabaseChatStore(private val repository: ChatRepository) : ChatS
 
     override suspend fun deleteConversation(id: String) = repository.deleteConversation(id)
     override suspend fun failZdrTurn(assistantMessageId: String) = repository.failZdrTurn(assistantMessageId)
-    override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel) = repository.retryFailedTurn(userMessageId, model)
+    override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String) = repository.retryFailedTurn(userMessageId, model, systemPrompt)
     override suspend fun deleteFailedTurn(userMessageId: String) = repository.deleteFailedTurn(userMessageId)
     override suspend fun changeConversationModel(conversationId: String, model: ChatModel) = repository.changeConversationModel(conversationId, model)
+    override suspend fun backfillInitialModel(conversationId: String) = repository.backfillInitialModel(conversationId)
 }

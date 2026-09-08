@@ -17,7 +17,9 @@ import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.DatabaseKeyManager
 import com.commandcode.chat.data.security.EncryptedBlobStore
+import com.commandcode.chat.data.security.EncryptedSystemPromptStore
 import com.commandcode.chat.data.security.SecretRepository
+import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.service.CommandCodeQuotaClient
 import com.commandcode.chat.data.service.ModelCatalogueRepository
 import com.commandcode.chat.data.service.ModelCatalogueSource
@@ -54,15 +56,17 @@ interface ChatStore {
         text: String,
         model: ChatModel,
         attachments: List<ImageAttachment> = emptyList(),
+        systemPrompt: String = "",
     ): PendingTurn
     suspend fun checkpointAssistant(messageId: String, text: String)
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String)
     suspend fun deleteConversation(id: String)
     suspend fun failZdrTurn(assistantMessageId: String): Unit = error("Message recovery is not supported by this store")
-    suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn = error("Message recovery is not supported by this store")
+    suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String = ""): PendingTurn = error("Message recovery is not supported by this store")
     suspend fun deleteFailedTurn(userMessageId: String): Unit = error("Message recovery is not supported by this store")
     suspend fun changeConversationModel(conversationId: String, model: ChatModel): Unit = error("Model events are not supported by this store")
+    suspend fun backfillInitialModel(conversationId: String): Unit = error("Initial model backfill is not supported by this store")
 }
 
 class AppSettings(context: Context) : SettingsStore {
@@ -100,6 +104,7 @@ class AppContainer(
     private val encryptedStore = EncryptedBlobStore(applicationContext)
     val settings = AppSettings(applicationContext)
     val secretRepository = SecretRepository(encryptedStore)
+    val systemPromptStore: SystemPromptStore = EncryptedSystemPromptStore(encryptedStore)
     val chatDatabase = databaseFactory(applicationContext, DatabaseKeyManager(encryptedStore))
     val chatRepository = ChatRepository(chatDatabase)
     private val attachmentFiles = EncryptedAttachmentStore(
@@ -139,7 +144,8 @@ class AppContainer(
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
-        ) = chatRepository.beginTurn(conversationId, text, model, attachments)
+            systemPrompt: String,
+        ) = chatRepository.beginTurn(conversationId, text, model, attachments, systemPrompt)
         override suspend fun checkpointAssistant(messageId: String, text: String) =
             chatRepository.checkpointAssistant(messageId, text)
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
@@ -149,9 +155,10 @@ class AppContainer(
             chatRepository.interruptTurn(messageId, partialText, reason)
         override suspend fun deleteConversation(id: String) = chatRepository.deleteConversation(id)
         override suspend fun failZdrTurn(assistantMessageId: String) = chatRepository.failZdrTurn(assistantMessageId)
-        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel) = chatRepository.retryFailedTurn(userMessageId, model)
+        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String) = chatRepository.retryFailedTurn(userMessageId, model, systemPrompt)
         override suspend fun deleteFailedTurn(userMessageId: String) = chatRepository.deleteFailedTurn(userMessageId)
         override suspend fun changeConversationModel(conversationId: String, model: ChatModel) = chatRepository.changeConversationModel(conversationId, model)
+        override suspend fun backfillInitialModel(conversationId: String) = chatRepository.backfillInitialModel(conversationId)
     }
     val attachmentOperations: AttachmentOperations = AttachmentService(
         chatStore = chatStore,

@@ -5,6 +5,7 @@ import com.commandcode.chat.domain.AttachmentException
 import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
+import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.domain.TokenUsage
 import android.content.Context
 import androidx.room.Room
@@ -57,8 +58,10 @@ class ChatRepositoryTest {
         assertTrue(first.assistantMessageId != retry.assistantMessageId)
         assertNull(database.messages().find(first.assistantMessageId))
         assertEquals(oldPosition, database.messages().find(retry.assistantMessageId)!!.createdAt)
+        val conversational = repository.messagesSnapshot(first.conversationId)
+            .filter { it.role == "USER" || it.role == "ASSISTANT" }
         assertEquals(listOf(first.userMessageId, retry.assistantMessageId, later.userMessageId, later.assistantMessageId),
-            repository.messagesSnapshot(first.conversationId).map { it.id })
+            conversational.map { it.id })
         assertEquals(3, database.usageEvents().observeForConversation(first.conversationId).first().size)
         repository.completeTurn(retry.assistantMessageId, "retry answer", TokenUsage(10, null, 2))
         assertEquals("retry answer", database.messages().find(retry.assistantMessageId)!!.content)
@@ -73,8 +76,10 @@ class ChatRepositoryTest {
         repository.failZdrTurn(failed.assistantMessageId)
         val later = repository.beginTurn(failed.conversationId, "later", ChatModel.SOL)
         repository.deleteFailedTurn(failed.userMessageId)
+        val conversational = repository.messagesSnapshot(failed.conversationId)
+            .filter { it.role == "USER" || it.role == "ASSISTANT" }
         assertEquals(listOf(later.userMessageId, later.assistantMessageId),
-            repository.messagesSnapshot(failed.conversationId).map { it.id })
+            conversational.map { it.id })
         assertEquals(2, database.usageEvents().observeForConversation(failed.conversationId).first().size)
         assertEquals(1, repository.observeConversations().first().size)
         assertTrue(runCatching { repository.deleteFailedTurn(later.userMessageId) }.isFailure)
@@ -97,7 +102,7 @@ class ChatRepositoryTest {
         val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
         repository.completeTurn(turn.assistantMessageId, "answer", null)
         repository.changeConversationModel(turn.conversationId, ChatModel.SOL)
-        assertEquals(2, repository.messagesSnapshot(turn.conversationId).size)
+        assertEquals(3, repository.messagesSnapshot(turn.conversationId).size)
         repository.changeConversationModel(turn.conversationId, ChatModel.LUNA)
         repository.changeConversationModel(turn.conversationId, ChatModel.LUNA)
         val event = repository.messagesSnapshot(turn.conversationId).last()
@@ -105,7 +110,7 @@ class ChatRepositoryTest {
         assertEquals(ChatModel.LUNA.displayName, event.content)
         assertEquals(ChatModel.LUNA.apiId, event.modelId)
         assertEquals(ChatModel.LUNA.apiId, database.conversations().find(turn.conversationId)!!.defaultModel)
-        assertEquals(3, repository.messagesSnapshot(turn.conversationId).size)
+        assertEquals(4, repository.messagesSnapshot(turn.conversationId).size)
         assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
     }
 
@@ -122,17 +127,21 @@ class ChatRepositoryTest {
         assertEquals(ChatModel.SOL.apiId, conversation.defaultModelId)
         val rows = repository.observeMessages(turn.conversationId).first()
         assertEquals(
-            listOf("USER", "ASSISTANT"),
+            listOf("INITIAL_MODEL", "USER", "ASSISTANT"),
             rows.map { it.role },
         )
-        assertEquals(turn.userMessageId, rows[0].id)
-        assertEquals("  hello   world  ", rows[0].content)
-        assertEquals("COMPLETE", rows[0].status)
-        assertEquals(turn.assistantMessageId, rows[1].id)
-        assertEquals("", rows[1].content)
-        assertEquals(ChatModel.SOL.apiId, rows[1].modelId)
-        assertEquals("PENDING", rows[1].status)
+        assertEquals(turn.userMessageId, rows[1].id)
+        assertEquals("  hello   world  ", rows[1].content)
+        assertEquals("COMPLETE", rows[1].status)
+        assertEquals(turn.assistantMessageId, rows[2].id)
+        assertEquals("", rows[2].content)
+        assertEquals(ChatModel.SOL.apiId, rows[2].modelId)
+        assertEquals("PENDING", rows[2].status)
         assertTrue(rows[1].createdAt > rows[0].createdAt)
+        assertTrue(rows[2].createdAt > rows[1].createdAt)
+        assertEquals(ChatModel.SOL.displayName, rows[0].content)
+        assertEquals(ChatModel.SOL.apiId, rows[0].modelId)
+        assertEquals("COMPLETE", rows[0].status)
         val event = database.usageEvents().observeForConversation(turn.conversationId).first().single()
         assertEquals(turn.assistantMessageId, event.requestId)
         assertEquals(turn.conversationId, event.conversationId)
@@ -217,7 +226,8 @@ class ChatRepositoryTest {
         val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
         val before = database.conversations().find(turn.conversationId)!!.updatedAt
         repository.interruptTurn(turn.assistantMessageId, "partial", "network failure")
-        val assistant = repository.observeMessages(turn.conversationId).first()[1]
+        val assistant = repository.observeMessages(turn.conversationId).first()
+            .first { it.role == "ASSISTANT" }
         assertEquals("INTERRUPTED", assistant.status)
         assertEquals("partial", assistant.content)
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > before)
@@ -242,7 +252,11 @@ class ChatRepositoryTest {
         assertEquals(first, second)
         val next = repository.beginTurn(turn.conversationId, "next\u00a0turn\u2003now", ChatModel.SOL)
         val rows = repository.observeMessages(turn.conversationId).first()
-        assertEquals(listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId), rows.map { it.id })
+        assertEquals(MessageState.INITIAL_MODEL, rows.first().role)
+        assertEquals(
+            listOf(turn.userMessageId, turn.assistantMessageId, next.userMessageId, next.assistantMessageId),
+            rows.filter { it.role == "USER" || it.role == "ASSISTANT" }.map { it.id },
+        )
         assertTrue(rows.zipWithNext().all { (a, b) -> b.createdAt > a.createdAt })
         assertTrue(database.conversations().find(turn.conversationId)!!.updatedAt > conversation.updatedAt)
     }
@@ -268,7 +282,7 @@ class ChatRepositoryTest {
         val snapshot = repository.messagesSnapshot(turn.conversationId)
 
         assertEquals(
-            listOf("first", "first answer", "second", ""),
+            listOf(ChatModel.SOL.displayName, "first", "first answer", "second", ""),
             snapshot.map { it.content },
         )
         assertEquals(second.assistantMessageId, snapshot.last().id)
@@ -321,10 +335,10 @@ class ChatRepositoryTest {
         val user = repository.messagesSnapshot(turn.conversationId).first { it.role == "USER" }
         assertEquals(listOf(image), user.attachments)
         val conversation = repository.observeConversations().first().single()
-        assertEquals(2L, conversation.textBytes)
+        assertEquals(13L, conversation.textBytes)
         assertEquals(133L, conversation.attachmentBytes)
         assertEquals(1, conversation.attachmentCount)
-        assertEquals(135L, conversation.totalBytes)
+        assertEquals(146L, conversation.totalBytes)
         assertEquals(image.id, database.attachments().listForConversation(turn.conversationId).single().id)
     }
 
@@ -365,7 +379,7 @@ class ChatRepositoryTest {
         }.exceptionOrNull()
         assertTrue(failure is AttachmentException && failure.kind == AttachmentFailure.TOO_MANY)
         assertEquals(20, repository.observeConversations().first().single().attachmentCount)
-        assertEquals(4, repository.observeMessages(first.conversationId).first().size)
+        assertEquals(5, repository.observeMessages(first.conversationId).first().size)
         assertEquals(2, database.usageEvents().observeForConversation(first.conversationId).first().size)
     }
 
@@ -380,7 +394,7 @@ class ChatRepositoryTest {
         }.exceptionOrNull()
 
         assertTrue(error is IllegalArgumentException)
-        assertEquals(2, repository.observeMessages(turn.conversationId).first().size)
+        assertEquals(3, repository.observeMessages(turn.conversationId).first().size)
         assertEquals(1, database.attachments().countForConversation(turn.conversationId))
         assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
     }
@@ -396,7 +410,7 @@ class ChatRepositoryTest {
         }.exceptionOrNull()
 
         assertTrue(error is IllegalArgumentException)
-        assertEquals(2, repository.observeMessages(first.conversationId).first().size)
+        assertEquals(3, repository.observeMessages(first.conversationId).first().size)
         assertEquals(1, database.attachments().countForConversation(first.conversationId))
         assertEquals(1, repository.observeConversations().first().single().attachmentCount)
     }
@@ -425,16 +439,16 @@ class ChatRepositoryTest {
     fun assistantCheckpointsUpdateReactiveTextSizes() = runTest {
         val (repository, _) = testRepository()
         val turn = repository.beginTurn(null, "hi", ChatModel.SOL)
-        assertEquals(2L, repository.observeConversations().first().single().textBytes)
+        assertEquals(13L, repository.observeConversations().first().single().textBytes)
 
         repository.checkpointAssistant(turn.assistantMessageId, "streamed")
 
-        assertEquals(10L, repository.observeConversations().first().single().textBytes)
-        assertEquals(10L, repository.observeConversations().first().single().totalBytes)
+        assertEquals(21L, repository.observeConversations().first().single().textBytes)
+        assertEquals(21L, repository.observeConversations().first().single().totalBytes)
 
         repository.completeTurn(turn.assistantMessageId, "done", null)
 
-        assertEquals(6L, repository.observeConversations().first().single().textBytes)
+        assertEquals(17L, repository.observeConversations().first().single().textBytes)
     }
 
     @Test
@@ -464,17 +478,17 @@ class ChatRepositoryTest {
         val conversations = repository.observeConversations().first().associateBy { it.id }
         val imagesConversation = conversations.getValue(withImages.conversationId)
         val textConversation = conversations.getValue(textOnly.conversationId)
-        assertEquals(2L, imagesConversation.textBytes)
+        assertEquals(13L, imagesConversation.textBytes)
         assertEquals(133L, imagesConversation.attachmentBytes)
         assertEquals(1, imagesConversation.attachmentCount)
-        assertEquals(5L, textConversation.textBytes)
+        assertEquals(16L, textConversation.textBytes)
         assertEquals(0L, textConversation.attachmentBytes)
         assertEquals(0, textConversation.attachmentCount)
 
         repository.deleteConversation(withImages.conversationId)
 
         val remaining = repository.observeConversations().first().single()
-        assertEquals(5L, remaining.textBytes)
+        assertEquals(16L, remaining.textBytes)
         assertEquals(0L, remaining.attachmentBytes)
         assertEquals(0, remaining.attachmentCount)
     }
@@ -496,10 +510,182 @@ class ChatRepositoryTest {
         val second = repository.beginTurn(turn.conversationId, "second", ChatModel.SOL, listOf(image("gamma")))
 
         val messages = repository.observeMessages(turn.conversationId).first()
-        assertEquals(listOf(zebra, apple), messages[0].attachments)
-        assertTrue(messages[1].attachments.isEmpty())
-        assertEquals(listOf(image("gamma")), messages[2].attachments)
+        assertEquals(listOf(zebra, apple), messages[1].attachments)
+        assertTrue(messages[2].attachments.isEmpty())
+        assertEquals(listOf(image("gamma")), messages[3].attachments)
         assertEquals(second.conversationId, turn.conversationId)
+    }
+
+    @Test
+    fun beginningAConversationPersistsItsInitialModelOnceBeforeLaterSwitches() = runTest {
+        val (repository, _) = testRepository(nowMillis = { 5_000L })
+        val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
+        val rows = repository.messagesSnapshot(turn.conversationId)
+        assertEquals(listOf(MessageState.INITIAL_MODEL, "USER", "ASSISTANT"), rows.map { it.role })
+        assertEquals(ChatModel.SOL.apiId, rows[0].modelId)
+        assertEquals(ChatModel.SOL.displayName, rows[0].content)
+        assertTrue(rows[1].createdAt > rows[0].createdAt)
+
+        repository.completeTurn(turn.assistantMessageId, "answer", null)
+        repository.changeConversationModel(turn.conversationId, ChatModel.LUNA)
+        repository.beginTurn(turn.conversationId, "later", ChatModel.SOL)
+
+        val after = repository.messagesSnapshot(turn.conversationId)
+        assertEquals(
+            listOf(ChatModel.SOL.displayName, "answer", ChatModel.LUNA.displayName),
+            listOf(
+                after.first { it.role == MessageState.INITIAL_MODEL }.content,
+                after.first { it.id == turn.assistantMessageId }.content,
+                after.first { it.role == "MODEL_CHANGE" }.content,
+            ),
+        )
+        assertEquals(1, after.count { it.role == MessageState.INITIAL_MODEL })
+    }
+
+    @Test
+    fun modelSwitchWithoutAnyConversationDoesNotCreateSavedNoticeRows() = runTest {
+        val (repository, database) = testRepository()
+        database.conversations().insert(ConversationEntity("preview", "Preview", ChatModel.SOL.apiId, 1, 1))
+
+        repository.changeConversationModel("preview", ChatModel.LUNA)
+
+        assertTrue(repository.messagesSnapshot("preview").isEmpty())
+        assertEquals(ChatModel.LUNA.apiId, database.conversations().find("preview")!!.defaultModel)
+    }
+
+    @Test
+    fun firstConfiguredPromptChangeClearAndRevertUseDeterministicFingerprintsOnly() = runTest {
+        val (repository, _) = testRepository()
+        val first = repository.beginTurn(null, "first", ChatModel.SOL, systemPrompt = "be kind")
+        val afterFirst = repository.messagesSnapshot(first.conversationId)
+        assertEquals(
+            listOf("959c5805d5c257bf3270f6fddfaaf04a72e02b5871d950154c42148369ee5378"),
+            afterFirst.filter { it.role == MessageState.SYSTEM_PROMPT_CHANGE }.map { it.content },
+        )
+        val firstEvent = afterFirst.first { it.role == MessageState.SYSTEM_PROMPT_CHANGE }
+        assertTrue(firstEvent.createdAt < afterFirst.first { it.role == "USER" }.createdAt)
+
+        // Unchanged prompt on a later turn must not add another notice.
+        repository.beginTurn(first.conversationId, "second", ChatModel.SOL, systemPrompt = "be kind")
+        assertEquals(1, repository.messagesSnapshot(first.conversationId)
+            .count { it.role == MessageState.SYSTEM_PROMPT_CHANGE })
+
+        // A different prompt records a new notice, and a change back to the original
+        // after a real attempt records another one (dedup is per last-used prompt).
+        repository.beginTurn(first.conversationId, "third", ChatModel.SOL, systemPrompt = "beta")
+        val changed = repository.messagesSnapshot(first.conversationId)
+            .filter { it.role == MessageState.SYSTEM_PROMPT_CHANGE }
+        assertEquals(
+            listOf(
+                "959c5805d5c257bf3270f6fddfaaf04a72e02b5871d950154c42148369ee5378",
+                "f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753",
+            ),
+            changed.map { it.content },
+        )
+        repository.beginTurn(first.conversationId, "fourth", ChatModel.SOL, systemPrompt = "be kind")
+        assertEquals(3, repository.messagesSnapshot(first.conversationId)
+            .count { it.role == MessageState.SYSTEM_PROMPT_CHANGE })
+
+        // Clearing has its own fingerprint for the empty prompt.
+        repository.beginTurn(first.conversationId, "fifth", ChatModel.SOL, systemPrompt = "")
+        val afterClear = repository.messagesSnapshot(first.conversationId)
+            .filter { it.role == MessageState.SYSTEM_PROMPT_CHANGE }
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", afterClear.last().content)
+        repository.beginTurn(first.conversationId, "sixth", ChatModel.SOL, systemPrompt = "")
+        assertEquals(4, repository.messagesSnapshot(first.conversationId)
+            .count { it.role == MessageState.SYSTEM_PROMPT_CHANGE })
+    }
+
+    @Test
+    fun restartingWithTheSamePromptDoesNotDuplicateItsNotice() = runTest {
+        val (repository, database) = testRepository()
+        val first = repository.beginTurn(null, "first", ChatModel.SOL, systemPrompt = "be kind")
+        repository.beginTurn(first.conversationId, "second", ChatModel.SOL, systemPrompt = "be kind")
+
+        val reopened = ChatRepository(database, System::currentTimeMillis)
+        reopened.beginTurn(first.conversationId, "third", ChatModel.SOL, systemPrompt = "be kind")
+
+        assertEquals(1, reopened.messagesSnapshot(first.conversationId)
+            .count { it.role == MessageState.SYSTEM_PROMPT_CHANGE })
+    }
+
+    @Test
+    fun retriedAttemptAppendsChangedPromptNoticeWithoutMovingUserOrReplacementPositions() = runTest {
+        val (repository, _) = testRepository()
+        val first = repository.beginTurn(null, "failed", ChatModel.SOL, systemPrompt = "alpha")
+        repository.failZdrTurn(first.assistantMessageId)
+        val later = repository.beginTurn(first.conversationId, "later", ChatModel.SOL, systemPrompt = "alpha")
+        repository.completeTurn(later.assistantMessageId, "later answer", null)
+        val replacedAssistantPosition = repository.messagesSnapshot(first.conversationId)
+            .first { it.id == first.assistantMessageId }.createdAt
+
+        val retry = repository.retryFailedTurn(first.userMessageId, ChatModel.LUNA, systemPrompt = "beta")
+
+        val rows = repository.messagesSnapshot(first.conversationId)
+        assertEquals(
+            listOf(
+                "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
+                "f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753",
+            ),
+            rows.filter { it.role == MessageState.SYSTEM_PROMPT_CHANGE }.map { it.content },
+        )
+        assertEquals(retry.assistantMessageId, rows.first { it.role == "ASSISTANT" && it.replyToMessageId == first.userMessageId }.id)
+        assertEquals(replacedAssistantPosition,
+            repository.messagesSnapshot(first.conversationId).first { it.id == retry.assistantMessageId }.createdAt)
+        val conversationalOrder = rows.filter { it.role == "USER" || it.role == "ASSISTANT" }.map { it.id }
+        assertEquals(
+            listOf(first.userMessageId, retry.assistantMessageId, later.userMessageId, later.assistantMessageId),
+            conversationalOrder,
+        )
+        assertEquals(MessageState.SYSTEM_PROMPT_CHANGE, rows.last().role)
+
+        // A failed retry retried again with the same prompt must not duplicate its notice.
+        repository.failZdrTurn(retry.assistantMessageId)
+        repository.retryFailedTurn(first.userMessageId, ChatModel.SOL, systemPrompt = "beta")
+        assertEquals(2, repository.messagesSnapshot(first.conversationId)
+            .count { it.role == MessageState.SYSTEM_PROMPT_CHANGE })
+    }
+
+    @Test
+    fun legacyBackfillUsesEarliestAssistantEvidenceOnceAndNeverFabricatesWithoutEvidence() = runTest {
+        val (repository, database) = testRepository()
+        database.conversations().insert(ConversationEntity("legacy", "Legacy", ChatModel.SOL.apiId, 1, 10))
+        database.messages().insert(MessageEntity("u1", "legacy", "USER", "first", null, 100, "COMPLETE"))
+        database.messages().insert(MessageEntity("a1", "legacy", "ASSISTANT", "answer", ChatModel.SOL.apiId, 200, "COMPLETE"))
+        database.messages().insert(MessageEntity("u2", "legacy", "USER", "second", null, 300, "COMPLETE"))
+        database.messages().insert(MessageEntity("a2", "legacy", "ASSISTANT", "reply", ChatModel.LUNA.apiId, 400, "COMPLETE"))
+
+        repository.backfillInitialModel("legacy")
+        repository.backfillInitialModel("legacy")
+
+        val rows = repository.messagesSnapshot("legacy")
+        val initial = rows.first { it.role == MessageState.INITIAL_MODEL }
+        assertEquals(1, rows.count { it.role == MessageState.INITIAL_MODEL })
+        assertEquals(ChatModel.SOL.apiId, initial.modelId)
+        assertEquals(ChatModel.SOL.apiId, initial.content)
+        assertTrue(initial.createdAt < rows.first { it.id == "a1" }.createdAt)
+
+        // Backfilling an empty conversation must not fabricate a notice.
+        database.conversations().insert(ConversationEntity("empty", "Empty", ChatModel.SOL.apiId, 1, 1))
+        repository.backfillInitialModel("empty")
+        assertTrue(repository.messagesSnapshot("empty").isEmpty())
+    }
+
+    @Test
+    fun legacyBackfillKeepsOriginalModelWhenLaterAttemptsAreDeleted() = runTest {
+        val (repository, database) = testRepository()
+        database.conversations().insert(ConversationEntity("legacy", "Legacy", ChatModel.SOL.apiId, 1, 10))
+        database.messages().insert(MessageEntity("uf", "legacy", "USER", "failed", null, 100, "FAILED_ZDR"))
+        database.messages().insert(MessageEntity("af", "legacy", "ASSISTANT", "", ChatModel.LUNA.apiId, 200, "FAILED_ZDR", "uf"))
+
+        repository.backfillInitialModel("legacy")
+        assertEquals(1, repository.messagesSnapshot("legacy").count { it.role == MessageState.INITIAL_MODEL })
+
+        repository.deleteFailedTurn("uf")
+
+        val remaining = repository.messagesSnapshot("legacy")
+        assertEquals(1, remaining.count { it.role == MessageState.INITIAL_MODEL })
+        assertEquals(ChatModel.LUNA.apiId, remaining.first { it.role == MessageState.INITIAL_MODEL }.modelId)
     }
 
     private fun image(

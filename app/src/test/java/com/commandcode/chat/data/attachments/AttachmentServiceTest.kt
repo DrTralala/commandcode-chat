@@ -104,6 +104,56 @@ class AttachmentServiceTest {
     }
 
     @Test
+    fun configuredSystemPromptLeadsTextAndImageRequestsAndEmptyOrBlankOmitsIt() = runTest {
+        val service = service()
+        val image = importPng(service)
+
+        val imageTurn = service.prepareTurn(null, "look", ChatModel.SOL, listOf(image), systemPrompt = "be kind")
+        assertEquals(listOf("system", "user"), imageTurn.messages.map { it.role })
+        assertEquals("be kind", imageTurn.messages.first().content)
+        assertTrue(imageTurn.messages.first().images.isEmpty())
+        assertEquals(1, imageTurn.messages.last().images.size)
+
+        val textTurn = service.prepareTurn(imageTurn.pending.conversationId, "again", ChatModel.SOL, emptyList(), systemPrompt = "be kind")
+        assertEquals(listOf("system", "user", "user"), textTurn.messages.map { it.role })
+        assertEquals("be kind", textTurn.messages.first().content)
+        assertEquals("again", textTurn.messages.last().content)
+
+        val emptyPrompt = service.prepareTurn(textTurn.pending.conversationId, "cleared", ChatModel.SOL, emptyList(), systemPrompt = "")
+        assertTrue(emptyPrompt.messages.none { it.role == "system" })
+        assertEquals("cleared", emptyPrompt.messages.last().content)
+
+        val blankPrompt = service.prepareTurn(emptyPrompt.pending.conversationId, "blank", ChatModel.SOL, emptyList(), systemPrompt = "  \n\t ")
+        assertTrue(blankPrompt.messages.none { it.role == "system" })
+        assertEquals("blank", blankPrompt.messages.last().content)
+    }
+
+    @Test
+    fun localTimelineNoticesNeverEnterNormalSendsOrRetries() = runTest {
+        val service = service()
+        val first = service.prepareTurn(null, "first", ChatModel.SOL, emptyList(), systemPrompt = "be kind")
+        chats.seedMessage(first.pending.conversationId, "INITIAL_MODEL", "GPT-5.6 Sol", ChatModel.SOL.apiId)
+        chats.seedMessage(first.pending.conversationId, "MODEL_CHANGE", "GPT-5.6 Luna", ChatModel.LUNA.apiId)
+        chats.seedMessage(first.pending.conversationId, "SYSTEM_PROMPT_CHANGE", "fingerprint-content", null)
+
+        val next = service.prepareTurn(first.pending.conversationId, "second", ChatModel.SOL, emptyList(), systemPrompt = "be kind")
+        assertEquals(listOf("system", "user", "user"), next.messages.map { it.role })
+        assertEquals(listOf("be kind", "first", "second"), next.messages.map { it.content })
+        assertTrue(next.messages.none { it.content.contains("Luna") || it.content.contains("fingerprint") })
+
+        val failed = service.prepareTurn(null, "setup", ChatModel.SOL, emptyList())
+        chats.seedMessage(failed.pending.conversationId, "INITIAL_MODEL", "GPT-5.6 Sol", ChatModel.SOL.apiId)
+        chats.seedMessage(failed.pending.conversationId, "MODEL_CHANGE", "GPT-5.6 Luna", ChatModel.LUNA.apiId)
+        chats.seedMessage(failed.pending.conversationId, "SYSTEM_PROMPT_CHANGE", "fingerprint-content", null)
+        val later = service.prepareTurn(failed.pending.conversationId, "failed", ChatModel.SOL, emptyList())
+        chats.failZdrTurn(later.pending.assistantMessageId)
+        val retry = service.prepareRetry(failed.pending.conversationId, later.pending.userMessageId, ChatModel.LUNA, systemPrompt = "be kind")
+        assertEquals(listOf("system", "user", "user"), retry.messages.map { it.role })
+        assertEquals(listOf("be kind", "setup", "failed"), retry.messages.map { it.content })
+        assertTrue(retry.messages.none { it.content.contains("Luna") || it.content.contains("fingerprint") })
+    }
+
+    @Test
     fun failedMessageDeletionDoesNotRemoveFilesUntilDatabaseSucceeds() = runTest {
         val service = service()
         val image = importPng(service)
@@ -874,6 +924,7 @@ class AttachmentServiceTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn {
             beginCalls++
             beginFailure?.let { throw it }
@@ -920,7 +971,7 @@ class AttachmentServiceTest {
             rows.value = rows.value.mapIndexed { i, m -> if (i == index || i == index - 1) m.copy(status = "FAILED_ZDR") else m }
         }
 
-        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn {
+        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String): PendingTurn {
             val rows = messages.values.single { list -> list.value.any { it.id == userMessageId } }
             val index = rows.value.indexOfFirst { it.id == userMessageId }
             val user = rows.value[index]
@@ -942,6 +993,11 @@ class AttachmentServiceTest {
         override suspend fun changeConversationModel(conversationId: String, model: ChatModel) {
             val rows = messages.getValue(conversationId)
             rows.value += Message("event", conversationId, "MODEL_CHANGE", model.displayName, model.apiId, 99, "COMPLETE")
+        }
+
+        fun seedMessage(conversationId: String, role: String, content: String, modelId: String?) {
+            val rows = messages.getValue(conversationId)
+            rows.value += Message("seeded-${rows.value.size}", conversationId, role, content, modelId, rows.value.size.toLong() + 100L, "COMPLETE")
         }
 
         override suspend fun deleteConversation(id: String) {

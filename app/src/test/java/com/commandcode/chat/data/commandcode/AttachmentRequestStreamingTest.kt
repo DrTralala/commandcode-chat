@@ -10,6 +10,7 @@ import okio.Buffer
 import okio.Sink
 import okio.Timeout
 import okio.buffer
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -94,6 +95,33 @@ class AttachmentRequestStreamingTest {
         assertTrue(failure is IOException)
         assertEquals(listOf(0), order)
         assertTrue(cleanupRan)
+    }
+
+    @Test fun `leading system message precedes multimodal user without carrying images`() {
+        var writes = 0
+        val image = ApiImage("image/png", 3) {
+            writes++
+            it.write("AQID".toByteArray())
+        }
+        val request = CommandCodeRequestFactory.create(
+            ChatModel.SOL,
+            listOf(
+                ApiMessage("system", "be kind"),
+                ApiMessage("user", "look", listOf(image)),
+            ),
+        )
+        val json = JSONObject(Buffer().also { request.writeTo(it) }.readUtf8())
+        val messages = json.getJSONArray("messages")
+        assertEquals(2, messages.length())
+        assertEquals("system", messages.getJSONObject(0).getString("role"))
+        assertEquals("be kind", messages.getJSONObject(0).getString("content"))
+        val second = messages.getJSONObject(1)
+        assertEquals("user", second.getString("role"))
+        assertEquals(
+            "data:image/png;base64,AQID",
+            second.getJSONArray("content").getJSONObject(1).getJSONObject("image_url").getString("url"),
+        )
+        assertTrue(writes > 0)
     }
 
     private class CountingOutputStream(

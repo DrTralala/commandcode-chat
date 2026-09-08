@@ -235,6 +235,8 @@ private fun AppContent(viewModel: AppViewModel) {
                         onClearApiKey = viewModel::clearApiKey,
                         onSetZdr = viewModel::setZdr,
                         onSetAmoled = viewModel::setAmoled,
+                        onSaveSystemPrompt = viewModel::saveSystemPrompt,
+                        onClearSystemPrompt = viewModel::clearSystemPrompt,
                     )
                 }
             }

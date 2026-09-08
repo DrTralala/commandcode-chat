@@ -34,6 +34,7 @@ import com.commandcode.chat.data.attachments.PreparedAttachmentTurn
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
+import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.service.ModelCatalogueSnapshot
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
@@ -270,6 +271,7 @@ class AppSmokeTest {
             modelCatalogue = EmptyCatalogue(),
             quota = EmptyQuota(),
             attachmentOperations = NoopAttachmentOperations(),
+            systemPromptStore = TestSystemPromptStore(),
         )
         compose.activity.setContent { AppRoot(viewModel = viewModel) }
 
@@ -298,6 +300,7 @@ class AppSmokeTest {
             modelCatalogue = EmptyCatalogue(),
             quota = EmptyQuota(),
             attachmentOperations = OfflineAttachmentOperations(chats),
+            systemPromptStore = TestSystemPromptStore(),
         )
         compose.activity.setContent { AppRoot(viewModel = viewModel) }
         compose.waitUntil(timeoutMillis = 5_000) {
@@ -338,6 +341,12 @@ class AppSmokeTest {
         override fun clearApiKey() = Unit
     }
 
+    private class TestSystemPromptStore : SystemPromptStore {
+        override fun read(): String = ""
+        override fun save(value: String) = Unit
+        override fun clear() = Unit
+    }
+
     private class NoopAttachmentOperations : AttachmentOperations {
         override suspend fun initialise() = Unit
         override suspend fun importImage(uri: Uri, modelId: String): ImageAttachment =
@@ -348,6 +357,7 @@ class AppSmokeTest {
             text: String,
             model: ChatModel,
             images: List<ImageAttachment>,
+            systemPrompt: String,
         ): PreparedAttachmentTurn = error("not expected")
         override suspend fun deleteConversation(id: String) = Unit
         override suspend fun preview(id: String, maxEdge: Int): Bitmap = error("not expected")
@@ -362,8 +372,9 @@ class AppSmokeTest {
             text: String,
             model: ChatModel,
             images: List<ImageAttachment>,
+            systemPrompt: String,
         ): PreparedAttachmentTurn = PreparedAttachmentTurn(
-            pending = chats.beginTurn(conversationId, text, model, images),
+            pending = chats.beginTurn(conversationId, text, model, images, systemPrompt),
             messages = listOf(ApiMessage("user", text)),
         )
         override suspend fun deleteConversation(id: String) = Unit
@@ -380,6 +391,7 @@ class AppSmokeTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn {
             mutationCalls += 1
             error("not expected")
@@ -391,6 +403,7 @@ class AppSmokeTest {
         }
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) { mutationCalls += 1 }
         override suspend fun deleteConversation(id: String) { mutationCalls += 1 }
+        override suspend fun backfillInitialModel(conversationId: String) = Unit
     }
 
     private class OfflineChatStore : ChatStore {
@@ -411,6 +424,7 @@ class AppSmokeTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn {
             val id = conversationId ?: "offline-conversation"
             val flow = messages.getOrPut(id) { MutableStateFlow(emptyList()) }
@@ -439,6 +453,8 @@ class AppSmokeTest {
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
 
         override suspend fun deleteConversation(id: String) = Unit
+
+        override suspend fun backfillInitialModel(conversationId: String) = Unit
     }
 
     private class EmptyCatalogue : ModelCatalogueSource {

@@ -445,12 +445,13 @@ class EncryptedAttachmentLifecycleInstrumentedTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn {
             if (failBegins > 0) {
                 failBegins--
                 throw IOException("injected commit failure")
             }
-            return delegate.beginTurn(conversationId, text, model, attachments)
+            return delegate.beginTurn(conversationId, text, model, attachments, systemPrompt)
         }
 
         override suspend fun checkpointAssistant(messageId: String, text: String) =

@@ -15,6 +15,7 @@ import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.MessageState
+import com.commandcode.chat.data.security.effectiveSystemPrompt
 import java.io.IOException
 import java.io.OutputStream
 import java.nio.ByteBuffer
@@ -49,10 +50,16 @@ interface AttachmentOperations {
         text: String,
         model: ChatModel,
         images: List<ImageAttachment>,
+        systemPrompt: String = "",
     ): PreparedAttachmentTurn
     suspend fun deleteConversation(id: String)
     suspend fun preview(id: String, maxEdge: Int): Bitmap
-    suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel): PreparedAttachmentTurn =
+    suspend fun prepareRetry(
+        conversationId: String,
+        userMessageId: String,
+        model: ChatModel,
+        systemPrompt: String = "",
+    ): PreparedAttachmentTurn =
         error("Message recovery is not supported by this attachment service")
     suspend fun deleteFailedMessage(conversationId: String, userMessageId: String): Unit =
         error("Message recovery is not supported by this attachment service")
@@ -142,6 +149,7 @@ class AttachmentService(
         text: String,
         model: ChatModel,
         images: List<ImageAttachment>,
+        systemPrompt: String,
     ): PreparedAttachmentTurn {
         return withContext(ioDispatcher) {
             lifecycleMutex.withLock {
@@ -175,8 +183,9 @@ class AttachmentService(
                 historicalImages.forEach { authenticate(it, AttachmentFailure.INCOMPATIBLE_HISTORY) }
                 selected.forEach { authenticate(it, AttachmentFailure.STALE_SELECTION) }
 
-                val context = buildContext(history, text, selected)
-                val pending = chatStore.beginTurn(conversationId, text, model, selected)
+                val effective = effectiveSystemPrompt(systemPrompt)
+                val context = prependSystemMessage(buildContext(history, text, selected), effective)
+                val pending = chatStore.beginTurn(conversationId, text, model, selected, effective)
 
                 // Nothing fallible happens after beginTurn succeeds. These are only
                 // process-local ownership transfers for the IDs just committed.
@@ -223,7 +232,12 @@ class AttachmentService(
         }
     }
 
-    override suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel): PreparedAttachmentTurn =
+    override suspend fun prepareRetry(
+        conversationId: String,
+        userMessageId: String,
+        model: ChatModel,
+        systemPrompt: String,
+    ): PreparedAttachmentTurn =
         withContext(ioDispatcher) {
             lifecycleMutex.withLock {
                 ensureInitialisedLocked()
@@ -238,8 +252,9 @@ class AttachmentService(
                 val owned = attachmentDao.listForConversation(conversationId).map { it.id }.toSet()
                 val images = validateHistory(prefix + user, databaseIds, owned, model)
                 images.forEach { authenticate(it, AttachmentFailure.INCOMPATIBLE_HISTORY) }
-                val context = buildContext(prefix, user.content, user.attachments)
-                val pending = chatStore.retryFailedTurn(userMessageId, model)
+                val effective = effectiveSystemPrompt(systemPrompt)
+                val context = prependSystemMessage(buildContext(prefix, user.content, user.attachments), effective)
+                val pending = chatStore.retryFailedTurn(userMessageId, model, effective)
                 PreparedAttachmentTurn(pending, context)
             }
         }
@@ -264,8 +279,17 @@ class AttachmentService(
     }
 
     private fun List<Message>.requestHistory(): List<Message> = filter {
-        it.role != MessageState.MODEL_CHANGE && it.status != MessageState.FAILED_ZDR
+        // Explicit conversational allow-list; local timeline notices never leave
+        // the device as provider messages. Pending/streaming assistants are
+        // excluded separately by buildContext's status rule.
+        (it.role == USER_ROLE || it.role == ASSISTANT_ROLE) && it.status != MessageState.FAILED_ZDR
     }
+
+    private fun prependSystemMessage(
+        context: List<ApiMessage>,
+        effective: String,
+    ): List<ApiMessage> =
+        if (effective.isEmpty()) context else listOf(ApiMessage(SYSTEM_ROLE, effective)) + context
 
     override suspend fun preview(id: String, maxEdge: Int): Bitmap {
         require(maxEdge > 0) { "maxEdge must be positive" }
@@ -612,6 +636,7 @@ class AttachmentService(
         private const val MAX_PREVIEW_EDGE = 2_048
         private const val USER_ROLE = "USER"
         private const val ASSISTANT_ROLE = "ASSISTANT"
+        private const val SYSTEM_ROLE = "system"
         private val NONTERMINAL_ASSISTANT_STATUSES = setOf("PENDING", "STREAMING")
     }
 }

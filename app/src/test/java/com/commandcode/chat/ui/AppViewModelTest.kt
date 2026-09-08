@@ -16,6 +16,8 @@ import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
+import com.commandcode.chat.data.security.SystemPromptStore
+import com.commandcode.chat.data.security.effectiveSystemPrompt
 import com.commandcode.chat.data.service.ModelCatalogueSnapshot
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
@@ -1734,6 +1736,291 @@ class AppViewModelTest {
         assertEquals(0, operations.streamCalls)
     }
 
+    @Test
+    fun savedSystemPromptLoadsAtStartupAndLeadsTheFirstAndLatestRequests() = runTest(dispatcher) {
+        val requests = mutableListOf<List<ApiMessage>>()
+        val chats = FakeChats()
+        val prompts = FakeSystemPromptStore(stored = "be kind")
+        val vm = viewModel(chats, StreamSource { _, _, messages, _ ->
+            requests += messages
+            successfulEvents("answer")
+        }, prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+
+        assertEquals("be kind", vm.state.value.systemPrompt)
+        assertTrue(vm.state.value.systemPromptLoaded)
+
+        vm.send("first")
+        advanceUntilIdle()
+        vm.saveSystemPrompt("beta")
+        advanceUntilIdle()
+        vm.send("second")
+        advanceUntilIdle()
+
+        assertEquals("system", requests[0].first().role)
+        assertEquals("be kind", requests[0].first().content)
+        assertEquals("system", requests[1].first().role)
+        assertEquals("beta", requests[1].first().content)
+        assertEquals(listOf("beta"), prompts.savedValues)
+        assertTrue(vm.state.value.messages.none { it.content.contains("be kind") })
+    }
+
+    @Test
+    fun blankSystemPromptSaveNormalisesToEmptyAndOmitsSystemMessage() = runTest(dispatcher) {
+        val requests = mutableListOf<List<ApiMessage>>()
+        val prompts = FakeSystemPromptStore()
+        val vm = viewModel(FakeChats(), StreamSource { _, _, messages, _ ->
+            requests += messages
+            successfulEvents("answer")
+        }, prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+
+        vm.saveSystemPrompt("   \n")
+        advanceUntilIdle()
+
+        assertTrue(vm.state.value.systemPromptLoaded)
+        assertEquals("", vm.state.value.systemPrompt)
+        assertEquals("", prompts.stored)
+        vm.send("hello")
+        advanceUntilIdle()
+        assertTrue(requests.single().all { it.role != "system" })
+    }
+
+    @Test
+    fun unreadableSavedPromptBlocksSendsUntilASuccessfulSaveHealsIt() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(chats, successfulSource("must not run"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+
+        assertFalse(vm.state.value.systemPromptLoaded)
+        assertEquals(SystemPromptFeedback.LOAD_FAILED, vm.state.value.systemPromptFeedback)
+
+        vm.send("blocked")
+        advanceUntilIdle()
+
+        assertEquals(0, chats.beginTurnCalls)
+        assertFalse(vm.state.value.sending)
+        assertTrue(vm.state.value.errorMessage!!.contains("system prompt", ignoreCase = true))
+
+        vm.saveSystemPrompt("healed")
+        advanceUntilIdle()
+
+        assertTrue(vm.state.value.systemPromptLoaded)
+        assertEquals(SystemPromptFeedback.SAVED, vm.state.value.systemPromptFeedback)
+        assertNull(vm.state.value.errorMessage)
+        prompts.readFailure = false
+        val chatRequests = mutableListOf<List<ApiMessage>>()
+        val sending = FakeChats()
+        val secondVm = viewModel(sending, StreamSource { _, _, messages, _ ->
+            chatRequests += messages
+            successfulEvents("ok")
+        }, prompts = prompts)
+        configureKey(secondVm)
+        advanceUntilIdle()
+        assertTrue(secondVm.state.value.systemPromptLoaded)
+        secondVm.send("now works")
+        advanceUntilIdle()
+        assertEquals("system", chatRequests.single().first().role)
+        assertEquals("healed", chatRequests.single().first().content)
+    }
+
+    @Test
+    fun promptLoadFailureBannerSurvivesOpeningConversationsAndNewChat() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("conversation")
+            addConversation("other")
+        }
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(chats, successfulSource("unused"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.systemPromptLoaded)
+
+        vm.openConversation("conversation")
+        runCurrent()
+        assertTrue(vm.state.value.errorMessage.orEmpty().contains("system prompt", ignoreCase = true))
+
+        vm.newChat()
+        assertTrue(vm.state.value.errorMessage.orEmpty().contains("system prompt", ignoreCase = true))
+
+        vm.openConversation("other")
+        runCurrent()
+        assertTrue(vm.state.value.errorMessage.orEmpty().contains("system prompt", ignoreCase = true))
+        assertEquals(0, vm.state.value.messages.size)
+    }
+
+    @Test
+    fun unrelatedFailureWhilePromptUnavailableCannotReplaceTheBlockingBanner() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("other")
+            deleteFailures += "other"
+        }
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(chats, successfulSource("unused"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.systemPromptLoaded)
+        assertEquals(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE, vm.state.value.errorMessage)
+
+        vm.deleteConversation("other")
+        advanceUntilIdle()
+
+        assertEquals(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE, vm.state.value.errorMessage)
+    }
+
+    @Test
+    fun unrelatedSuccessWhilePromptUnavailableCannotClearTheBlockingBanner() = runTest(dispatcher) {
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(FakeChats(), successfulSource("unused"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.systemPromptLoaded)
+        assertEquals(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE, vm.state.value.errorMessage)
+
+        vm.clearApiKey()
+        advanceUntilIdle()
+
+        assertFalse(vm.state.value.systemPromptLoaded)
+        assertEquals(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE, vm.state.value.errorMessage)
+    }
+
+    @Test
+    fun healingClearsTheBlockingBannerWithoutLeavingStaleUnrelatedText() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("other")
+            deleteFailures += "other"
+        }
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(chats, successfulSource("unused"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        assertEquals(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE, vm.state.value.errorMessage)
+
+        // An unrelated failure during the blocked window must not stash stale text
+        // that would outlive a later successful heal.
+        vm.deleteConversation("other")
+        advanceUntilIdle()
+        assertEquals(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE, vm.state.value.errorMessage)
+
+        vm.saveSystemPrompt("healed")
+        advanceUntilIdle()
+
+        assertTrue(vm.state.value.systemPromptLoaded)
+        assertNull(vm.state.value.errorMessage)
+    }
+
+    @Test
+    fun sendAttemptWhilePromptUnavailableIsNeverSilentlyDropped() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(chats, successfulSource("must not run"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        assertFalse(vm.state.value.systemPromptLoaded)
+
+        vm.updateDraft("ready to send")
+        vm.send("ready to send")
+        advanceUntilIdle()
+
+        assertEquals(0, chats.beginTurnCalls)
+        assertFalse(vm.state.value.sending)
+        assertTrue(vm.state.value.errorMessage.orEmpty().contains("system prompt", ignoreCase = true))
+        assertEquals("ready to send", vm.state.value.draftText)
+    }
+
+    @Test
+    fun combinedAttachmentAndPromptStartupFailuresPrioritiseThePromptBanner() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            initialiseFailure = AttachmentException(AttachmentFailure.KEY_UNAVAILABLE)
+        }
+        val prompts = FakeSystemPromptStore(readFailure = true)
+        val vm = viewModel(chats, successfulSource("unused"), operations = operations, prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+
+        assertFalse(vm.state.value.systemPromptLoaded)
+        assertEquals(AttachmentFailure.KEY_UNAVAILABLE, vm.state.value.attachmentError)
+        assertTrue(vm.state.value.errorMessage.orEmpty().contains("system prompt", ignoreCase = true))
+    }
+
+    @Test
+    fun failedPromptSaveKeepsLastSuccessfulValueAndReportsGenericFeedback() = runTest(dispatcher) {
+        val prompts = FakeSystemPromptStore(stored = "alpha")
+        val vm = viewModel(FakeChats(), successfulSource("unused"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        prompts.saveFailure = IllegalStateException("secret storage detail")
+
+        vm.saveSystemPrompt("beta")
+        advanceUntilIdle()
+
+        assertEquals("alpha", vm.state.value.systemPrompt)
+        assertEquals("alpha", prompts.stored)
+        assertEquals(SystemPromptFeedback.SAVE_FAILED, vm.state.value.systemPromptFeedback)
+        assertFalse(vm.state.value.systemPromptFeedback.toString().contains("secret"))
+
+        prompts.saveFailure = null
+        vm.saveSystemPrompt("  beta  ")
+        advanceUntilIdle()
+        assertEquals("  beta  ", vm.state.value.systemPrompt)
+        assertEquals("  beta  ", prompts.stored)
+    }
+
+    @Test
+    fun failedPromptClearKeepsLastSuccessfulValueUntilClearSucceeds() = runTest(dispatcher) {
+        val prompts = FakeSystemPromptStore(stored = "alpha")
+        val vm = viewModel(FakeChats(), successfulSource("unused"), prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+        prompts.clearFailure = IllegalStateException("secret clear detail")
+
+        vm.clearSystemPrompt()
+        advanceUntilIdle()
+
+        assertEquals("alpha", vm.state.value.systemPrompt)
+        assertEquals("alpha", prompts.stored)
+        assertEquals(SystemPromptFeedback.CLEAR_FAILED, vm.state.value.systemPromptFeedback)
+
+        prompts.clearFailure = null
+        vm.clearSystemPrompt()
+        advanceUntilIdle()
+        assertEquals("", vm.state.value.systemPrompt)
+        assertEquals("", prompts.stored)
+        assertEquals(SystemPromptFeedback.CLEARED, vm.state.value.systemPromptFeedback)
+    }
+
+    @Test
+    fun inFlightRequestKeepsItsStartTimePromptSnapshotWhenSettingsChangeDuringStreaming() = runTest(dispatcher) {
+        val requests = mutableListOf<List<ApiMessage>>()
+        val prompts = FakeSystemPromptStore(stored = "alpha")
+        val vm = viewModel(FakeChats(), StreamSource { _, _, messages, _ -> flow {
+            requests += messages
+            emit(StreamEvent.Delta("partial"))
+            awaitCancellation()
+        } }, prompts = prompts)
+        configureKey(vm)
+        advanceUntilIdle()
+
+        vm.send("in flight")
+        runCurrent()
+        assertTrue(vm.state.value.sending)
+
+        vm.saveSystemPrompt("beta")
+        advanceUntilIdle()
+
+        assertEquals("beta", vm.state.value.systemPrompt)
+        assertEquals(listOf("system", "user"), requests.single().map { it.role })
+        assertEquals("alpha", requests.single().first().content)
+
+        vm.cancel()
+        advanceUntilIdle()
+    }
+
     private fun successfulSource(answer: String) = StreamSource { _, _, _, _ -> successfulEvents(answer) }
     private fun successfulEvents(answer: String) = flowOf(
         StreamEvent.Delta(answer), StreamEvent.Usage(TokenUsage(1, 0, 1)), StreamEvent.Done,
@@ -1757,6 +2044,7 @@ class AppViewModelTest {
         settings: SettingsStore = FakeSettings(),
         apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
         operations: FakeAttachmentOperations = FakeAttachmentOperations(chats),
+        prompts: SystemPromptStore = FakeSystemPromptStore(),
     ) = AppViewModel(
         secrets = keys,
         settings = settings,
@@ -1767,6 +2055,7 @@ class AppViewModelTest {
         attachmentOperations = operations,
         elapsedMillis = elapsedMillis,
         apiKeyCopier = apiKeyCopier,
+        systemPromptStore = prompts,
     )
 
     private class FakeCatalogue(
@@ -1876,6 +2165,34 @@ class AppViewModelTest {
     ) : SettingsStore {
     }
 
+    private class FakeSystemPromptStore(
+        var stored: String = "",
+        var readFailure: Boolean = false,
+        var saveFailure: Exception? = null,
+        var clearFailure: Exception? = null,
+    ) : SystemPromptStore {
+        val savedValues = mutableListOf<String>()
+        var clearCalls = 0
+
+        override fun read(): String {
+            if (readFailure) throw com.commandcode.chat.data.security.PromptRecoveryRequired()
+            return stored
+        }
+
+        override fun save(value: String) {
+            saveFailure?.let { throw it }
+            val effective = effectiveSystemPrompt(value)
+            stored = effective
+            savedValues += effective
+        }
+
+        override fun clear() {
+            clearFailure?.let { throw it }
+            clearCalls += 1
+            stored = ""
+        }
+    }
+
     private class FakeAttachmentOperations(
         private val chats: FakeChats,
     ) : AttachmentOperations {
@@ -1944,6 +2261,7 @@ class AppViewModelTest {
             text: String,
             model: ChatModel,
             images: List<ImageAttachment>,
+            systemPrompt: String,
         ): PreparedAttachmentTurn {
             prepareFailure?.let { throw it }
             val history = conversationId?.let { chats.messagesSnapshot(it) }.orEmpty()
@@ -1963,13 +2281,16 @@ class AppViewModelTest {
                 text,
                 images.map { com.commandcode.chat.data.commandcode.ApiImage(it.mimeType, it.originalBytes) {} },
             )
-            val pending = chats.beginTurn(conversationId, text, model, images)
+            val effective = effectiveSystemPrompt(systemPrompt)
+            val messages = if (effective.isEmpty()) context
+                else listOf(ApiMessage("system", effective)) + context
+            val pending = chats.beginTurn(conversationId, text, model, images, effective)
             prepared += PreparedRequest(text, model, images)
-            preparedContexts += context
+            preparedContexts += messages
             prepareEntered?.complete(Unit)
             prepareRelease?.await()
             events += "prepare-return"
-            return PreparedAttachmentTurn(pending, context)
+            return PreparedAttachmentTurn(pending, messages)
         }
 
         override suspend fun deleteConversation(id: String) {
@@ -1992,9 +2313,13 @@ class AppViewModelTest {
         override suspend fun preview(id: String, maxEdge: Int): Bitmap =
             throw UnsupportedOperationException("preview is not used by AppViewModel tests")
 
-        override suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel): PreparedAttachmentTurn {
+        override suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel, systemPrompt: String): PreparedAttachmentTurn {
             val user = chats.messagesSnapshot(conversationId).single { it.id == userMessageId }
-            return PreparedAttachmentTurn(chats.retryFailedTurn(userMessageId, model), listOf(ApiMessage("user", user.content)))
+            val context = listOf(ApiMessage("user", user.content))
+            val effective = effectiveSystemPrompt(systemPrompt)
+            val messages = if (effective.isEmpty()) context
+                else listOf(ApiMessage("system", effective)) + context
+            return PreparedAttachmentTurn(chats.retryFailedTurn(userMessageId, model, effective), messages)
         }
 
         override suspend fun deleteFailedMessage(conversationId: String, userMessageId: String) = chats.deleteFailedTurn(userMessageId)
@@ -2034,6 +2359,7 @@ class AppViewModelTest {
             text: String,
             model: ChatModel,
             attachments: List<ImageAttachment>,
+            systemPrompt: String,
         ): PendingTurn {
             beginTurnCalls += 1
             val id = conversationId ?: "conversation"
@@ -2090,7 +2416,7 @@ class AppViewModelTest {
             rows.value = rows.value.mapIndexed { i, m -> if (i == index || i == index - 1) m.copy(status = "FAILED_ZDR") else m }
         }
 
-        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn {
+        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String): PendingTurn {
             val rows = messageFlows.values.single { flow -> flow.value.any { it.id == userMessageId } }
             val index = rows.value.indexOfFirst { it.id == userMessageId }
             val user = rows.value[index]
@@ -2100,6 +2426,8 @@ class AppViewModelTest {
             rows.value = rows.value.mapIndexed { i, m -> when(i) { index -> m.copy(status = "COMPLETE"); index + 1 -> reply; else -> m } }
             return PendingTurn(user.conversationId, user.id, reply.id)
         }
+
+        override suspend fun backfillInitialModel(conversationId: String) = Unit
 
         override suspend fun deleteFailedTurn(userMessageId: String) {
             val rows = messageFlows.values.single { flow -> flow.value.any { it.id == userMessageId } }

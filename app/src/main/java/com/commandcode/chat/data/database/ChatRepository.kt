@@ -51,6 +51,7 @@ class ChatRepository(
         const val STREAMING = "STREAMING"
         const val COMPLETE = "COMPLETE"
         const val INTERRUPTED = "INTERRUPTED"
+        const val EMPTY_PROMPT_FINGERPRINT = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     }
     private val IMAGE_CHAT_TITLE: String = "Image chat"
 
@@ -76,6 +77,7 @@ class ChatRepository(
         text: String,
         model: ChatModel,
         attachments: List<ImageAttachment> = emptyList(),
+        systemPrompt: String = "",
     ): PendingTurn {
         require(text.isNotBlank() || attachments.isNotEmpty()) { "A turn needs text or at least one image" }
         val ids = attachments.map { it.id }
@@ -84,9 +86,31 @@ class ChatRepository(
         val turnStartedAt = nowMillis()
         return database.withTransaction {
             val id = conversationId ?: UUID.randomUUID().toString()
-            val userAt = nextTimestamp(turnStartedAt, database.messages().latestCreatedAt(id) ?: Long.MIN_VALUE)
+            val previousLatest = database.messages().latestCreatedAt(id) ?: Long.MIN_VALUE
+            var allocated = previousLatest
+            fun allocateAt(): Long {
+                allocated = nextTimestamp(turnStartedAt, allocated)
+                return allocated
+            }
+
+            val isNewConversation = conversationId == null
+            val initialEventAt = if (isNewConversation) allocateAt() else null
+            val effective = effectivePrompt(systemPrompt)
+            val fingerprint = promptFingerprint(effective)
+            val history = if (isNewConversation) {
+                emptyList()
+            } else {
+                val conversation = database.conversations().find(id) ?: error("Conversation not found")
+                database.messages().listForConversation(id)
+            }
+            val latestPromptFingerprint = history.lastOrNull {
+                it.role == MessageState.SYSTEM_PROMPT_CHANGE
+            }?.content
+            val promptEventAt = if (promptFingerprintChanged(latestPromptFingerprint, fingerprint)) allocateAt() else null
+
+            val userAt = nextTimestamp(turnStartedAt, allocated)
             val assistantAt = nextTimestamp(userAt, userAt)
-            if (conversationId == null) {
+            if (isNewConversation) {
                 database.conversations().insert(
                     ConversationEntity(id, title, model.apiId, userAt, assistantAt),
                 )
@@ -99,6 +123,22 @@ class ChatRepository(
             AttachmentPolicy.requireCount(database.attachments().countForConversation(id), 0, attachments.size)
             val userId = UUID.randomUUID().toString()
             val assistantId = UUID.randomUUID().toString()
+            initialEventAt?.let { eventAt ->
+                database.messages().insert(
+                    MessageEntity(
+                        UUID.randomUUID().toString(), id, MessageState.INITIAL_MODEL,
+                        model.displayName, model.apiId, eventAt, Status.COMPLETE,
+                    ),
+                )
+            }
+            promptEventAt?.let { eventAt ->
+                database.messages().insert(
+                    MessageEntity(
+                        UUID.randomUUID().toString(), id, MessageState.SYSTEM_PROMPT_CHANGE,
+                        fingerprint, null, eventAt, Status.COMPLETE,
+                    ),
+                )
+            }
             database.messages().insert(MessageEntity(userId, id, Role.USER, text, null, userAt, Status.USER_COMPLETE))
             database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, assistantAt, Status.PENDING, userId))
             if (attachments.isNotEmpty()) {
@@ -182,18 +222,34 @@ class ChatRepository(
         touchConversation(user.conversationId)
     }
 
-    suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn = database.withTransaction {
+    suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String = ""): PendingTurn = database.withTransaction {
         val (user, reply) = failedPair(userMessageId)
+        val conversationId = user.conversationId
+        val history = database.messages().listForConversation(conversationId)
+        val effective = effectivePrompt(systemPrompt)
+        val fingerprint = promptFingerprint(effective)
+        val latestPromptFingerprint = history.lastOrNull {
+            it.role == MessageState.SYSTEM_PROMPT_CHANGE
+        }?.content
         val newId = UUID.randomUUID().toString()
+        if (promptFingerprintChanged(latestPromptFingerprint, fingerprint)) {
+            val eventAt = nextTimestamp(nowMillis(), history.maxOf { it.createdAt })
+            database.messages().insert(
+                MessageEntity(
+                    UUID.randomUUID().toString(), conversationId, MessageState.SYSTEM_PROMPT_CHANGE,
+                    fingerprint, null, eventAt, Status.COMPLETE,
+                ),
+            )
+        }
         database.messages().delete(reply)
         database.messages().insert(reply.copy(id = newId, modelId = model.apiId, status = Status.PENDING))
         check(database.messages().updateIfStatus(user.id, user.status, user.content, Status.USER_COMPLETE) == 1)
         database.usageEvents().insert(UsageEventEntity(
-            UUID.randomUUID().toString(), newId, user.conversationId, model.apiId, nowMillis(),
+            UUID.randomUUID().toString(), newId, conversationId, model.apiId, nowMillis(),
             null, null, null, null, null, false,
         ))
-        touchConversation(user.conversationId)
-        PendingTurn(user.conversationId, user.id, newId)
+        touchConversation(conversationId)
+        PendingTurn(conversationId, user.id, newId)
     }
 
     suspend fun deleteFailedTurn(userMessageId: String) = database.withTransaction {
@@ -227,6 +283,33 @@ class ChatRepository(
         touchConversation(conversationId)
     }
 
+    /** Backfills an evidence-based starting-model notice for chats that predate it. */
+    suspend fun backfillInitialModel(conversationId: String) {
+        database.withTransaction {
+            val conversation = database.conversations().find(conversationId) ?: error("Conversation not found")
+            val history = database.messages().listForConversation(conversationId)
+            if (history.any { it.role == MessageState.INITIAL_MODEL }) return@withTransaction
+            val evidence = history.firstOrNull { it.role == Role.ASSISTANT && it.modelId != null }
+                ?: return@withTransaction
+            val evidenceModelId = requireNotNull(evidence.modelId)
+            // Place the notice at the very start of the timeline so it reads as the
+            // chat's starting model, before the first conversational message.
+            val earliest = history.minOf { it.createdAt }
+            val eventAt = if (earliest > Long.MIN_VALUE) earliest - 1 else return@withTransaction
+            database.messages().insert(
+                MessageEntity(
+                    id = UUID.randomUUID().toString(),
+                    conversationId = conversation.id,
+                    role = MessageState.INITIAL_MODEL,
+                    content = evidenceModelId,
+                    modelId = evidenceModelId,
+                    createdAt = eventAt,
+                    status = Status.COMPLETE,
+                ),
+            )
+        }
+    }
+
     private suspend fun updateAssistant(messageId: String, text: String, status: String) {
         database.withTransaction {
             val message = assistant(messageId)
@@ -244,6 +327,19 @@ class ChatRepository(
     private fun nextTimestamp(now: Long, previous: Long): Long {
         check(previous < Long.MAX_VALUE) { "Timestamp space exhausted" }
         return maxOf(now, previous + 1)
+    }
+
+    private fun effectivePrompt(value: String): String = if (value.isBlank()) "" else value
+
+    private fun promptFingerprint(effective: String): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(effective.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    /** Absence of any recorded prompt event represents a previously empty prompt. */
+    private fun promptFingerprintChanged(latest: String?, fingerprint: String): Boolean {
+        val lastUsed = latest ?: Status.EMPTY_PROMPT_FINGERPRINT
+        return lastUsed != fingerprint
     }
 
     private fun assistant(id: String): MessageEntity =
