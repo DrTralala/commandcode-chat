@@ -122,6 +122,7 @@ class AppViewModel(
     private val keyMutationMutex = Mutex()
     private var activeTurn: ActiveTurn? = null
     private var sendTargetConversationId: String? = null
+    private var messageMutationJob: Job? = null
     private var draftGeneration = 0L
     private var attachmentActionsReady = false
     private var pendingModels: List<ChatModel>? = null
@@ -398,8 +399,28 @@ class AppViewModel(
     fun selectModel(model: ChatModel) {
         if (selectionIsFrozen()) return
         val currentModel = mutableState.value.models.firstOrNull { it.apiId == model.apiId } ?: return
-        if (mutableState.value.selectedModel.apiId != currentModel.apiId) nextDraftGeneration()
-        mutableState.value = mutableState.value.copy(selectedModel = currentModel)
+        if (mutableState.value.selectedModel.apiId == currentModel.apiId) return
+        val conversationId = mutableState.value.currentConversationId
+        if (conversationId == null) {
+            nextDraftGeneration()
+            mutableState.value = mutableState.value.copy(selectedModel = currentModel)
+            return
+        }
+        messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            try {
+                chats.changeConversationModel(conversationId, currentModel)
+                nextDraftGeneration()
+                mutableState.value = mutableState.value.copy(selectedModel = currentModel)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                mutableState.value = mutableState.value.copy(errorMessage = "Model could not be changed. Try again.")
+            } finally {
+                messageMutationJob = null
+                applyPendingModelsIfIdle()
+            }
+        }
+        messageMutationJob?.start()
     }
 
     fun refreshQuota() {
@@ -441,12 +462,14 @@ class AppViewModel(
     }
 
     fun openConversation(id: String) {
+        if (messageMutationJob != null) return
         if (mutableState.value.currentConversationId == id) return
         if (isCurrentConversationDeleting() || id in deletingConversationIds) return
         showConversation(id, invalidateDraft = true)
     }
 
     fun newChat() {
+        if (messageMutationJob != null) return
         if (isSendBusy() || isCurrentConversationDeleting()) return
         invalidateAttachmentImport()
         nextDraftGeneration()
@@ -476,6 +499,10 @@ class AppViewModel(
         messageCollection?.cancel()
         mutableState.value = mutableState.value.copy(
             currentConversationId = id,
+            selectedModel = if (invalidateDraft) {
+                val modelId = mutableState.value.conversations.firstOrNull { it.id == id }?.defaultModelId
+                mutableState.value.models.firstOrNull { it.apiId == modelId } ?: mutableState.value.selectedModel
+            } else mutableState.value.selectedModel,
             messages = emptyList(),
             draftText = "",
             pendingAttachments = emptyList(),
@@ -592,7 +619,7 @@ class AppViewModel(
         isConversationDeleting(mutableState.value.currentConversationId)
 
     private fun selectionIsFrozen(): Boolean =
-        isSendBusy() ||
+        messageMutationJob != null || isSendBusy() ||
             mutableState.value.importingAttachments ||
             attachmentImportJob != null ||
             isCurrentConversationDeleting()
@@ -605,6 +632,7 @@ class AppViewModel(
     }
 
     fun deleteConversation(id: String) {
+        if (messageMutationJob != null) return
         if (id in deletingConversationIds) return
         val snapshot = mutableState.value
         val ownsCurrentDraft = snapshot.currentConversationId == id
@@ -681,31 +709,35 @@ class AppViewModel(
         }
     }
 
-    fun send(text: String) {
+    fun send(text: String) = sendOrRetry(text, null)
+
+    private fun sendOrRetry(text: String, retryUserId: String?) {
         val prompt = text.trim()
         val snapshot = mutableState.value
-        if ((prompt.isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
+        if ((retryUserId == null && prompt.isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
             selectionIsFrozen() ||
             !snapshot.keyConfigured
         ) return
-        if (snapshot.draftText != text) {
+        if (retryUserId == null && snapshot.draftText != text) {
             mutableState.value = snapshot.copy(draftText = text)
         }
         val selectedModel = snapshot.selectedModel
         val zdr = snapshot.zdr
         val requestedConversationId = snapshot.currentConversationId
-        val snapshotImages = snapshot.pendingAttachments.toList()
+        val snapshotImages = if (retryUserId == null) snapshot.pendingAttachments.toList() else emptyList()
         val snapshotGeneration = draftGeneration
         sendTargetConversationId = requestedConversationId
         val handoff = CompletableDeferred<String?>()
         sendHandoff = handoff
-        sendJob = viewModelScope.launch {
+        sendJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             var turn: ActiveTurn? = null
             var apiKey: CharArray? = null
             try {
                 mutableState.value = mutableState.value.copy(sending = true, streamingText = "", errorMessage = null)
                 val registered = withContext(NonCancellable) {
-                    val prepared = attachmentOperations.prepareTurn(
+                    val prepared = if (retryUserId != null) attachmentOperations.prepareRetry(
+                        requireNotNull(requestedConversationId), retryUserId, selectedModel,
+                    ) else attachmentOperations.prepareTurn(
                         requestedConversationId,
                         prompt,
                         selectedModel,
@@ -725,7 +757,7 @@ class AppViewModel(
                         )
                         handoff.complete(prepared.pending.conversationId)
                     }
-                    if (draftGeneration == snapshotGeneration) {
+                    if (retryUserId == null && draftGeneration == snapshotGeneration) {
                         mutableState.value = mutableState.value.copy(
                             draftText = "",
                             pendingAttachments = emptyList(),
@@ -763,7 +795,15 @@ class AppViewModel(
                 }
                 throw cancelled
             } catch (error: Exception) {
-                if (turn?.completionCommitted != true) turn?.let { interruptSafely(it, "failed") }
+                if (turn?.completionCommitted != true) turn?.let { active ->
+                    if (zdr && error is CommandCodeException.ZdrUnavailable && active.partial.isEmpty()) {
+                        try {
+                            withContext(NonCancellable) { chats.failZdrTurn(active.pending.assistantMessageId) }
+                        } catch (_: Exception) {
+                            interruptSafely(active, "failed")
+                        }
+                    } else interruptSafely(active, "failed")
+                }
                 if (error is KeyRecoveryRequired) {
                     finishTurn(turn, null, recoveryMessage = API_KEY_RECOVERY_MESSAGE)
                 } else if (error is AttachmentException) {
@@ -783,10 +823,41 @@ class AppViewModel(
                 }
             }
         }
+        sendJob?.start()
     }
 
     fun cancel() {
         sendJob?.cancel()
+    }
+
+    fun retryMessage(userMessageId: String) {
+        val user = mutableState.value.messages.firstOrNull {
+            it.id == userMessageId && it.role == "USER" && it.status == com.commandcode.chat.domain.MessageState.FAILED_ZDR
+        } ?: return
+        sendOrRetry(user.content, user.id)
+    }
+
+    fun deleteFailedMessage(userMessageId: String) {
+        if (selectionIsFrozen()) return
+        val snapshot = mutableState.value
+        val conversationId = snapshot.currentConversationId ?: return
+        if (snapshot.messages.none { it.id == userMessageId && it.role == "USER" && it.status == com.commandcode.chat.domain.MessageState.FAILED_ZDR }) return
+        messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            try {
+                attachmentOperations.deleteFailedMessage(conversationId, userMessageId)
+                mutableState.value = mutableState.value.copy(errorMessage = null)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: AttachmentException) {
+                publishAttachmentFailure(error.kind)
+            } catch (_: Exception) {
+                mutableState.value = mutableState.value.copy(errorMessage = "Message could not be deleted. Try again.")
+            } finally {
+                messageMutationJob = null
+                applyPendingModelsIfIdle()
+            }
+        }
+        messageMutationJob?.start()
     }
 
     private suspend fun collectStream(
@@ -930,7 +1001,7 @@ class AppViewModel(
         AttachmentFailure.UNVERIFIED_MODEL,
         -> AttachmentPolicy.UNSUPPORTED_MESSAGE
         AttachmentFailure.INVALID_FORMAT -> "This image format is not supported. Choose JPEG, PNG, or WebP."
-        AttachmentFailure.CORRUPT_IMAGE -> "The image could not be read. Try another image."
+        AttachmentFailure.CORRUPT_IMAGE -> "Failed to upload image. Please try again."
         AttachmentFailure.TOO_LARGE -> "This image is too large. The maximum is 10 MB."
         AttachmentFailure.TOO_MANY -> "This chat already has the maximum number of images."
         AttachmentFailure.EXCESSIVE_DIMENSIONS -> "This image exceeds the 8000-pixel dimension limit."

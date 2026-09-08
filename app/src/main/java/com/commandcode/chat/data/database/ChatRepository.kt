@@ -1,4 +1,5 @@
 package com.commandcode.chat.data.database
+import com.commandcode.chat.domain.MessageState
 
 import androidx.room.withTransaction
 import com.commandcode.chat.domain.AttachmentPolicy
@@ -31,6 +32,7 @@ data class Message(
     val createdAt: Long,
     val status: String,
     val attachments: List<ImageAttachment> = emptyList(),
+    val replyToMessageId: String? = null,
 )
 
 data class PendingTurn(
@@ -98,7 +100,7 @@ class ChatRepository(
             val userId = UUID.randomUUID().toString()
             val assistantId = UUID.randomUUID().toString()
             database.messages().insert(MessageEntity(userId, id, Role.USER, text, null, userAt, Status.USER_COMPLETE))
-            database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, assistantAt, Status.PENDING))
+            database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, assistantAt, Status.PENDING, userId))
             if (attachments.isNotEmpty()) {
                 database.attachments().insert(
                     attachments.mapIndexed { position, image ->
@@ -141,7 +143,7 @@ class ChatRepository(
         database.withTransaction {
             val assistant = assistant(messageId)
             if (assistant.status == Status.COMPLETE) return@withTransaction true
-            if (assistant.status == Status.INTERRUPTED) return@withTransaction false
+            if (assistant.status == Status.INTERRUPTED || assistant.status == MessageState.FAILED_ZDR) return@withTransaction false
             check(assistant.status == Status.PENDING || assistant.status == Status.STREAMING) { "Assistant turn is terminal" }
             if (database.messages().updateIfStatus(messageId, assistant.status, text, Status.COMPLETE) == 0) return@withTransaction false
             touchConversation(assistant.conversationId)
@@ -167,10 +169,68 @@ class ChatRepository(
         updateAssistant(messageId, partialText, Status.INTERRUPTED)
     }
 
+    suspend fun failZdrTurn(assistantMessageId: String) = database.withTransaction {
+        val reply = assistant(assistantMessageId)
+        val user = database.messages().find(requireNotNull(reply.replyToMessageId)) ?: error("Message not found")
+        check(user.role == Role.USER && user.conversationId == reply.conversationId)
+        check(reply.content.isEmpty()) { "Cannot discard a partial response" }
+        val failed = com.commandcode.chat.domain.MessageState.FAILED_ZDR
+        if (reply.status == failed && user.status == failed) return@withTransaction
+        check(reply.status in setOf(Status.PENDING, Status.STREAMING) && user.status == Status.USER_COMPLETE)
+        check(database.messages().updateIfStatus(reply.id, reply.status, "", failed) == 1)
+        check(database.messages().updateIfStatus(user.id, user.status, user.content, failed) == 1)
+        touchConversation(user.conversationId)
+    }
+
+    suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn = database.withTransaction {
+        val (user, reply) = failedPair(userMessageId)
+        val newId = UUID.randomUUID().toString()
+        database.messages().delete(reply)
+        database.messages().insert(reply.copy(id = newId, modelId = model.apiId, status = Status.PENDING))
+        check(database.messages().updateIfStatus(user.id, user.status, user.content, Status.USER_COMPLETE) == 1)
+        database.usageEvents().insert(UsageEventEntity(
+            UUID.randomUUID().toString(), newId, user.conversationId, model.apiId, nowMillis(),
+            null, null, null, null, null, false,
+        ))
+        touchConversation(user.conversationId)
+        PendingTurn(user.conversationId, user.id, newId)
+    }
+
+    suspend fun deleteFailedTurn(userMessageId: String) = database.withTransaction {
+        val (user, reply) = failedPair(userMessageId)
+        database.messages().delete(reply)
+        database.messages().delete(user)
+        touchConversation(user.conversationId)
+    }
+
+    private fun failedPair(userMessageId: String): Pair<MessageEntity, MessageEntity> {
+        val user = database.messages().find(userMessageId) ?: error("Message not found")
+        val failed = com.commandcode.chat.domain.MessageState.FAILED_ZDR
+        check(user.role == Role.USER && user.status == failed) { "Message is not a failed ZDR send" }
+        val reply = database.messages().replies(user.id).single()
+        check(reply.conversationId == user.conversationId && reply.status == failed && reply.content.isEmpty())
+        return user to reply
+    }
+
+    suspend fun changeConversationModel(conversationId: String, model: ChatModel) = database.withTransaction {
+        val conversation = database.conversations().find(conversationId) ?: error("Conversation not found")
+        if (conversation.defaultModel == model.apiId) return@withTransaction
+        database.conversations().changeModel(conversationId, model.apiId)
+        val history = database.messages().listForConversation(conversationId)
+        if (history.any { it.role == Role.USER || it.role == Role.ASSISTANT }) {
+            val at = nextTimestamp(nowMillis(), history.maxOf { it.createdAt })
+            database.messages().insert(MessageEntity(
+                UUID.randomUUID().toString(), conversationId, com.commandcode.chat.domain.MessageState.MODEL_CHANGE,
+                model.displayName, model.apiId, at, Status.COMPLETE,
+            ))
+        }
+        touchConversation(conversationId)
+    }
+
     private suspend fun updateAssistant(messageId: String, text: String, status: String) {
         database.withTransaction {
             val message = assistant(messageId)
-            if (message.status == Status.COMPLETE || message.status == Status.INTERRUPTED) return@withTransaction
+            if (message.status == Status.COMPLETE || message.status == Status.INTERRUPTED || message.status == MessageState.FAILED_ZDR) return@withTransaction
             if (database.messages().updateIfStatus(messageId, message.status, text, status) == 0) return@withTransaction
             touchConversation(message.conversationId)
         }
@@ -196,7 +256,7 @@ class ChatRepository(
 
     private fun ConversationRow.toDomain() =
         Conversation(id, title, defaultModel, createdAt, updatedAt, textBytes, attachmentBytes, attachmentCount)
-    private fun MessageWithAttachments.toDomain() = Message(id, conversationId, role, content, modelId, createdAt, status, attachments.map { it.toDomain() })
+    private fun MessageWithAttachments.toDomain() = Message(id, conversationId, role, content, modelId, createdAt, status, attachments.map { it.toDomain() }, replyToMessageId)
 
     private fun titleFor(text: String): String {
         val normalised = buildString {

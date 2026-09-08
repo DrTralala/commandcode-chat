@@ -14,6 +14,7 @@ import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
+import com.commandcode.chat.domain.MessageState
 import java.io.IOException
 import java.io.OutputStream
 import java.nio.ByteBuffer
@@ -51,6 +52,10 @@ interface AttachmentOperations {
     ): PreparedAttachmentTurn
     suspend fun deleteConversation(id: String)
     suspend fun preview(id: String, maxEdge: Int): Bitmap
+    suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel): PreparedAttachmentTurn =
+        error("Message recovery is not supported by this attachment service")
+    suspend fun deleteFailedMessage(conversationId: String, userMessageId: String): Unit =
+        error("Message recovery is not supported by this attachment service")
 }
 
 /**
@@ -156,7 +161,7 @@ class AttachmentService(
                 val databaseIds = attachmentDao.listIds().toSet()
                 committedIds = databaseIds
                 val selected = validateSelected(images, databaseIds, model)
-                val history = conversationId?.let { chatStore.messagesSnapshot(it) }.orEmpty()
+                val history = conversationId?.let { chatStore.messagesSnapshot(it) }.orEmpty().requestHistory()
                 val savedAttachmentIds = conversationId?.let {
                     attachmentDao.listForConversation(it).map { attachment -> attachment.id }.toSet()
                 }.orEmpty()
@@ -216,6 +221,50 @@ class AttachmentService(
                 }
             }
         }
+    }
+
+    override suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel): PreparedAttachmentTurn =
+        withContext(ioDispatcher) {
+            lifecycleMutex.withLock {
+                ensureInitialisedLocked()
+                val history = chatStore.messagesSnapshot(conversationId)
+                val index = history.indexOfFirst { it.id == userMessageId }
+                check(index >= 0) { "Message not found" }
+                val user = history[index]
+                check(user.role == USER_ROLE && user.status == MessageState.FAILED_ZDR)
+                val prefix = history.take(index).requestHistory()
+                val databaseIds = attachmentDao.listIds().toSet()
+                committedIds = databaseIds
+                val owned = attachmentDao.listForConversation(conversationId).map { it.id }.toSet()
+                val images = validateHistory(prefix + user, databaseIds, owned, model)
+                images.forEach { authenticate(it, AttachmentFailure.INCOMPATIBLE_HISTORY) }
+                val context = buildContext(prefix, user.content, user.attachments)
+                val pending = chatStore.retryFailedTurn(userMessageId, model)
+                PreparedAttachmentTurn(pending, context)
+            }
+        }
+
+    override suspend fun deleteFailedMessage(conversationId: String, userMessageId: String) {
+        withContext(ioDispatcher) {
+            lifecycleMutex.withLock {
+                ensureInitialisedLocked()
+                val user = chatStore.messagesSnapshot(conversationId).single { it.id == userMessageId }
+                check(user.role == USER_ROLE && user.status == MessageState.FAILED_ZDR)
+                val ids = user.attachments.map { it.id }.toSet()
+                chatStore.deleteFailedTurn(userMessageId)
+                committedIds = committedIds - ids
+                val cleanup = withContext(NonCancellable) { removeCapturedFiles(ids) }
+                if (cleanup.failures.isNotEmpty()) {
+                    cleanupByConversation.getOrPut(conversationId) { mutableSetOf() }.addAll(cleanup.failures.keys)
+                }
+                currentCoroutineContext().ensureActive()
+                if (cleanup.failures.isNotEmpty()) throw cleanupFailure(cleanup.failures.values.first(), databaseDeleted = true)
+            }
+        }
+    }
+
+    private fun List<Message>.requestHistory(): List<Message> = filter {
+        it.role != MessageState.MODEL_CHANGE && it.status != MessageState.FAILED_ZDR
     }
 
     override suspend fun preview(id: String, maxEdge: Int): Bitmap {

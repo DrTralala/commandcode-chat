@@ -73,6 +73,53 @@ class AttachmentServiceTest {
     }
 
     @Test
+    fun retryUsesPrefixAndOriginalCommittedImageOnce() = runTest {
+        val service = service()
+        val image = importPng(service)
+        val first = service.prepareTurn(null, "failed", ChatModel.SOL, listOf(image))
+        chats.failZdrTurn(first.pending.assistantMessageId)
+        service.prepareTurn(first.pending.conversationId, "later", ChatModel.SOL, emptyList())
+        val retry = service.prepareRetry(first.pending.conversationId, first.pending.userMessageId, ChatModel.LUNA)
+        assertEquals(listOf("failed"), retry.messages.map { it.content })
+        assertEquals(1, retry.messages.single().images.size)
+        assertEquals(first.pending.userMessageId, retry.pending.userMessageId)
+        assertEquals(setOf(image.id), dao.rows.keys)
+        val output = CloseTrackingOutputStream()
+        retry.messages.single().images.single().writeBase64(output)
+        assertTrue(output.size() > 0)
+        service.discard(listOf(image))
+        assertTrue(files.stored.containsKey(image.id))
+    }
+
+    @Test
+    fun ordinarySendExcludesFailedImagesAndLocalEvents() = runTest {
+        val service = service()
+        val image = importPng(service)
+        val first = service.prepareTurn(null, "failed", ChatModel.SOL, listOf(image))
+        chats.failZdrTurn(first.pending.assistantMessageId)
+        chats.changeConversationModel(first.pending.conversationId, ChatModel.LUNA)
+        files.missing += image.id
+        val next = service.prepareTurn(first.pending.conversationId, "new", ChatModel.LUNA, emptyList())
+        assertEquals(listOf("new"), next.messages.map { it.content })
+    }
+
+    @Test
+    fun failedMessageDeletionDoesNotRemoveFilesUntilDatabaseSucceeds() = runTest {
+        val service = service()
+        val image = importPng(service)
+        val first = service.prepareTurn(null, "failed", ChatModel.SOL, listOf(image))
+        chats.failZdrTurn(first.pending.assistantMessageId)
+        chats.deleteFailure = IOException("database unavailable")
+        assertTrue(captureFailure { service.deleteFailedMessage(first.pending.conversationId, first.pending.userMessageId) } is IOException)
+        assertTrue(files.stored.containsKey(image.id))
+        chats.deleteFailure = null
+        service.deleteFailedMessage(first.pending.conversationId, first.pending.userMessageId)
+        assertFalse(files.stored.containsKey(image.id))
+        assertTrue(dao.rows.isEmpty())
+        assertEquals(1, chats.conversations.value.size)
+    }
+
+    @Test
     fun failedPrepareLeavesDraftForRetryAndCommittedDraftCannotBeDiscarded() = runTest {
         val service = service()
         val bytes = ImageTestFactory.png()
@@ -866,6 +913,36 @@ class AttachmentServiceTest {
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean = true
 
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
+
+        override suspend fun failZdrTurn(assistantMessageId: String) {
+            val rows = messages.values.single { list -> list.value.any { it.id == assistantMessageId } }
+            val index = rows.value.indexOfFirst { it.id == assistantMessageId }
+            rows.value = rows.value.mapIndexed { i, m -> if (i == index || i == index - 1) m.copy(status = "FAILED_ZDR") else m }
+        }
+
+        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn {
+            val rows = messages.values.single { list -> list.value.any { it.id == userMessageId } }
+            val index = rows.value.indexOfFirst { it.id == userMessageId }
+            val user = rows.value[index]
+            check(user.status == "FAILED_ZDR")
+            val reply = rows.value[index + 1].copy(id = "retry-$userMessageId", modelId = model.apiId, status = "PENDING")
+            rows.value = rows.value.mapIndexed { i, m -> when (i) { index -> m.copy(status = "COMPLETE"); index + 1 -> reply; else -> m } }
+            return PendingTurn(user.conversationId, user.id, reply.id)
+        }
+
+        override suspend fun deleteFailedTurn(userMessageId: String) {
+            deleteFailure?.let { throw it }
+            val rows = messages.values.single { list -> list.value.any { it.id == userMessageId } }
+            val index = rows.value.indexOfFirst { it.id == userMessageId }
+            check(rows.value[index].status == "FAILED_ZDR")
+            rows.value = rows.value.filterIndexed { i, _ -> i != index && i != index + 1 }
+            dao.rows.values.removeIf { it.messageId == userMessageId }
+        }
+
+        override suspend fun changeConversationModel(conversationId: String, model: ChatModel) {
+            val rows = messages.getValue(conversationId)
+            rows.value += Message("event", conversationId, "MODEL_CHANGE", model.displayName, model.apiId, 99, "COMPLETE")
+        }
 
         override suspend fun deleteConversation(id: String) {
             deleteCalls++

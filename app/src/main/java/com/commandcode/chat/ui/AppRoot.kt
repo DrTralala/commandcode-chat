@@ -198,6 +198,8 @@ private fun AppContent(viewModel: AppViewModel) {
                         onNewChat = viewModel::newChat,
                         onSend = viewModel::send,
                         onCancel = viewModel::cancel,
+                        onRetryMessage = viewModel::retryMessage,
+                        onDeleteFailedMessage = viewModel::deleteFailedMessage,
                         onDraftChange = viewModel::updateDraft,
                         onAttach = {
                             if (pendingPickerTicket == null) {

@@ -205,7 +205,7 @@ class EncryptedDatabaseTest {
     }
 
     @Test
-    fun encryptedExportedV1MigratesToProductionV2AndReopensOwnedImageAfterSourceRevocation() = runBlocking {
+    fun encryptedExportedV1MigratesToProductionV3AndReopensOwnedImageAfterSourceRevocation() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val environment = EncryptedTestEnvironment(context)
         var migrated: ChatDatabase? = null
@@ -270,6 +270,7 @@ class EncryptedDatabaseTest {
                     "gpt-5.6-sol",
                     4000L,
                     "COMPLETE",
+                    replyToMessageId = SqlCipherV1TestFixture.USER_MESSAGE_ID,
                 ),
                 migratedDatabase.messages().find(SqlCipherV1TestFixture.ASSISTANT_MESSAGE_ID),
             )
@@ -315,7 +316,8 @@ class EncryptedDatabaseTest {
                 images = listOf(image),
             )
             assertEquals(SqlCipherV1TestFixture.CONVERSATION_ID, turn.pending.conversationId)
-            assertEquals(1, turn.messages.single().images.size)
+            assertEquals(listOf("v1 prompt", "v1 answer", ""), turn.messages.map { it.content })
+            assertEquals(listOf(0, 0, 1), turn.messages.map { it.images.size })
 
             // The MediaStore source is no longer available; the app-owned ciphertext is
             // the only input used by the reopened service below.

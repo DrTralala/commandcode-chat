@@ -136,9 +136,7 @@ class ImageInspectorTest {
 
     @Test
     fun sniffedMimeIsAuthoritativeOverContradictoryDeclaredMime() {
-        assertKind(AttachmentFailure.CORRUPT_IMAGE) {
-            inspector.inspect(ImageTestFactory.png(), "image/jpeg", "photo.jpg")
-        }
+        assertEquals("image/png", inspector.inspect(ImageTestFactory.png(), "image/jpeg", "photo.png").mimeType)
     }
 
     @Test
@@ -148,10 +146,16 @@ class ImageInspectorTest {
     }
 
     @Test
-    fun contradictoryDisplayNameSuffixRejects() {
-        assertKind(AttachmentFailure.CORRUPT_IMAGE) {
-            inspector.inspect(ImageTestFactory.png(), "image/png", "not-a-real.jpg")
-        }
+    fun contentWinsOverContradictoryDisplayNameSuffix() {
+        assertEquals("image/png", inspector.inspect(ImageTestFactory.png(), "image/png", "photo.jpg").mimeType)
+    }
+
+    @Test
+    fun acceptsWebpDespiteJpegMetadata() {
+        val info = inspector.inspect(ImageTestFactory.webpLossless(), "image/jpeg", "photo.jpg")
+        assertEquals("image/webp", info.mimeType)
+        assertEquals(2, info.width)
+        assertEquals(2, info.height)
     }
 
     @Test

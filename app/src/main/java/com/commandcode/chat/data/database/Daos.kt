@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.Flow
     @Query("SELECT * FROM conversations WHERE id = :id") fun find(id: String): ConversationEntity?
     @Query("UPDATE conversations SET updatedAt = :updatedAt WHERE id = :id") fun touch(id: String, updatedAt: Long)
     @Delete fun delete(value: ConversationEntity)
+    @Query("UPDATE conversations SET defaultModel = :modelId WHERE id = :id")
+    fun changeModel(id: String, modelId: String)
 }
 
 /** Projection row backing [Conversation] with reactive size fields. */
@@ -51,6 +53,9 @@ data class ConversationRow(
     @Query("SELECT MAX(createdAt) FROM messages WHERE conversationId = :conversationId") fun latestCreatedAt(conversationId: String): Long?
     @Query("UPDATE messages SET content = :content, status = :newStatus WHERE id = :id AND status = :expectedStatus")
     fun updateIfStatus(id: String, expectedStatus: String, content: String, newStatus: String): Int
+    @Delete fun delete(value: MessageEntity)
+    @Query("SELECT * FROM messages WHERE replyToMessageId = :userMessageId AND role = 'ASSISTANT'")
+    fun replies(userMessageId: String): List<MessageEntity>
 }
 
 /** A message with its ordered attachment metadata, loaded in one Room transaction. */
@@ -64,6 +69,7 @@ data class MessageWithAttachments(
     val status: String,
     @Relation(parentColumn = "id", entityColumn = "messageId")
     val attachments: List<AttachmentEntity>,
+    val replyToMessageId: String? = null,
 ) {
     fun toDomain(): Message =
         Message(
@@ -75,6 +81,7 @@ data class MessageWithAttachments(
             createdAt,
             status,
             attachments.sortedWith(compareBy({ it.position }, { it.id })).map { it.toDomain() },
+            replyToMessageId,
         )
 }
 

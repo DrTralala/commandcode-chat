@@ -59,6 +59,10 @@ interface ChatStore {
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String)
     suspend fun deleteConversation(id: String)
+    suspend fun failZdrTurn(assistantMessageId: String): Unit = error("Message recovery is not supported by this store")
+    suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn = error("Message recovery is not supported by this store")
+    suspend fun deleteFailedTurn(userMessageId: String): Unit = error("Message recovery is not supported by this store")
+    suspend fun changeConversationModel(conversationId: String, model: ChatModel): Unit = error("Model events are not supported by this store")
 }
 
 class AppSettings(context: Context) : SettingsStore {
@@ -144,6 +148,10 @@ class AppContainer(
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) =
             chatRepository.interruptTurn(messageId, partialText, reason)
         override suspend fun deleteConversation(id: String) = chatRepository.deleteConversation(id)
+        override suspend fun failZdrTurn(assistantMessageId: String) = chatRepository.failZdrTurn(assistantMessageId)
+        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel) = chatRepository.retryFailedTurn(userMessageId, model)
+        override suspend fun deleteFailedTurn(userMessageId: String) = chatRepository.deleteFailedTurn(userMessageId)
+        override suspend fun changeConversationModel(conversationId: String, model: ChatModel) = chatRepository.changeConversationModel(conversationId, model)
     }
     val attachmentOperations: AttachmentOperations = AttachmentService(
         chatStore = chatStore,

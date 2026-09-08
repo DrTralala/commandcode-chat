@@ -32,6 +32,84 @@ class ChatRepositoryTest {
         databases.clear()
     }
     @Test
+    fun failedRoutingClassificationCannotBeOverwrittenByLateStreamEvents() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "failed", ChatModel.SOL)
+        repository.failZdrTurn(turn.assistantMessageId)
+        repository.checkpointAssistant(turn.assistantMessageId, "late")
+        repository.interruptTurn(turn.assistantMessageId, "", "late")
+        assertTrue(!repository.completeTurn(turn.assistantMessageId, "late", null))
+        assertEquals("FAILED_ZDR", database.messages().find(turn.assistantMessageId)!!.status)
+        assertEquals("", database.messages().find(turn.assistantMessageId)!!.content)
+    }
+
+    @Test
+    fun retryKeepsUserAndPositionButCreatesSeparateUsageAttempt() = runTest {
+        val (repository, database) = testRepository()
+        val first = repository.beginTurn(null, "failed", ChatModel.SOL)
+        repository.failZdrTurn(first.assistantMessageId)
+        assertEquals("FAILED_ZDR", database.messages().find(first.userMessageId)?.status)
+        val oldPosition = database.messages().find(first.assistantMessageId)!!.createdAt
+        val later = repository.beginTurn(first.conversationId, "later", ChatModel.SOL)
+        repository.completeTurn(later.assistantMessageId, "later answer", null)
+        val retry = repository.retryFailedTurn(first.userMessageId, ChatModel.LUNA)
+        assertEquals(first.userMessageId, retry.userMessageId)
+        assertTrue(first.assistantMessageId != retry.assistantMessageId)
+        assertNull(database.messages().find(first.assistantMessageId))
+        assertEquals(oldPosition, database.messages().find(retry.assistantMessageId)!!.createdAt)
+        assertEquals(listOf(first.userMessageId, retry.assistantMessageId, later.userMessageId, later.assistantMessageId),
+            repository.messagesSnapshot(first.conversationId).map { it.id })
+        assertEquals(3, database.usageEvents().observeForConversation(first.conversationId).first().size)
+        repository.completeTurn(retry.assistantMessageId, "retry answer", TokenUsage(10, null, 2))
+        assertEquals("retry answer", database.messages().find(retry.assistantMessageId)!!.content)
+        assertTrue(runCatching { repository.retryFailedTurn(first.userMessageId, ChatModel.SOL) }.isFailure)
+    }
+
+    @Test
+    fun failedDeletionKeepsConversationLaterMessagesAndUsage() = runTest {
+        val (repository, database) = testRepository()
+        val failed = repository.beginTurn(null, "failed", ChatModel.SOL)
+        repository.failZdrTurn(failed.assistantMessageId)
+        repository.failZdrTurn(failed.assistantMessageId)
+        val later = repository.beginTurn(failed.conversationId, "later", ChatModel.SOL)
+        repository.deleteFailedTurn(failed.userMessageId)
+        assertEquals(listOf(later.userMessageId, later.assistantMessageId),
+            repository.messagesSnapshot(failed.conversationId).map { it.id })
+        assertEquals(2, database.usageEvents().observeForConversation(failed.conversationId).first().size)
+        assertEquals(1, repository.observeConversations().first().size)
+        assertTrue(runCatching { repository.deleteFailedTurn(later.userMessageId) }.isFailure)
+    }
+
+    @Test
+    fun nonemptyOrCompleteAssistantCannotBecomeZdrFailure() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
+        repository.checkpointAssistant(turn.assistantMessageId, "partial")
+        assertTrue(runCatching { repository.failZdrTurn(turn.assistantMessageId) }.isFailure)
+        repository.completeTurn(turn.assistantMessageId, "answer", null)
+        assertTrue(runCatching { repository.failZdrTurn(turn.assistantMessageId) }.isFailure)
+        assertEquals("COMPLETE", database.messages().find(turn.userMessageId)!!.status)
+    }
+
+    @Test
+    fun modelChangeIsLocalPersistentAndOnlyAddedForADifferentModel() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
+        repository.completeTurn(turn.assistantMessageId, "answer", null)
+        repository.changeConversationModel(turn.conversationId, ChatModel.SOL)
+        assertEquals(2, repository.messagesSnapshot(turn.conversationId).size)
+        repository.changeConversationModel(turn.conversationId, ChatModel.LUNA)
+        repository.changeConversationModel(turn.conversationId, ChatModel.LUNA)
+        val event = repository.messagesSnapshot(turn.conversationId).last()
+        assertEquals("MODEL_CHANGE", event.role)
+        assertEquals(ChatModel.LUNA.displayName, event.content)
+        assertEquals(ChatModel.LUNA.apiId, event.modelId)
+        assertEquals(ChatModel.LUNA.apiId, database.conversations().find(turn.conversationId)!!.defaultModel)
+        assertEquals(3, repository.messagesSnapshot(turn.conversationId).size)
+        assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
+    }
+
+    @Test
     fun beginTurnCreatesConversationPendingRowsAndIncompleteUsageAnchor() = runTest {
         val startedAt = 1_777_777L
         val (repository, database) = testRepository(nowMillis = { startedAt })

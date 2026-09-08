@@ -7,8 +7,10 @@ import androidx.activity.viewModels
 import androidx.core.view.WindowCompat
 import com.commandcode.chat.ui.AppRoot
 import com.commandcode.chat.ui.AppViewModel
+import com.commandcode.chat.ui.RefreshRatePreference
 
 class MainActivity : ComponentActivity() {
+    private val refreshRatePreference by lazy { RefreshRatePreference(this) }
     private val commandCodeApplication: CommandCodeApplication
         get() = application as CommandCodeApplication
 
@@ -31,5 +33,15 @@ class MainActivity : ComponentActivity() {
                 startupRecovery = commandCodeApplication.recoveryCause != null,
             )
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshRatePreference.start()
+    }
+
+    override fun onPause() {
+        refreshRatePreference.stop()
+        super.onPause()
     }
 }

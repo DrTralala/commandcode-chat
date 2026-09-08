@@ -3,7 +3,7 @@
 # Command Code Chat
 
 [![CI](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml/badge.svg)](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml)
-[![Version](https://img.shields.io/badge/version-v2.0.1-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v2.0.1)
+[![Version](https://img.shields.io/badge/version-v2.1.0-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v2.1.0)
 [![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
 
@@ -31,10 +31,14 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 ## Features
 
 - Streams chat responses directly from Command Code.
+- Shows an animated Thinking indicator while waiting for response text, with automatic scrolling that pauses when you scroll back.
 - Bundles a pinned, validated GOAT model catalogue in the APK.
 - Shows plan-aware credit usage, including rolling windows when the account provides them, with safe stale-data fallback.
 - Stores conversations and usage history in an encrypted local database.
 - Enables zero data retention (ZDR) by default and can fail rather than use a non-ZDR provider.
+- Marks ZDR-routing failures with a red exclamation; long-press or tap it to Retry with current model/ZDR settings or Delete the failed message.
+- Persists local model-change notices without sending them to the provider.
+- Requests the highest supported refresh rate at the current resolution; Android and device policies still control the delivered rate.
 - Offers a persistent AMOLED dark mode with true-black surfaces.
 - Uses distinct, aligned message bubbles for user and assistant messages.
 - Keeps chat, history, budget, and security settings in one native Jetpack Compose app.
@@ -44,7 +48,8 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 - JPEG, PNG and static WebP, up to 10 MB each and 20 images per chat (decimal MB).
 - Initially enabled for GPT-5.6 Sol, GPT-5.6 Luna and Gemini 3.7 Flash based on documentation; other models remain disabled until verified.
 - App-owned image copies are encrypted on this device, like chat history. The source gallery file is unchanged. Providers process sent images; this is not end-to-end encryption against the provider.
-- History shows estimated message/attachment storage and can sort largest/smallest first. Deleting a chat removes its encrypted attachment copies.
+- Compact stacked previews stay above the keyboard-aware composer. Validated image content takes precedence over misleading filenames or MIME labels.
+- History shows estimated message/attachment storage, can sort largest/smallest first, and supports selecting multiple chats for deletion. Deleting a chat removes its encrypted attachment copies.
 - Command Code's request limits are undocumented; large requests may be rejected. PDF/document/audio/video inputs are not supported by this version.
 
 The documented capabilities above are not runtime-validated here; the app limits are not a gateway guarantee.

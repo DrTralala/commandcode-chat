@@ -7,6 +7,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -25,6 +26,7 @@ import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedIconButton
@@ -55,6 +57,7 @@ import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.formatStorageBytes
 import com.commandcode.chat.domain.ImageAttachment
+import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.ui.AppUiState
 
 internal fun modelOptionTestTag(apiId: String): String = buildString {
@@ -106,8 +109,16 @@ fun ChatScreen(
     onRemoveAttachment: (String) -> Unit,
     onDismissAttachmentError: () -> Unit,
     loadAttachmentPreview: suspend (String, Int) -> Bitmap,
+    onRetryMessage: (String) -> Unit = {},
+    onDeleteFailedMessage: (String) -> Unit = {},
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    val activeId = state.activeAssistantMessageId.takeIf { state.sending && state.currentConversationId == state.activeConversationId }
+    val timeline = state.messages.filterNot { it.role == "ASSISTANT" && it.status == MessageState.FAILED_ZDR }.let { rows ->
+        if (activeId != null && rows.none { it.id == activeId }) {
+            rows + Message(activeId, state.currentConversationId.orEmpty(), "ASSISTANT", "", null, Long.MAX_VALUE, "PENDING")
+        } else rows
+    }.asReversed()
     val messages = rememberLazyListState()
     var followResponse by remember(state.currentConversationId) { mutableStateOf(true) }
     val responseScroll = remember(messages, state.currentConversationId) {
@@ -119,7 +130,7 @@ fun ChatScreen(
         }
     }
     LaunchedEffect(state.currentConversationId, state.visibleMessages.size, state.visibleStreamingText, state.visibleThinking) {
-        if (followResponse) messages.scrollToItem(0)
+        if (followResponse) messages.scrollToItem(timeline.indexOfFirst { it.id == activeId }.coerceAtLeast(0))
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
     val supportHeight = (maxHeight * 0.4f).coerceAtMost(240.dp)
@@ -194,32 +205,33 @@ fun ChatScreen(
             reverseLayout = true,
             verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Top),
         ) {
-            if (state.visibleThinking) {
-                item(key = "thinking") { ThinkingIndicator() }
-            }
-            state.visibleStreamingText?.let { liveText ->
-                item(key = "live_response") {
+            items(timeline, key = Message::id) { message ->
+                if (message.role == MessageState.MODEL_CHANGE) {
+                    Text(
+                        "Model changed to ${message.content}",
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).testTag("model_change_${message.id}"),
+                        style = MaterialTheme.typography.labelMedium,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else if (message.id == activeId) {
+                    if (state.visibleThinking) ThinkingIndicator() else state.visibleStreamingText?.let { liveText ->
                     MessageRow(
-                        message = Message(
-                            id = "active_assistant_response",
-                            conversationId = state.activeConversationId.orEmpty(),
-                            role = "ASSISTANT",
-                            content = liveText,
-                            modelId = null,
-                            createdAt = Long.MAX_VALUE,
-                            status = "STREAMING",
-                        ),
+                        message = message.copy(content = liveText, status = "STREAMING"),
                         loadAttachmentPreview = loadAttachmentPreview,
                         modifier = Modifier.testTag("active_assistant_response"),
                     )
+                    }
+                } else {
+                    MessageRow(
+                        message = message,
+                        loadAttachmentPreview = loadAttachmentPreview,
+                        modifier = Modifier.testTag("message_${message.id}"),
+                        actionsEnabled = !state.sending && !state.importingAttachments,
+                        onRetry = { onRetryMessage(message.id) },
+                        onDelete = { onDeleteFailedMessage(message.id) },
+                    )
                 }
-            }
-            items(state.visibleMessages.asReversed(), key = Message::id) { message ->
-                MessageRow(
-                    message = message,
-                    loadAttachmentPreview = loadAttachmentPreview,
-                    modifier = Modifier.testTag("message_${message.id}"),
-                )
             }
         }
         if (state.pendingAttachments.isNotEmpty() || state.attachmentError != null || state.errorMessage != null) {
@@ -313,8 +325,13 @@ private fun MessageRow(
     message: Message,
     loadAttachmentPreview: suspend (String, Int) -> Bitmap,
     modifier: Modifier = Modifier,
+    actionsEnabled: Boolean = false,
+    onRetry: () -> Unit = {},
+    onDelete: () -> Unit = {},
 ) {
     val isUser = messageSide(message.role) == MessageSide.END
+    val failed = isUser && message.status == MessageState.FAILED_ZDR
+    var actionsOpen by remember(message.id, failed, actionsEnabled) { mutableStateOf(false) }
     val colours = MaterialTheme.colorScheme
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -325,7 +342,13 @@ private fun MessageRow(
             contentColor = messageContentColour(message.role, colours),
             tonalElevation = if (isUser) 1.dp else 3.dp,
             modifier = modifier
-                .fillMaxWidth(0.86f)
+                .fillMaxWidth(if (failed) 0.8f else 0.86f)
+                .then(if (failed) Modifier.combinedClickable(
+                    enabled = actionsEnabled,
+                    onClick = {},
+                    onLongClickLabel = "Message actions",
+                    onLongClick = { actionsOpen = true },
+                ) else Modifier)
                 .semantics { contentDescription = if (isUser) "User message" else "Assistant message" },
         ) {
             Column(
@@ -335,6 +358,22 @@ private fun MessageRow(
                 if (message.content.isNotEmpty()) Text(message.content)
                 message.attachments.forEach { image ->
                     SavedAttachmentRow(image, loadAttachmentPreview)
+                }
+            }
+        }
+        if (failed) {
+            Box {
+                IconButton(
+                    onClick = { actionsOpen = true }, enabled = actionsEnabled,
+                    modifier = Modifier.testTag("failed_message_${message.id}"),
+                ) {
+                    Icon(painterResource(R.drawable.ic_message_failed),
+                        "Message not sent. No ZDR-capable provider is available. Message actions",
+                        tint = Color(0xFFEF4444))
+                }
+                DropdownMenu(expanded = actionsOpen, onDismissRequest = { actionsOpen = false }) {
+                    DropdownMenuItem(text = { Text("Retry") }, onClick = { actionsOpen = false; onRetry() })
+                    DropdownMenuItem(text = { Text("Delete") }, onClick = { actionsOpen = false; onDelete() })
                 }
             }
         }

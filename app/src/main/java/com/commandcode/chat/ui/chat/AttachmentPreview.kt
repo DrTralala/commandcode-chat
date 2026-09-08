@@ -148,7 +148,7 @@ internal fun attachmentErrorCopy(kind: AttachmentFailure): AttachmentErrorCopy =
     AttachmentFailure.INVALID_FORMAT -> AttachmentErrorCopy(
         "This image format is not supported. Choose JPEG, PNG, or WebP.",
     )
-    AttachmentFailure.CORRUPT_IMAGE -> AttachmentErrorCopy("The image could not be read. Try another image.")
+    AttachmentFailure.CORRUPT_IMAGE -> AttachmentErrorCopy("Failed to upload image. Please try again.")
     AttachmentFailure.TOO_LARGE -> AttachmentErrorCopy("This image is too large. The maximum is 10 MB.")
     AttachmentFailure.TOO_MANY -> AttachmentErrorCopy("This chat already has the maximum number of images.")
     AttachmentFailure.EXCESSIVE_DIMENSIONS -> AttachmentErrorCopy("This image exceeds the 8000-pixel dimension limit.")

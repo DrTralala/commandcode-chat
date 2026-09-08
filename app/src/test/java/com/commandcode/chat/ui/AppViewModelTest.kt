@@ -66,6 +66,79 @@ class AppViewModelTest {
     @After fun resetMain() = Dispatchers.resetMain()
 
     @Test
+    fun zdrOffAndPartialResponsesAreNeverMarkedAsRetryableRoutingFailures() = runTest(dispatcher) {
+        for ((zdr, partial) in listOf(false to "", true to "partial")) {
+            val chats = FakeChats()
+            val vm = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+                if (partial.isNotEmpty()) emit(StreamEvent.Delta(partial))
+                throw CommandCodeException.ZdrUnavailable()
+            } }, settings = FakeSettings(zdr = zdr))
+            configureKey(vm)
+            vm.send("hello")
+            advanceUntilIdle()
+            assertEquals("COMPLETE", vm.state.value.messages.single { it.role == "USER" }.status)
+            assertEquals("INTERRUPTED", vm.state.value.messages.single { it.role == "ASSISTANT" }.status)
+            assertEquals(partial, chats.interruptedText)
+            vm.viewModelScope.cancel()
+        }
+    }
+
+    @Test
+    fun repeatedRoutingFailureCanBeDeletedWithoutClearingDraftOrConversation() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val vm = viewModel(chats, StreamSource { _, _, _, _ -> flow { throw CommandCodeException.ZdrUnavailable() } })
+        configureKey(vm)
+        vm.send("failed")
+        advanceUntilIdle()
+        val user = vm.state.value.messages.single { it.role == "USER" }.id
+        vm.retryMessage(user)
+        advanceUntilIdle()
+        assertEquals("FAILED_ZDR", vm.state.value.messages.single { it.id == user }.status)
+        val id = vm.state.value.currentConversationId
+        vm.updateDraft("unrelated draft")
+        vm.deleteFailedMessage(user)
+        vm.deleteFailedMessage(user)
+        advanceUntilIdle()
+        assertEquals(id, vm.state.value.currentConversationId)
+        assertEquals("unrelated draft", vm.state.value.draftText)
+        assertTrue(vm.state.value.messages.isEmpty())
+        assertEquals(1, vm.state.value.conversations.size)
+    }
+
+    @Test
+    fun zdrFailureRetryUsesCurrentSettingsWithoutDuplicatingUserOrClearingDraft() = runTest(dispatcher) {
+        val chats = FakeChats()
+        var attempts = 0
+        val usedModels = mutableListOf<String>()
+        val usedZdr = mutableListOf<Boolean>()
+        val vm = viewModel(chats, StreamSource { _, model, _, zdr -> flow {
+            usedModels += model.apiId
+            usedZdr += zdr
+            if (++attempts == 1) throw CommandCodeException.ZdrUnavailable()
+            emit(StreamEvent.Delta("retry answer"))
+            emit(StreamEvent.Done)
+        } }, catalogue = FakeCatalogue(local = catalogueSnapshot(models = listOf(ChatModel.SOL, ChatModel.LUNA))))
+        configureKey(vm)
+        vm.send("original")
+        advanceUntilIdle()
+        val user = vm.state.value.messages.single { it.role == "USER" }
+        assertEquals("FAILED_ZDR", user.status)
+        vm.selectModel(ChatModel.LUNA)
+        advanceUntilIdle()
+        vm.setZdr(false)
+        vm.updateDraft("keep this draft")
+        vm.retryMessage(user.id)
+        vm.retryMessage(user.id)
+        advanceUntilIdle()
+        assertEquals(listOf(ChatModel.SOL.apiId, ChatModel.LUNA.apiId), usedModels)
+        assertEquals(listOf(true, false), usedZdr)
+        assertEquals(1, vm.state.value.messages.count { it.role == "USER" })
+        assertEquals("retry answer", chats.completedText)
+        assertEquals("keep this draft", vm.state.value.draftText)
+        assertEquals(1, vm.state.value.messages.count { it.role == "MODEL_CHANGE" })
+    }
+
+    @Test
     fun usageBeforeDoneCompletesOrderedDeltasAndClearsStreamingKeyCopy() = runTest(dispatcher) {
         val chats = FakeChats()
         val keys = FakeKeys()
@@ -1455,8 +1528,9 @@ class AppViewModelTest {
         )
         runCurrent()
         refreshEntered.await()
-        viewModel.selectModel(ChatModel.LUNA)
         viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.selectModel(ChatModel.LUNA)
         runCurrent()
         val ticket = requireNotNull(viewModel.requestAttachmentPicker())
         viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
@@ -1918,6 +1992,13 @@ class AppViewModelTest {
         override suspend fun preview(id: String, maxEdge: Int): Bitmap =
             throw UnsupportedOperationException("preview is not used by AppViewModel tests")
 
+        override suspend fun prepareRetry(conversationId: String, userMessageId: String, model: ChatModel): PreparedAttachmentTurn {
+            val user = chats.messagesSnapshot(conversationId).single { it.id == userMessageId }
+            return PreparedAttachmentTurn(chats.retryFailedTurn(userMessageId, model), listOf(ApiMessage("user", user.content)))
+        }
+
+        override suspend fun deleteFailedMessage(conversationId: String, userMessageId: String) = chats.deleteFailedTurn(userMessageId)
+
         data class PreparedRequest(
             val text: String,
             val model: ChatModel,
@@ -2001,6 +2082,38 @@ class AppViewModelTest {
             deletedConversations += id
             conversations.value = conversations.value.filterNot { it.id == id }
             messageFlows.remove(id)
+        }
+
+        override suspend fun failZdrTurn(assistantMessageId: String) {
+            val rows = messageFlows.values.single { flow -> flow.value.any { it.id == assistantMessageId } }
+            val index = rows.value.indexOfFirst { it.id == assistantMessageId }
+            rows.value = rows.value.mapIndexed { i, m -> if (i == index || i == index - 1) m.copy(status = "FAILED_ZDR") else m }
+        }
+
+        override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel): PendingTurn {
+            val rows = messageFlows.values.single { flow -> flow.value.any { it.id == userMessageId } }
+            val index = rows.value.indexOfFirst { it.id == userMessageId }
+            val user = rows.value[index]
+            check(user.status == "FAILED_ZDR")
+            val reply = rows.value[index + 1].copy(id = "retry-${++turnCount}", status = "PENDING", modelId = model.apiId, replyToMessageId = user.id)
+            messageOwners[reply.id] = user.conversationId
+            rows.value = rows.value.mapIndexed { i, m -> when(i) { index -> m.copy(status = "COMPLETE"); index + 1 -> reply; else -> m } }
+            return PendingTurn(user.conversationId, user.id, reply.id)
+        }
+
+        override suspend fun deleteFailedTurn(userMessageId: String) {
+            val rows = messageFlows.values.single { flow -> flow.value.any { it.id == userMessageId } }
+            val index = rows.value.indexOfFirst { it.id == userMessageId }
+            check(rows.value[index].status == "FAILED_ZDR")
+            rows.value = rows.value.filterIndexed { i, _ -> i != index && i != index + 1 }
+        }
+
+        override suspend fun changeConversationModel(conversationId: String, model: ChatModel) {
+            val conversation = conversations.value.single { it.id == conversationId }
+            if (conversation.defaultModelId == model.apiId) return
+            conversations.value = conversations.value.map { if (it.id == conversationId) it.copy(defaultModelId = model.apiId) else it }
+            val rows = messages(conversationId)
+            if (rows.value.isNotEmpty()) rows.value += Message("model-event-${rows.value.size}", conversationId, "MODEL_CHANGE", model.displayName, model.apiId, rows.value.size + 1L, "COMPLETE")
         }
 
         fun addConversation(id: String) {

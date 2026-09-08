@@ -16,40 +16,10 @@ data class InspectedImage(val mimeType: String, val width: Int, val height: Int)
  */
 class ImageInspector {
 
-    fun inspect(bytes: ByteArray, declaredMime: String?, displayName: String?): InspectedImage {
-        if (bytes.isEmpty()) throw AttachmentException(AttachmentFailure.CORRUPT_IMAGE)
-        if (declaredMime == null && displayName == null) return inspect(bytes)
-        val sniffed = sniffMime(bytes)
-        // Contradictory explicit MIME/suffix claims are rejected; generic or missing
-        // metadata resolves to the verified content below.
-        if (declaredMime != null && isSpecific(declaredMime) && declaredMime != sniffed) {
-            throw AttachmentException(AttachmentFailure.CORRUPT_IMAGE)
-        }
-        if (displayName != null) {
-            val suffix = displayName.substringAfterLast('.', "").lowercase()
-            if (suffix.isNotEmpty() && isSpecificSuffix(suffix) && suffix !in acceptedSuffixes(sniffed)) {
-                throw AttachmentException(AttachmentFailure.CORRUPT_IMAGE)
-            }
-        }
-        return inspect(bytes)
-    }
-
-    /** A MIME claim we treat as authoritative evidence; null/generic/wildcard are not. */
-    private fun isSpecific(mime: String): Boolean =
-        mime.isNotEmpty() && mime != "application/octet-stream" && mime != "image/*"
-
-    /** Suffixes that identify a concrete (possibly excluded) image container. Unknown
-     *  suffixes such as `.bin` or `.txt` are not evidence and resolve to content. */
-    private fun isSpecificSuffix(suffix: String): Boolean =
-        suffix in setOf("jpg", "jpeg", "png", "webp", "gif", "heic", "heif")
-
-    /** Suffixes consistent with a verified container type. */
-    private fun acceptedSuffixes(mime: String): Set<String> = when (mime) {
-        "image/jpeg" -> setOf("jpg", "jpeg")
-        "image/png" -> setOf("png")
-        "image/webp" -> setOf("webp")
-        else -> emptySet()
-    }
+    // Providers and downloaded filenames can mislabel valid images. Only validated
+    // container content and Android's decoder determine the MIME sent to the API.
+    @Suppress("UNUSED_PARAMETER")
+    fun inspect(bytes: ByteArray, declaredMime: String?, displayName: String?): InspectedImage = inspect(bytes)
 
     private fun sniffMime(bytes: ByteArray): String = when {
         startsWith(bytes, PNG_SIGNATURE) -> "image/png"

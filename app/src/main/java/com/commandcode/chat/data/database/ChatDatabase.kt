@@ -10,7 +10,7 @@ import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 
 @Database(
     entities = [ConversationEntity::class, MessageEntity::class, UsageEventEntity::class, AttachmentEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -34,7 +34,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     val factoryPassphrase = passphrase.copyOf()
                     val database = Room.databaseBuilder(context, ChatDatabase::class.java, databaseName)
                     .openHelperFactory(SupportOpenHelperFactory(factoryPassphrase))
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     database.openHelper.writableDatabase
                     database.reconcileUnfinishedTurnsForStartup()

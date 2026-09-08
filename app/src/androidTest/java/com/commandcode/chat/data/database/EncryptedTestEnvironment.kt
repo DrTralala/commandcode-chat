@@ -92,4 +92,8 @@ internal class DatabaseChatStore(private val repository: ChatRepository) : ChatS
         repository.interruptTurn(messageId, partialText, reason)
 
     override suspend fun deleteConversation(id: String) = repository.deleteConversation(id)
+    override suspend fun failZdrTurn(assistantMessageId: String) = repository.failZdrTurn(assistantMessageId)
+    override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel) = repository.retryFailedTurn(userMessageId, model)
+    override suspend fun deleteFailedTurn(userMessageId: String) = repository.deleteFailedTurn(userMessageId)
+    override suspend fun changeConversationModel(conversationId: String, model: ChatModel) = repository.changeConversationModel(conversationId, model)
 }

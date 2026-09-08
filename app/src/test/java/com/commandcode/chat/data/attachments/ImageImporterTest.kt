@@ -191,14 +191,12 @@ class ImageImporterTest {
     }
 
     @Test
-    fun specificContradictoryDeclaredMimeRejects() {
+    fun specificContradictoryDeclaredMimeUsesVerifiedContent() {
         val bytes = ImageTestFactory.png()
         registerProvider(bytes, size = null, mime = "image/jpeg", name = "photo.png")
-        val error = assertThrows(AttachmentException::class.java) {
-            importer().importImage(uri(), "gpt-5.6-sol")
-        }
-        assertEquals(AttachmentFailure.CORRUPT_IMAGE, error.kind)
-        assertTrue(files.stored.isEmpty())
+        val attachment = importer().importImage(uri(), "gpt-5.6-sol")
+        assertEquals("image/png", attachment.mimeType)
+        assertEquals(1, files.stored.size)
     }
 
     @Test
@@ -417,12 +415,12 @@ class ImageImporterTest {
 
     @Test
     fun importClosesResolverInputStreamOnInspectionFailure() {
-        val bytes = ImageTestFactory.png()
+        val bytes = ImageTestFactory.png().dropLast(10).toByteArray()
         val tracking = CloseTrackingInputStream(ByteArrayInputStream(bytes))
         registerProvider(
             bytes = bytes,
             size = null,
-            mime = "image/jpeg", // specific MIME contradicts the PNG content
+            mime = "image/png",
             name = "photo.png",
             streamSupplier = { tracking },
         )
@@ -436,12 +434,12 @@ class ImageImporterTest {
 
     @Test
     fun closeFailureDoesNotMaskTypedInspectionFailure() {
-        val bytes = ImageTestFactory.png()
+        val bytes = ImageTestFactory.png().dropLast(10).toByteArray()
         val closeThrowing = CloseThrowingInputStream(ByteArrayInputStream(bytes))
         registerProvider(
             bytes = bytes,
             size = null,
-            mime = "image/jpeg", // specific MIME contradicts the PNG content
+            mime = "image/png",
             name = "photo.png",
             streamSupplier = { closeThrowing },
         )

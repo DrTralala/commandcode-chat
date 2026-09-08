@@ -92,6 +92,13 @@ class ChatScreenPresentationTest {
     }
 
     @Test
+    fun unreadableImageUsesRequestedUploadFailureCopy() {
+        val copy = attachmentErrorCopy(AttachmentFailure.CORRUPT_IMAGE)
+        assertEquals("Failed to upload image. Please try again.", copy.primary)
+        assertNull(copy.secondary)
+    }
+
+    @Test
     fun attachmentNamesRemoveControlsAndPickerUsesPolicyOrder() {
         assertEquals("photo.png", safeAttachmentDisplayName(" photo\n.png "))
         assertEquals("Image", safeAttachmentDisplayName("\u0000\n"))

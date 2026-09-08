@@ -24,6 +24,7 @@ import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
+import androidx.compose.ui.test.longClick
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
@@ -47,6 +48,55 @@ import org.junit.runner.RunWith
 class ChatScreenComposeTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun failedMessageLongPressOffersRetryAndDeleteAndSuccessfulMessagesDoNot() {
+        var retried: String? = null
+        var deleted: String? = null
+        val rows = listOf(
+            Message("failed", "conversation", "USER", "Try this", null, 1, "FAILED_ZDR"),
+            Message("empty", "conversation", "ASSISTANT", "", null, 2, "FAILED_ZDR", replyToMessageId = "failed"),
+            Message("notice", "conversation", "MODEL_CHANGE", "GPT-5.6 Luna", ChatModel.LUNA.apiId, 3, "COMPLETE"),
+        )
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(state().copy(messages = rows), {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") },
+                    onRetryMessage = { retried = it }, onDeleteFailedMessage = { deleted = it })
+            }
+        }
+        compose.onNodeWithTag("failed_message_failed").assertIsDisplayed()
+            .assertContentDescriptionEquals("Message not sent. No ZDR-capable provider is available. Message actions")
+        compose.onNodeWithTag("message_empty").assertDoesNotExist()
+        compose.onNodeWithText("Model changed to GPT-5.6 Luna").assertIsDisplayed()
+        compose.onNodeWithTag("message_failed").performTouchInput { longClick() }
+        compose.onNodeWithText("Retry").performClick()
+        assertEquals("failed", retried)
+        compose.onNodeWithTag("failed_message_failed").performClick()
+        compose.onNodeWithText("Delete").performClick()
+        assertEquals("failed", deleted)
+    }
+
+    @Test
+    fun retryThinkingAndStreamingRemainBetweenOriginalUserAndLaterMessages() {
+        val live = mutableStateOf(state().copy(
+            sending = true, activeConversationId = "conversation", activeAssistantMessageId = "retry",
+            messages = listOf(
+                Message("original", "conversation", "USER", "Original", null, 1, "COMPLETE"),
+                Message("retry", "conversation", "ASSISTANT", "", null, 2, "PENDING", replyToMessageId = "original"),
+                Message("later", "conversation", "USER", "Later", null, 3, "COMPLETE"),
+            ),
+        ))
+        compose.setContent {
+            MaterialTheme { ChatScreen(live.value, {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") }) }
+        }
+        val original = compose.onNodeWithTag("message_original").fetchSemanticsNode().boundsInRoot
+        val thinking = compose.onNodeWithTag("thinking_indicator").fetchSemanticsNode().boundsInRoot
+        val later = compose.onNodeWithTag("message_later").fetchSemanticsNode().boundsInRoot
+        assertTrue("thinking belongs to original turn", original.bottom <= thinking.top && thinking.bottom <= later.top)
+        compose.runOnIdle { live.value = live.value.copy(streamingText = "Retry answer") }
+        val answer = compose.onNodeWithTag("active_assistant_response").fetchSemanticsNode().boundsInRoot
+        assertTrue("stream stays at original turn", answer.bottom <= compose.onNodeWithTag("message_later").fetchSemanticsNode().boundsInRoot.top)
+    }
 
     @Test
     fun longStreamingResponseFollowsNewestTextUntilTheUserScrollsUp() {

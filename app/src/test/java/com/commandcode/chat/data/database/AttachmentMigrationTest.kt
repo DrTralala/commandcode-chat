@@ -34,6 +34,40 @@ class AttachmentMigrationTest {
     }
 
     @Test
+    fun v2AttachmentsAndUsageSurviveMigrationAndRecoverySurvivesReopen() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "message-recovery-migration-${System.nanoTime()}.db"
+        try {
+            buildV1Database(context, name)
+            context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { db ->
+                db.execSQL("CREATE TABLE attachments (id TEXT NOT NULL PRIMARY KEY, messageId TEXT NOT NULL, displayName TEXT NOT NULL, mimeType TEXT NOT NULL, originalBytes INTEGER NOT NULL, encryptedBytes INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, position INTEGER NOT NULL, FOREIGN KEY(messageId) REFERENCES messages(id) ON UPDATE NO ACTION ON DELETE CASCADE)")
+                db.execSQL("CREATE UNIQUE INDEX index_attachments_messageId_position ON attachments(messageId, position)")
+                db.execSQL("INSERT INTO attachments VALUES ('image', 'message-user', 'Image.webp', 'image/webp', 100, 133, 2, 2, 0)")
+                db.version = 2
+            }
+            fun open() = Room.databaseBuilder(context, ChatDatabase::class.java, name)
+                .addMigrations(MIGRATION_2_3).allowMainThreadQueries().build().also { databases += it }
+            val migrated = open()
+            assertEquals("message-user", migrated.messages().find("message-assistant")!!.replyToMessageId)
+            val repository = ChatRepository(migrated)
+            assertEquals("image", repository.messagesSnapshot("conversation-a").first().attachments.single().id)
+            repository.failZdrTurn("message-assistant")
+            repository.changeConversationModel("conversation-a", com.commandcode.chat.domain.ChatModel.LUNA)
+            migrated.close()
+            val reopened = open()
+            val recovered = ChatRepository(reopened)
+            assertEquals("FAILED_ZDR", recovered.messagesSnapshot("conversation-a").first().status)
+            assertEquals("MODEL_CHANGE", recovered.messagesSnapshot("conversation-a").last().role)
+            assertEquals(1, reopened.usageEvents().observeForConversation("conversation-a").first().size)
+            recovered.retryFailedTurn("message-user", com.commandcode.chat.domain.ChatModel.LUNA)
+            assertEquals("image", recovered.messagesSnapshot("conversation-a").first().attachments.single().id)
+        } finally {
+            databases.forEach { it.close() }
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
     fun migratingRealV1DatabasePreservesAllValuesAndAddsAttachmentSchema() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val name = "attachment-migration-${System.nanoTime()}.db"
@@ -41,7 +75,7 @@ class AttachmentMigrationTest {
             val v1 = buildV1Database(context, name)
 
             val migrated = Room.databaseBuilder(context, ChatDatabase::class.java, name)
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .allowMainThreadQueries()
                 .build()
             databases += migrated
@@ -66,6 +100,7 @@ class AttachmentMigrationTest {
             assertEquals("", assistant.content)
             assertEquals("gpt-5.6-sol", assistant.modelId)
             assertEquals("PENDING", assistant.status)
+            assertEquals(user.id, assistant.replyToMessageId)
 
             val usage = migrated.usageEvents().observeForConversation("conversation-a").first().single()
             assertEquals("message-assistant", usage.requestId)
