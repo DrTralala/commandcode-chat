@@ -99,7 +99,7 @@ class AppContainer(
     val chatDatabase = databaseFactory(applicationContext, DatabaseKeyManager(encryptedStore))
     val chatRepository = ChatRepository(chatDatabase)
     private val attachmentFiles = EncryptedAttachmentStore(
-        File(applicationContext.noBackupFilesDir, "attachments"),
+        File(applicationContext.noBackupFilesDir.canonicalFile, "attachments"),
         AndroidAttachmentKeyProvider(),
     )
     private val imageImporter = ImageImporter(

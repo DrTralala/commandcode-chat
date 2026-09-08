@@ -186,6 +186,40 @@ class EncryptedAttachmentStoreTest {
     }
 
     @Test
+    fun canonicalTrustedParentAllowsRoundTripButRootAndLeafSymlinksRemainRejected() {
+        val trustedParent = temporaryFolder.newFolder("trusted-parent")
+        val parentAlias = File(temporaryFolder.root, "trusted-parent-alias")
+        if (!tryCreateSymlink(parentAlias, trustedParent.toPath())) return
+
+        assertFailure(AttachmentFailure.STORAGE) {
+            EncryptedAttachmentStore(File(parentAlias, "raw-attachments"), TestKeyProvider()).initialise(emptySet())
+        }
+
+        val root = File(parentAlias.canonicalFile, "attachments")
+        val store = store(root)
+        store.initialise(emptySet())
+        val id = UUID.randomUUID().toString()
+        val plaintext = "trusted parent round trip".toByteArray()
+        store.write(id, plaintext)
+        assertArrayEquals(plaintext, store.withPlaintext(id) { it.copyOf() })
+
+        val linkedRoot = File(temporaryFolder.root, "linked-attachments")
+        if (!tryCreateSymlink(linkedRoot, root.toPath())) return
+        assertFailure(AttachmentFailure.STORAGE) {
+            EncryptedAttachmentStore(linkedRoot, TestKeyProvider()).initialise(emptySet())
+        }
+
+        val outside = temporaryFolder.newFile("outside.bin").apply { writeBytes(byteArrayOf(7, 7, 7)) }
+        val linkedLeafId = UUID.randomUUID().toString()
+        val linkedLeaf = File(root, linkedLeafId)
+        if (!tryCreateSymlink(linkedLeaf, outside.toPath())) return
+        assertFailure(AttachmentFailure.STORAGE) { store.withPlaintext(linkedLeafId) { it.size } }
+        assertFailure(AttachmentFailure.STORAGE) { store.remove(linkedLeafId) }
+        assertTrue(linkedLeaf.isSymbolicLink())
+        assertArrayEquals(byteArrayOf(7, 7, 7), outside.readBytes())
+    }
+
+    @Test
     fun tamperingOrSubstitutingCiphertextDoesNotInvokeReaderCallback() {
         val root = temporaryFolder.newFolder("attachments")
         val store = store(root)

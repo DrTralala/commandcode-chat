@@ -1,9 +1,1 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application>
-        <provider
-            android:name="com.commandcode.chat.data.attachments.OwnedImageContentProvider"
-            android:authorities="com.commandcode.chat.test.image-source"
-            android:exported="false"
-            android:grantUriPermissions="true" />
-    </application>
-</manifest>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

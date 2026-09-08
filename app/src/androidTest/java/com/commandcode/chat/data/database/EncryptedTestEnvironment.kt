@@ -21,7 +21,7 @@ internal class EncryptedTestEnvironment(private val context: Context) {
     val databaseAlias = "commandcode-task11-db-${UUID.randomUUID()}"
     val databaseBlobKey = "databaseKey-${UUID.randomUUID()}"
     val attachmentAlias = "commandcode-task11-attachment-${UUID.randomUUID()}"
-    val attachmentRoot = File(context.noBackupFilesDir, "task11-attachments-${UUID.randomUUID()}")
+    val attachmentRoot = File(context.noBackupFilesDir.canonicalFile, "task11-attachments-${UUID.randomUUID()}")
     val blobStore = EncryptedBlobStore(context, storageName)
     val keyManager = DatabaseKeyManager(
         blobStore,

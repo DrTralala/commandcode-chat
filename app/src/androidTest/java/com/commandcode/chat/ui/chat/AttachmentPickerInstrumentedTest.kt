@@ -11,13 +11,15 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.core.app.ActivityOptionsCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -152,7 +154,11 @@ class AttachmentPickerInstrumentedTest {
         compose.waitForIdle()
 
         compose.onAllNodesWithTag("attachment_error_box").assertCountEquals(0)
-        compose.onNodeWithTag("message_composer").assertTextEquals("retain this draft")
+        compose.onNodeWithTag("message_composer").assert(
+            SemanticsMatcher("cancelled picker retains editable text") { node ->
+                node.config[SemanticsProperties.EditableText].text == "retain this draft"
+            },
+        )
         compose.onNodeWithTag("attach_image").performClick()
         compose.waitForIdle()
         assertEquals(2, harness.registry.launches.size)

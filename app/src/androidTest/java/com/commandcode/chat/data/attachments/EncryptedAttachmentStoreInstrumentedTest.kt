@@ -1,6 +1,7 @@
 package com.commandcode.chat.data.attachments
 
 import android.content.Context
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.domain.AttachmentException
@@ -21,7 +22,7 @@ import org.junit.runner.RunWith
 class EncryptedAttachmentStoreInstrumentedTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val suffix = UUID.randomUUID().toString()
-    private val root = File(context.noBackupFilesDir, "attachments-test-$suffix")
+    private val root = File(context.noBackupFilesDir.canonicalFile, "attachments-test-$suffix")
     private val alias = "commandcode-test-attachment-$suffix"
 
     @After
@@ -89,11 +90,70 @@ class EncryptedAttachmentStoreInstrumentedTest {
         }
 
         // Reconciliation verifies that all three encrypted files remain readable without
-        // consulting the now-revoked source provider.
+        // consulting the now-revoked MediaStore source.
         store.initialise(images.map { it.id }.toSet())
         images.forEachIndexed { index, image ->
             assertArrayEquals(sources[index].bytes, store.withPlaintext(image.id) { it.copyOf() })
         }
+    }
+
+    @Test
+    fun failedSourceDeletionRetainsOwnershipUntilRetry() {
+        val source = OwnedImageSources.publish(AndroidImageTestFixtures.all().first())
+        OwnedImageSources.deleteForTests = { 0 }
+        try {
+            val error = assertThrows(IllegalStateException::class.java) {
+                OwnedImageSources.revoke(source)
+            }
+            assertTrue(error.message.orEmpty().contains("zero-count delete"))
+            assertTrue(OwnedImageSources.isAvailable(source.uri))
+        } finally {
+            OwnedImageSources.deleteForTests = null
+        }
+
+        OwnedImageSources.revoke(source)
+        assertFalse(OwnedImageSources.isAvailable(source.uri))
+        OwnedImageSources.revoke(source)
+
+        val alreadyGone = OwnedImageSources.publish(AndroidImageTestFixtures.all()[1])
+        assertEquals(1, context.contentResolver.delete(alreadyGone.uri, null, null))
+        OwnedImageSources.deleteForTests = { 0 }
+        try {
+            OwnedImageSources.revoke(alreadyGone)
+            assertFalse(OwnedImageSources.isAvailable(alreadyGone.uri))
+            OwnedImageSources.revoke(alreadyGone)
+        } finally {
+            OwnedImageSources.deleteForTests = null
+        }
+    }
+
+    @Test
+    fun clearAttemptsAllOwnedSourcesAndAggregatesFailuresWithoutDroppingOwnership() {
+        val first = OwnedImageSources.publish(AndroidImageTestFixtures.all()[0])
+        val second = OwnedImageSources.publish(AndroidImageTestFixtures.all()[1])
+        val attempted = mutableListOf<Uri>()
+        val resolver = context.contentResolver
+        OwnedImageSources.deleteForTests = { uri ->
+            attempted += uri
+            if (uri == first.uri) {
+                throw IllegalStateException("injected delete failure")
+            }
+            resolver.delete(uri, null, null)
+        }
+        try {
+            val error = assertThrows(IllegalStateException::class.java) {
+                OwnedImageSources.clear()
+            }
+            assertTrue(error.message.orEmpty().contains("unable to clear 1"))
+            assertEquals(1, error.suppressed.size)
+        } finally {
+            OwnedImageSources.deleteForTests = null
+        }
+
+        assertEquals(setOf(first.uri, second.uri), attempted.toSet())
+        assertTrue(OwnedImageSources.isAvailable(first.uri))
+        assertFalse(OwnedImageSources.isAvailable(second.uri))
+        OwnedImageSources.revoke(first)
     }
 
     @Test

@@ -317,7 +317,7 @@ class EncryptedDatabaseTest {
             assertEquals(SqlCipherV1TestFixture.CONVERSATION_ID, turn.pending.conversationId)
             assertEquals(1, turn.messages.single().images.size)
 
-            // The provider source is no longer available; the app-owned ciphertext is
+            // The MediaStore source is no longer available; the app-owned ciphertext is
             // the only input used by the reopened service below.
             OwnedImageSources.revoke(source)
             assertFalse(OwnedImageSources.isAvailable(source.uri))

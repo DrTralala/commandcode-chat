@@ -1,21 +1,13 @@
 package com.commandcode.chat.data.attachments
 
-import android.content.ContentProvider
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
-import android.content.Intent
-import android.database.Cursor
-import android.database.MatrixCursor
 import android.net.Uri
-import android.os.ParcelFileDescriptor
-import android.provider.OpenableColumns
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileNotFoundException
-import java.io.IOException
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /** Generated, app-owned image inputs used by the compile-only device fixtures. */
@@ -58,219 +50,109 @@ internal data class OwnedImageSource(
     val displayName: String,
 )
 
-/**
- * A test-only content source. Bytes are backed by a private test-APK file rather than
- * this process's static map, so a provider process can serve the URI to the target app.
- * Each target grant is explicit and is revoked when the source is removed.
- */
+/** Test-only content sources backed by MediaStore rows owned by the target application. */
 internal object OwnedImageSources {
-    const val AUTHORITY = "com.commandcode.chat.test.image-source"
+    private val imageCollection =
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    private val insertedUris = ConcurrentHashMap.newKeySet<Uri>()
+    private val relativePath = "${Environment.DIRECTORY_PICTURES}/CommandCodeChatTest/"
 
-    private const val SOURCE_DIRECTORY = "task11-owned-image-sources"
-    private const val READ_GRANT = Intent.FLAG_GRANT_READ_URI_PERMISSION
-    private val sources = ConcurrentHashMap<String, SourceRecord>()
+    /** Test-only delete fault seam; production code never references this fixture. */
+    internal var deleteForTests: ((Uri) -> Int)? = null
 
     fun publish(format: AndroidImageTestFixtures.Format): OwnedImageSource {
-        val identity = SourceIdentity.create(format)
-        val file = sourceFile(testContext(), identity)
-        file.parentFile?.mkdirs()
-        check(file.parentFile?.isDirectory == true) { "test source directory unavailable" }
-        check(file.createNewFile()) { "test source collision: ${identity.fileName}" }
+        val resolver = targetContext().contentResolver
+        val uri = resolver.insert(
+            imageCollection,
+            ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, format.displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, format.mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            },
+        ) ?: error("unable to insert generated MediaStore image")
+        insertedUris += uri
+
         try {
-            file.writeBytes(format.bytes)
-            check(file.length() == format.bytes.size.toLong()) { "test source write was incomplete" }
-        } catch (error: Exception) {
-            file.delete()
+            resolver.openOutputStream(uri, "w")?.use { output ->
+                output.write(format.bytes)
+            } ?: error("unable to open generated MediaStore image")
+            check(
+                resolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                    null,
+                    null,
+                ) == 1,
+            ) { "unable to publish generated MediaStore image" }
+            return OwnedImageSource(
+                uri = uri,
+                bytes = format.bytes.copyOf(),
+                mimeType = format.mimeType,
+                displayName = format.displayName,
+            )
+        } catch (error: Throwable) {
+            runCatching { deleteOwned(resolver, uri) }
+                .onFailure(error::addSuppressed)
             throw error
         }
-
-        val uri = Uri.Builder()
-            .scheme(ContentResolver.SCHEME_CONTENT)
-            .authority(AUTHORITY)
-            .appendPath(identity.fileName)
-            .build()
-        sources[identity.fileName] = SourceRecord(
-            uri = uri,
-            file = file,
-        )
-        testContext().grantUriPermission(targetContext().packageName, uri, READ_GRANT)
-        return OwnedImageSource(
-            uri = uri,
-            bytes = format.bytes.copyOf(),
-            mimeType = format.mimeType,
-            displayName = format.displayName,
-        )
     }
 
     fun revoke(source: OwnedImageSource) {
-        val identity = parse(source.uri)
-        val record = sources.remove(identity.fileName)
-        val file = record?.file ?: sourceFile(testContext(), identity)
-        try {
-            if (file.exists() && !file.delete() && file.exists()) {
-                error("unable to revoke test source ${identity.fileName}")
-            }
-        } finally {
-            testContext().revokeUriPermission(targetContext().packageName, source.uri, READ_GRANT)
-        }
+        if (!insertedUris.contains(source.uri)) return
+        deleteOwned(targetContext().contentResolver, source.uri)
     }
 
     fun isAvailable(uri: Uri): Boolean {
-        val identity = parse(uri)
-        return sources[identity.fileName]?.file?.isFile == true
+        if (!insertedUris.contains(uri)) return false
+        return uriExists(targetContext().contentResolver, uri)
     }
 
     fun readThroughTargetResolver(source: OwnedImageSource): ByteArray {
-        val identity = parse(source.uri)
-        check(sources.containsKey(identity.fileName)) { "test source is not published" }
+        check(insertedUris.contains(source.uri)) { "test source is not published" }
         return targetContext().contentResolver.openInputStream(source.uri)?.use { it.readBytes() }
-            ?: throw FileNotFoundException("unable to read test source ${identity.fileName}")
+            ?: error("unable to read generated MediaStore image")
     }
 
     fun clear() {
-        sources.values.forEach { record ->
-            runCatching {
-                testContext().revokeUriPermission(targetContext().packageName, record.uri, READ_GRANT)
+        val resolver = targetContext().contentResolver
+        val failures = mutableListOf<Throwable>()
+        insertedUris.toList().forEach { uri ->
+            try {
+                deleteOwned(resolver, uri)
+            } catch (error: Throwable) {
+                failures += IllegalStateException("unable to delete generated MediaStore image $uri", error)
             }
-            runCatching { record.file.delete() }
         }
-        sources.clear()
-        sourceRoot(testContext()).deleteRecursively()
+        if (failures.isNotEmpty()) {
+            throw IllegalStateException("unable to clear ${failures.size} generated MediaStore image(s)").also {
+                failures.forEach(it::addSuppressed)
+            }
+        }
     }
 
-    internal fun sourceForProvider(context: Context, uri: Uri): ProviderSource {
-        val identity = try {
-            parse(uri)
-        } catch (error: IllegalArgumentException) {
-            throw FileNotFoundException("invalid test source URI").also { it.initCause(error) }
+    private fun deleteOwned(resolver: ContentResolver, uri: Uri) {
+        val deleted = deleteForTests?.invoke(uri) ?: resolver.delete(uri, null, null)
+        if (deleted == 0) {
+            if (!uriExists(resolver, uri)) {
+                insertedUris.remove(uri)
+                return
+            }
+            throw IllegalStateException("generated MediaStore image remains after zero-count delete: $uri")
         }
-        val root = sourceRoot(context)
-        val file = File(root, identity.fileName)
-        val canonicalRoot = try {
-            root.canonicalFile
-        } catch (error: IOException) {
-            throw FileNotFoundException("test source root unavailable").also { it.initCause(error) }
-        }
-        val canonicalFile = try {
-            file.canonicalFile
-        } catch (error: IOException) {
-            throw FileNotFoundException("test source unavailable").also { it.initCause(error) }
-        }
-        if (canonicalFile.parentFile != canonicalRoot || !canonicalFile.isFile) {
-            throw FileNotFoundException("revoked test source ${identity.fileName}")
-        }
-        val metadata = metadata(identity.extension)
-        return ProviderSource(canonicalFile, metadata.mimeType, metadata.displayName)
+        check(deleted == 1) { "unexpected generated MediaStore delete count: $deleted" }
+        check(!uriExists(resolver, uri)) { "generated MediaStore image remains after delete: $uri" }
+        insertedUris.remove(uri)
     }
 
-    private fun parse(uri: Uri): SourceIdentity {
-        require(uri.scheme == ContentResolver.SCHEME_CONTENT) { "test source must use content scheme" }
-        require(uri.authority == AUTHORITY) { "test source authority mismatch" }
-        require(uri.query == null && uri.fragment == null) { "test source URI must not contain query or fragment" }
-        val segments = uri.pathSegments
-        require(segments.size == 1) { "test source URI must contain exactly one path segment" }
-        val fileName = segments.single()
-        val dot = fileName.lastIndexOf('.')
-        require(dot > 0 && dot == fileName.indexOf('.')) { "test source filename is invalid" }
-        val id = fileName.substring(0, dot)
-        val extension = fileName.substring(dot + 1)
-        require(UUID.fromString(id).toString() == id) { "test source ID is invalid" }
-        require(extension in EXTENSIONS) { "test source extension is invalid" }
-        return SourceIdentity(id, extension, fileName)
-    }
-
-    private fun sourceFile(context: Context, identity: SourceIdentity): File =
-        File(sourceRoot(context), identity.fileName)
-
-    private fun sourceRoot(context: Context): File = File(context.filesDir, SOURCE_DIRECTORY)
-
-    private fun testContext(): Context = InstrumentationRegistry.getInstrumentation().context
+    private fun uriExists(resolver: ContentResolver, uri: Uri): Boolean =
+        resolver.query(
+            uri,
+            arrayOf(MediaStore.MediaColumns._ID),
+            null,
+            null,
+            null,
+        )?.use { it.moveToFirst() } == true
 
     private fun targetContext(): Context = InstrumentationRegistry.getInstrumentation().targetContext
-
-    private fun metadata(extension: String): SourceMetadata = when (extension) {
-        "png" -> SourceMetadata("image/png", "owned.png")
-        "jpg" -> SourceMetadata("image/jpeg", "owned.jpg")
-        "webp" -> SourceMetadata("image/webp", "owned.webp")
-        else -> error("unsupported test source extension: $extension")
-    }
-
-    private data class SourceIdentity(
-        val id: String,
-        val extension: String,
-        val fileName: String,
-    ) {
-        companion object {
-            fun create(format: AndroidImageTestFixtures.Format): SourceIdentity {
-                val extension = when (format.mimeType) {
-                    "image/png" -> "png"
-                    "image/jpeg" -> "jpg"
-                    "image/webp" -> "webp"
-                    else -> error("unsupported test source MIME type: ${format.mimeType}")
-                }
-                val id = UUID.randomUUID().toString()
-                return SourceIdentity(id, extension, "$id.$extension")
-            }
-        }
-    }
-
-    private data class SourceRecord(
-        val uri: Uri,
-        val file: File,
-    )
-
-    private data class SourceMetadata(val mimeType: String, val displayName: String)
-
-    internal data class ProviderSource(
-        val file: File,
-        val mimeType: String,
-        val displayName: String,
-    )
-
-    private val EXTENSIONS = setOf("png", "jpg", "webp")
-}
-
-/** ContentProvider implementation for [OwnedImageSources]. */
-class OwnedImageContentProvider : ContentProvider() {
-    override fun onCreate(): Boolean = true
-
-    private fun source(uri: Uri): OwnedImageSources.ProviderSource =
-        OwnedImageSources.sourceForProvider(requireNotNull(context), uri)
-
-    override fun getType(uri: Uri): String = source(uri).mimeType
-
-    override fun query(
-        uri: Uri,
-        projection: Array<String>?,
-        selection: String?,
-        selectionArgs: Array<String>?,
-        sortOrder: String?,
-    ): Cursor {
-        val source = source(uri)
-        val columns = projection ?: arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
-        val values = arrayOfNulls<Any>(columns.size)
-        columns.forEachIndexed { index, column ->
-            when (column) {
-                OpenableColumns.DISPLAY_NAME -> values[index] = source.displayName
-                OpenableColumns.SIZE -> values[index] = source.file.length()
-            }
-        }
-        return MatrixCursor(columns).also { it.addRow(values) }
-    }
-
-    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
-        if (mode != "r") throw FileNotFoundException("test source is read-only")
-        return ParcelFileDescriptor.open(source(uri).file, ParcelFileDescriptor.MODE_READ_ONLY)
-    }
-
-    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
-
-    override fun update(
-        uri: Uri,
-        values: ContentValues?,
-        selection: String?,
-        selectionArgs: Array<String>?,
-    ): Int = 0
-
-    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<String>?): Int = 0
 }

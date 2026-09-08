@@ -49,6 +49,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
+import java.io.File
 import org.junit.After
 import org.junit.Before
 import org.junit.Assert.assertEquals
@@ -160,6 +161,19 @@ class AppSmokeTest {
             compose.onNodeWithText("New Chat").assertIsDisplayed()
             compose.onNodeWithTag("bottom_navigation").assertIsDisplayed()
         }
+    }
+
+    @Test
+    fun appContainerInitialisesAttachmentStorageAtStartup() {
+        compose.waitUntil(timeoutMillis = 5_000) {
+            !compose.activity.viewModelForTests.state.value.loading
+        }
+
+        assertTrue(!compose.activity.viewModelForTests.state.value.loading)
+        assertTrue(compose.activity.viewModelForTests.state.value.attachmentError == null)
+        assertTrue(
+            File(compose.activity.noBackupFilesDir.canonicalFile, "attachments").isDirectory,
+        )
     }
 
     @Test
