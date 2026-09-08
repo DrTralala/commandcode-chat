@@ -1,6 +1,10 @@
 package com.commandcode.chat.ui.chat
 
 import android.graphics.Bitmap
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -17,6 +21,9 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
@@ -40,6 +47,91 @@ import org.junit.runner.RunWith
 class ChatScreenComposeTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun longStreamingResponseFollowsNewestTextUntilTheUserScrollsUp() {
+        val live = mutableStateOf(state().copy(
+            sending = true, activeConversationId = "conversation", activeAssistantMessageId = "pending",
+            streamingText = (1..100).joinToString("\n") { "Line $it" },
+        ))
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = live.value, onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("unused") },
+                )
+            }
+        }
+        fun scrollOffset() = compose.onNodeWithTag("chat_messages").fetchSemanticsNode()
+            .config[SemanticsProperties.VerticalScrollAxisRange].value()
+        assertEquals(0f, scrollOffset())
+        compose.runOnIdle { live.value = live.value.copy(streamingText = live.value.streamingText + "\nLine 101") }
+        assertEquals(0f, scrollOffset())
+        compose.onNodeWithTag("chat_messages").performTouchInput { swipeDown() }
+        compose.waitForIdle()
+        val scrolledOffset = scrollOffset()
+        assertTrue("user can scroll up in a long response", scrolledOffset > 0f)
+        compose.runOnIdle { live.value = live.value.copy(streamingText = live.value.streamingText + "\nLine 102") }
+        assertTrue("incoming text must not pull the user back to the bottom", scrollOffset() > 0f)
+    }
+
+    @Test
+    fun manyAttachmentsRemainCompactStackedAndScrollableWithoutDisplacingComposer() {
+        compose.setContent {
+            MaterialTheme {
+                Box(Modifier.height(400.dp)) {
+                    ChatScreen(
+                        state = state().copy(pendingAttachments = (1..20).map { image().copy(id = "image$it") }),
+                        onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                        onDraftChange = {}, onAttach = {}, onRemoveAttachment = {}, onDismissAttachmentError = {},
+                        loadAttachmentPreview = { _, _ -> Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888) },
+                    )
+                }
+            }
+        }
+        compose.onNodeWithTag("message_composer").assertIsDisplayed()
+        compose.onNodeWithTag("send_message").assertIsDisplayed()
+        val input = compose.onNodeWithTag("message_composer").fetchSemanticsNode().boundsInRoot
+        val first = compose.onNodeWithTag("pending_attachment_image1").fetchSemanticsNode().boundsInRoot
+        val second = compose.onNodeWithTag("pending_attachment_image2").fetchSemanticsNode().boundsInRoot
+        assertTrue("rows do not overlap", first.bottom <= second.top)
+        assertTrue("rows are above composer", second.bottom <= input.top)
+        val thumbnail = compose.onNodeWithTag("attachment_preview_image1").fetchSemanticsNode().boundsInRoot
+        assertTrue("thumbnail is compact", thumbnail.height <= with(compose.density) { 56.dp.toPx() } + 1f)
+        compose.onNodeWithTag("pending_attachments").performScrollToIndex(19)
+        compose.onNodeWithTag("remove_attachment_image20").assertIsDisplayed()
+        compose.onNodeWithTag("message_composer").assertIsDisplayed()
+    }
+
+    @Test
+    fun thinkingIsReplacedByIncrementalAnswerAndStopsAfterCancellation() {
+        val live = mutableStateOf(state().copy(
+            sending = true, activeConversationId = "conversation", activeAssistantMessageId = "pending",
+        ))
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = live.value, onSelectModel = {}, onNewChat = {}, onSend = {},
+                    onCancel = { live.value = live.value.copy(sending = false, activeConversationId = null) },
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("unused") },
+                )
+            }
+        }
+        compose.onNodeWithText("Thinking").assertIsDisplayed()
+        compose.runOnIdle { live.value = live.value.copy(streamingText = "First") }
+        compose.onNodeWithText("Thinking").assertDoesNotExist()
+        compose.onNodeWithText("First").assertIsDisplayed()
+        compose.runOnIdle { live.value = live.value.copy(streamingText = "First second") }
+        compose.onNodeWithText("First second").assertIsDisplayed()
+        compose.runOnIdle { live.value = live.value.copy(streamingText = "", currentConversationId = "other") }
+        compose.onNodeWithText("Thinking").assertDoesNotExist()
+        compose.runOnIdle { live.value = live.value.copy(currentConversationId = "conversation") }
+        compose.onNodeWithText("Thinking").assertIsDisplayed()
+        compose.onNodeWithTag("cancel_send").performClick()
+        compose.onNodeWithText("Thinking").assertDoesNotExist()
+    }
 
     @Test
     fun newConversationHeaderUsesModelFirstAndSimpleSendCopy() {

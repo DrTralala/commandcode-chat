@@ -143,11 +143,8 @@ internal data class AttachmentErrorCopy(
 )
 
 internal fun attachmentErrorCopy(kind: AttachmentFailure): AttachmentErrorCopy = when (kind) {
-    AttachmentFailure.UNSUPPORTED_MODEL -> AttachmentErrorCopy(AttachmentPolicy.UNSUPPORTED_MESSAGE)
-    AttachmentFailure.UNVERIFIED_MODEL -> AttachmentErrorCopy(
-        primary = AttachmentPolicy.UNSUPPORTED_MESSAGE,
-        secondary = "Attachment support for this model has not been verified.",
-    )
+    AttachmentFailure.UNSUPPORTED_MODEL,
+    AttachmentFailure.UNVERIFIED_MODEL -> AttachmentErrorCopy(AttachmentPolicy.UNSUPPORTED_MESSAGE)
     AttachmentFailure.INVALID_FORMAT -> AttachmentErrorCopy(
         "This image format is not supported. Choose JPEG, PNG, or WebP.",
     )

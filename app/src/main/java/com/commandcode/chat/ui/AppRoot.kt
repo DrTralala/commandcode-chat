@@ -39,6 +39,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -171,6 +172,9 @@ private fun AppContent(viewModel: AppViewModel) {
     }
 
     val navController = rememberNavController()
+    val currentEntry by navController.currentBackStackEntryAsState()
+    val chatKeyboardVisible = currentEntry?.destination?.route == Route.CHAT &&
+        WindowInsets.ime.getBottom(LocalDensity.current) > 0
     var previouslyConfigured by rememberSaveable { mutableStateOf(state.keyConfigured) }
     LaunchedEffect(state.keyConfigured) {
         navigationTarget(previouslyConfigured, state.keyConfigured)?.let { destination ->
@@ -216,6 +220,7 @@ private fun AppContent(viewModel: AppViewModel) {
                         modelDisplayName = { modelId -> modelDisplayName(state.models, modelId) },
                         onOpen = { viewModel.openConversation(it); navController.navigate(Route.CHAT) },
                         onDelete = viewModel::deleteConversation,
+                        errorMessage = state.errorMessage,
                     )
                 }
                 composable(Route.BUDGET) {
@@ -232,8 +237,10 @@ private fun AppContent(viewModel: AppViewModel) {
                 }
             }
         }
-        if (state.keyConfigured) BottomPanel(navController)
-        SecurityRail(state.zdr)
+        if (!chatKeyboardVisible) {
+            if (state.keyConfigured) BottomPanel(navController)
+            SecurityRail(state.zdr)
+        }
     }
 }
 

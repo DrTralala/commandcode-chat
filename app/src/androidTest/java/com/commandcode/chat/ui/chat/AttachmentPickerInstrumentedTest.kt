@@ -17,6 +17,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
@@ -98,7 +99,7 @@ class AttachmentPickerInstrumentedTest {
 
         compose.onNodeWithTag("attachment_error_box").assertIsDisplayed()
         compose.onNodeWithText("This model does not support attachments").assertIsDisplayed()
-        compose.onNodeWithText("Attachment support for this model has not been verified.").assertIsDisplayed()
+        compose.onNodeWithText("Attachment support for this model has not been verified.").assertDoesNotExist()
         assertEquals(0, harness.registry.launches.size)
     }
 
@@ -165,17 +166,92 @@ class AttachmentPickerInstrumentedTest {
         assertEquals(0, harness.operations.importCalls)
     }
 
+    @Test
+    fun manyAttachmentsStayAboveTheComposerWithTheRealKeyboardOpen() {
+        val harness = setRoot(allowImports = true)
+        compose.onNodeWithTag("attach_image").performClick()
+        val launch = harness.registry.launches.single()
+        compose.runOnIdle {
+            harness.registry.dispatchResult(launch.requestCode, (1..20).map { Uri.parse("content://fixture/$it") })
+        }
+        compose.waitUntil(5_000) {
+            harness.operations.importCalls == 20 &&
+                !compose.onNodeWithTag("message_composer").fetchSemanticsNode().config.contains(SemanticsProperties.Disabled)
+        }
+        compose.onNodeWithTag("message_composer").performClick().performTextInput("Line one\nLine two\nLine three\nLine four")
+        compose.waitUntil(5_000) {
+            androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)
+                ?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) == true
+        }
+        compose.onNodeWithTag("message_composer").assertIsDisplayed()
+        compose.onNodeWithTag("send_message").assertIsDisplayed()
+        compose.onNodeWithTag("pending_attachments").performScrollToIndex(19)
+        compose.onNodeWithTag("remove_attachment_20").assertIsDisplayed()
+        val input = compose.onNodeWithTag("message_composer").fetchSemanticsNode().boundsInRoot
+        val attachments = compose.onNodeWithTag("pending_attachments").fetchSemanticsNode().boundsInRoot
+        assertTrue("attachments must remain above input", attachments.bottom <= input.top)
+        compose.onNodeWithTag("bottom_navigation").assertDoesNotExist()
+        compose.runOnIdle {
+            val decor = compose.activity.window.decorView
+            val visibleFrame = android.graphics.Rect()
+            decor.getWindowVisibleDisplayFrame(visibleFrame)
+            val composeHost = compose.activity.findViewById<android.view.ViewGroup>(android.R.id.content).getChildAt(0)
+            val location = IntArray(2)
+            composeHost.getLocationOnScreen(location)
+            val gap = visibleFrame.bottom - (location[1] + input.bottom)
+            val maxGap = 24f * compose.activity.resources.displayMetrics.density
+            assertTrue("actual composer-to-keyboard gap must be 0..${maxGap}px, was $gap", gap in 0f..maxGap)
+        }
+        if (InstrumentationRegistry.getArguments().getString("capturePolishEvidence") == "true") {
+            val landscape = compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+            val screenshot = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
+            try {
+                java.io.File(compose.activity.cacheDir, "chat-polish-${if (landscape) "landscape" else "portrait"}.png")
+                    .outputStream().use { screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            } finally {
+                screenshot.recycle()
+            }
+        }
+    }
+
+    @Test
+    fun keyboardLeavesComposerDirectlyAboveImeAndHidesBottomNavigation() {
+        setRoot()
+        compose.onNodeWithTag("message_composer").performClick().performTextInput("Line one\nLine two")
+        compose.waitUntil(5_000) {
+            androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)
+                ?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) == true
+        }
+        compose.onNodeWithTag("bottom_navigation").assertDoesNotExist()
+        compose.onNodeWithTag("security_zdr_status").assertDoesNotExist()
+        val input = compose.onNodeWithTag("message_composer").fetchSemanticsNode().boundsInRoot
+        val send = compose.onNodeWithTag("send_message").fetchSemanticsNode().boundsInRoot
+        val root = compose.onNodeWithTag("app_inset_content").fetchSemanticsNode().boundsInRoot
+        assertTrue("send must share the composer row", send.center.y in input.top..input.bottom)
+        assertTrue("composer must be at the bottom of inset content: $input $root", root.bottom - input.bottom < 80f)
+        compose.runOnIdle {
+            androidx.core.view.WindowCompat.getInsetsController(compose.activity.window, compose.activity.window.decorView)
+                .hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+        }
+        compose.waitUntil(5_000) {
+            androidx.core.view.ViewCompat.getRootWindowInsets(compose.activity.window.decorView)
+                ?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) == false
+        }
+        compose.onNodeWithTag("bottom_navigation").assertIsDisplayed()
+        compose.onNodeWithTag("security_zdr_status").assertIsDisplayed()
+    }
+
     private data class RootHarness(
         val registry: RecordingActivityResultRegistry,
         val operations: RecordingAttachmentOperations,
         val unverified: ChatModel,
     )
 
-    private fun setRoot(): RootHarness {
+    private fun setRoot(allowImports: Boolean = false): RootHarness {
         val registry = RecordingActivityResultRegistry(
             InstrumentationRegistry.getInstrumentation().targetContext,
         )
-        val operations = RecordingAttachmentOperations()
+        val operations = RecordingAttachmentOperations(allowImports)
         val unverified = ChatModel("unverified/model", "Unverified model", ChatModel.SOL.apiFamily)
         val catalogue = TestCatalogue(unverified)
         val viewModel = AppViewModel(
@@ -270,13 +346,16 @@ class AttachmentPickerInstrumentedTest {
         override suspend fun clear() = Unit
     }
 
-    private class RecordingAttachmentOperations : AttachmentOperations {
+    private class RecordingAttachmentOperations(private val allowImports: Boolean) : AttachmentOperations {
         var importCalls = 0
 
         override suspend fun initialise() = Unit
         override suspend fun importImage(uri: Uri, modelId: String): ImageAttachment {
+            // Match the real importer's asynchronous IO before publishing its result.
+            kotlinx.coroutines.yield()
             importCalls += 1
-            error("stale result must not import")
+            check(allowImports) { "stale result must not import" }
+            return ImageAttachment(importCalls.toString(), "photo$importCalls.png", "image/png", 4, 37, 2, 2)
         }
         override suspend fun discard(images: List<ImageAttachment>) = Unit
         override suspend fun prepareTurn(
@@ -286,6 +365,9 @@ class AttachmentPickerInstrumentedTest {
             images: List<ImageAttachment>,
         ): PreparedAttachmentTurn = error("not expected")
         override suspend fun deleteConversation(id: String) = Unit
-        override suspend fun preview(id: String, maxEdge: Int) = error("not expected")
+        override suspend fun preview(id: String, maxEdge: Int): android.graphics.Bitmap {
+            check(allowImports)
+            return android.graphics.Bitmap.createBitmap(2, 2, android.graphics.Bitmap.Config.ARGB_8888)
+        }
     }
 }

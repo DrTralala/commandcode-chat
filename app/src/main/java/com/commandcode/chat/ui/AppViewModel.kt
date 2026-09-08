@@ -94,6 +94,9 @@ data class AppUiState(
         get() = streamingText.takeIf {
             it.isNotEmpty() && currentConversationId == activeConversationId
         }
+
+    val visibleThinking: Boolean
+        get() = sending && streamingText.isEmpty() && currentConversationId == activeConversationId
 }
 
 class AppViewModel(

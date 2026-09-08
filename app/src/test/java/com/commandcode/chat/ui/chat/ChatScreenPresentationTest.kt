@@ -81,14 +81,14 @@ class ChatScreenPresentationTest {
     }
 
     @Test
-    fun typedAttachmentErrorsUseSafeCopyAndKeepUnverifiedSupportSeparate() {
+    fun disabledModelsShowOnlyTheSimpleAttachmentError() {
         val unsupported = attachmentErrorCopy(AttachmentFailure.UNSUPPORTED_MODEL)
-        assertEquals(AttachmentPolicy.UNSUPPORTED_MESSAGE, unsupported.primary)
+        assertEquals("This model does not support attachments", unsupported.primary)
         assertNull(unsupported.secondary)
 
         val unverified = attachmentErrorCopy(AttachmentFailure.UNVERIFIED_MODEL)
-        assertEquals(AttachmentPolicy.UNSUPPORTED_MESSAGE, unverified.primary)
-        assertEquals("Attachment support for this model has not been verified.", unverified.secondary)
+        assertEquals("This model does not support attachments", unverified.primary)
+        assertNull(unverified.secondary)
     }
 
     @Test

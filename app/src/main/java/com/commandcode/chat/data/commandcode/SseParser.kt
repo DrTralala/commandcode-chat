@@ -23,15 +23,17 @@ class SseParser {
             val json = JSONObject(data)
             val choices = json.optJSONArray("choices")
             val delta = choices?.optJSONObject(0)?.optJSONObject("delta")
-            val content = delta?.takeIf { it.has("content") }?.getString("content")
-            if (!content.isNullOrEmpty()) listOf(StreamEvent.Delta(content))
-            else json.optJSONObject("usage")?.let { usage ->
-                listOf(StreamEvent.Usage(TokenUsage(
+            val content = delta?.takeIf { it.has("content") && !it.isNull("content") }?.getString("content")
+            buildList {
+                if (!content.isNullOrEmpty()) add(StreamEvent.Delta(content))
+                json.optJSONObject("usage")?.let { usage ->
+                    add(StreamEvent.Usage(TokenUsage(
                     usage.getLong("prompt_tokens"),
                     usage.optJSONObject("prompt_tokens_details")?.optLong("cached_tokens")?.takeIf { usage.optJSONObject("prompt_tokens_details")?.has("cached_tokens") == true },
                     usage.getLong("completion_tokens"),
-                )))
-            } ?: emptyList()
+                    )))
+                }
+            }
         } catch (_: JSONException) {
             listOf(StreamEvent.Error("MALFORMED_FRAME", "Malformed SSE frame"))
         } catch (_: RuntimeException) {

@@ -8,6 +8,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -77,8 +79,10 @@ class HistoryScreenComposeTest {
         val smallerTop = compose.onNodeWithTag("conversation_row_a").fetchSemanticsNode().boundsInRoot.top
         assertTrue("largest conversation should be first", largestTop < smallerTop)
 
-        compose.onNodeWithTag("delete_conversation_c").performClick()
-        compose.onNodeWithText("This removes the conversation and its encrypted attachment copies from this device.")
+        compose.onNodeWithTag("history_delete_mode").performClick()
+        compose.onNodeWithTag("select_conversation_c").performClick()
+        compose.onNodeWithTag("history_delete_selected").performClick()
+        compose.onNodeWithText("This removes the selected conversations and their encrypted attachment copies from this device.")
             .assertIsDisplayed()
     }
 
@@ -149,6 +153,46 @@ class HistoryScreenComposeTest {
 
         assertEquals(HistorySort.SMALLEST_FIRST, viewModel.state.value.historySort)
         compose.onNodeWithText("Smallest first").assertIsDisplayed()
+    }
+
+    @Test
+    fun selectionDeletesOnlyConfirmedIdsAndCancelNeverDeletes() {
+        val deleted = mutableListOf<String>()
+        val opened = mutableListOf<String>()
+        var selectedSort by mutableStateOf(HistorySort.MOST_RECENT)
+        var values by mutableStateOf(listOf(conversation("a"), conversation("b"), conversation("c")))
+        compose.setContent {
+            MaterialTheme {
+                HistoryScreen(values, selectedSort, { selectedSort = it }, { it }, opened::add, deleted::add)
+            }
+        }
+        compose.onNodeWithText("Estimated message and attachment storage; excludes shared database overhead.").assertDoesNotExist()
+        compose.onAllNodesWithText("Delete").assertCountEquals(0)
+        compose.onNodeWithText("a").performClick()
+        assertEquals(listOf("a"), opened)
+        compose.onNodeWithTag("history_delete_mode").performClick()
+        compose.onNodeWithTag("history_delete_selected").assertIsNotEnabled()
+        compose.onNodeWithTag("select_conversation_a").performClick()
+        compose.onNodeWithTag("select_conversation_c").performClick()
+        compose.onNodeWithTag("history_sort").performClick()
+        compose.onNodeWithText("Smallest first").performClick()
+        compose.onNodeWithTag("select_conversation_c").assertIsOn()
+        compose.onNodeWithTag("history_delete_selected").performClick()
+        compose.onNodeWithText("Delete 2 conversations?").assertIsDisplayed()
+        compose.onNodeWithText("Keep").performClick()
+        assertTrue(deleted.isEmpty())
+        compose.onNodeWithTag("history_cancel_selection").performClick()
+        compose.onAllNodesWithText("Delete").assertCountEquals(0)
+        compose.onNodeWithTag("history_delete_mode").performClick()
+        compose.onNodeWithTag("history_select_all").performClick()
+        compose.onNodeWithTag("select_conversation_b").performClick()
+        compose.runOnIdle { values = values.filterNot { it.id == "a" } }
+        compose.onNodeWithTag("history_delete_selected").performClick()
+        compose.onNodeWithText("Delete 1 conversation?").assertIsDisplayed()
+        compose.onNodeWithTag("confirm_delete_conversation").performClick()
+        assertEquals(listOf("c"), deleted)
+        assertEquals(listOf("a"), opened)
+        compose.onAllNodesWithText("Delete").assertCountEquals(0)
     }
 
     private fun conversation(

@@ -5,6 +5,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SseParserTest {
+    @Test fun `null answer during reasoning is not rendered as literal null`() {
+        val parser = SseParser()
+        assertTrue(parser.acceptLine("""data: {"choices":[{"delta":{"content":null,"reasoning_content":"private"}}]}""").isEmpty())
+        assertEquals(listOf(StreamEvent.Delta("Answer")), parser.acceptLine("""data: {"choices":[{"delta":{"content":"Answer"}}]}"""))
+    }
+
+    @Test fun `content and usage in the same frame are both retained`() {
+        assertEquals(
+            listOf(StreamEvent.Delta("Hi"), StreamEvent.Usage(TokenUsage(12, null, 4))),
+            SseParser().acceptLine("""data: {"choices":[{"delta":{"content":"Hi"}}],"usage":{"prompt_tokens":12,"completion_tokens":4}}"""),
+        )
+    }
+
     @Test fun `parses delta and usage`() {
         val parser = SseParser()
         assertEquals(listOf(StreamEvent.Delta("Hi")), parser.acceptLine("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}"))
