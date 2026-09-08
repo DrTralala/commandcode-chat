@@ -3,7 +3,7 @@
 # Command Code Chat
 
 [![CI](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml/badge.svg)](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml)
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v1.0.0)
+[![Version](https://img.shields.io/badge/version-v2.0.0-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v2.0.0)
 [![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
 
@@ -38,6 +38,16 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 - Offers a persistent AMOLED dark mode with true-black surfaces.
 - Uses distinct, aligned message bubbles for user and assistant messages.
 - Keeps chat, history, budget, and security settings in one native Jetpack Compose app.
+
+### Image attachments
+
+- JPEG, PNG and static WebP, up to 10 MB each and 20 images per chat (decimal MB).
+- Initially enabled for GPT-5.6 Sol, GPT-5.6 Luna and Gemini 3.7 Flash based on documentation; other models remain disabled until verified.
+- App-owned image copies are encrypted on this device, like chat history. The source gallery file is unchanged. Providers process sent images; this is not end-to-end encryption against the provider.
+- History shows estimated message/attachment storage and can sort largest/smallest first. Deleting a chat removes its encrypted attachment copies.
+- Command Code's request limits are undocumented; large requests may be rejected. PDF/document/audio/video inputs are not supported by this version.
+
+The documented capabilities above are not runtime-validated here; the app limits are not a gateway guarantee.
 
 ## How it works
 

@@ -4,6 +4,12 @@ import android.content.Context
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeClient
 import com.commandcode.chat.data.commandcode.StreamEvent
+import com.commandcode.chat.data.attachments.AndroidAttachmentKeyProvider
+import com.commandcode.chat.data.attachments.AttachmentOperations
+import com.commandcode.chat.data.attachments.AttachmentService
+import com.commandcode.chat.data.attachments.EncryptedAttachmentStore
+import com.commandcode.chat.data.attachments.ImageImporter
+import com.commandcode.chat.data.attachments.ImageInspector
 import com.commandcode.chat.data.database.ChatDatabase
 import com.commandcode.chat.data.database.ChatRepository
 import com.commandcode.chat.data.database.Conversation
@@ -20,7 +26,9 @@ import com.commandcode.chat.data.service.QuotaRepository
 import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.data.service.ServiceSnapshotStore
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
+import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.Flow
 import okhttp3.Call
@@ -41,7 +49,12 @@ interface ChatStore {
     fun observeConversations(): Flow<List<Conversation>>
     fun observeMessages(conversationId: String): Flow<List<Message>>
     suspend fun messagesSnapshot(conversationId: String): List<Message>
-    suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn
+    suspend fun beginTurn(
+        conversationId: String?,
+        text: String,
+        model: ChatModel,
+        attachments: List<ImageAttachment> = emptyList(),
+    ): PendingTurn
     suspend fun checkpointAssistant(messageId: String, text: String)
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String)
@@ -85,6 +98,15 @@ class AppContainer(
     val secretRepository = SecretRepository(encryptedStore)
     val chatDatabase = databaseFactory(applicationContext, DatabaseKeyManager(encryptedStore))
     val chatRepository = ChatRepository(chatDatabase)
+    private val attachmentFiles = EncryptedAttachmentStore(
+        File(applicationContext.noBackupFilesDir, "attachments"),
+        AndroidAttachmentKeyProvider(),
+    )
+    private val imageImporter = ImageImporter(
+        applicationContext.contentResolver,
+        ImageInspector(),
+        attachmentFiles,
+    )
     val commandCodeClient = clientFactory()
     private val serviceHttpClient = OkHttpClient.Builder()
         .followRedirects(false)
@@ -108,8 +130,12 @@ class AppContainer(
         override fun observeConversations() = chatRepository.observeConversations()
         override fun observeMessages(conversationId: String) = chatRepository.observeMessages(conversationId)
         override suspend fun messagesSnapshot(conversationId: String) = chatRepository.messagesSnapshot(conversationId)
-        override suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel) =
-            chatRepository.beginTurn(conversationId, text, model)
+        override suspend fun beginTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            attachments: List<ImageAttachment>,
+        ) = chatRepository.beginTurn(conversationId, text, model, attachments)
         override suspend fun checkpointAssistant(messageId: String, text: String) =
             chatRepository.checkpointAssistant(messageId, text)
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
@@ -119,6 +145,12 @@ class AppContainer(
             chatRepository.interruptTurn(messageId, partialText, reason)
         override suspend fun deleteConversation(id: String) = chatRepository.deleteConversation(id)
     }
+    val attachmentOperations: AttachmentOperations = AttachmentService(
+        chatStore = chatStore,
+        attachmentDao = chatDatabase.attachments(),
+        imageImporter = imageImporter,
+        files = attachmentFiles,
+    )
     val streamSource: StreamSource = streamSourceFactory?.invoke(commandCodeClient)
         ?: StreamSource(commandCodeClient::stream)
 }

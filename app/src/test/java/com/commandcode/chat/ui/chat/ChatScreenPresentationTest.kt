@@ -1,10 +1,18 @@
 package com.commandcode.chat.ui.chat
 
 import com.commandcode.chat.data.database.Conversation
+import com.commandcode.chat.domain.AttachmentFailure
+import com.commandcode.chat.domain.AttachmentPolicy
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.ui.AmoledAppColours
 import com.commandcode.chat.ui.AppUiState
 import com.commandcode.chat.ui.StandardAppColours
+import com.commandcode.chat.ui.attachmentPickerMimeTypes
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChatScreenPresentationTest {
@@ -52,6 +60,44 @@ class ChatScreenPresentationTest {
                     ),
                 ),
             ),
+        )
+    }
+
+    @Test
+    fun imageOnlyDraftEnablesSendWithoutChangingTextOnlyBehaviour() {
+        val image = ImageAttachment(
+            id = "image",
+            displayName = "photo.png",
+            mimeType = "image/png",
+            originalBytes = 4,
+            encryptedBytes = 37,
+            width = 2,
+            height = 2,
+        )
+
+        assertTrue(sendButtonEnabled(AppUiState(pendingAttachments = listOf(image))))
+        assertTrue(sendButtonEnabled(AppUiState(draftText = "hello")))
+        assertFalse(sendButtonEnabled(AppUiState()))
+    }
+
+    @Test
+    fun typedAttachmentErrorsUseSafeCopyAndKeepUnverifiedSupportSeparate() {
+        val unsupported = attachmentErrorCopy(AttachmentFailure.UNSUPPORTED_MODEL)
+        assertEquals(AttachmentPolicy.UNSUPPORTED_MESSAGE, unsupported.primary)
+        assertNull(unsupported.secondary)
+
+        val unverified = attachmentErrorCopy(AttachmentFailure.UNVERIFIED_MODEL)
+        assertEquals(AttachmentPolicy.UNSUPPORTED_MESSAGE, unverified.primary)
+        assertEquals("Attachment support for this model has not been verified.", unverified.secondary)
+    }
+
+    @Test
+    fun attachmentNamesRemoveControlsAndPickerUsesPolicyOrder() {
+        assertEquals("photo.png", safeAttachmentDisplayName(" photo\n.png "))
+        assertEquals("Image", safeAttachmentDisplayName("\u0000\n"))
+        assertArrayEquals(
+            arrayOf("image/jpeg", "image/png", "image/webp"),
+            attachmentPickerMimeTypes("gpt-5.6-sol"),
         )
     }
 }

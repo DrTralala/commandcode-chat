@@ -1,9 +1,11 @@
 package com.commandcode.chat.ui.chat
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -37,7 +39,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.commandcode.chat.R
 import com.commandcode.chat.data.database.Message
+import com.commandcode.chat.domain.AttachmentFailure
+import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.formatStorageBytes
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.ui.AppUiState
 
 internal fun modelOptionTestTag(apiId: String): String = buildString {
@@ -63,6 +69,20 @@ internal fun chatHeading(state: AppUiState): String {
     return state.conversations.firstOrNull { it.id == conversationId }?.title ?: "New Chat"
 }
 
+internal fun sendButtonEnabled(state: AppUiState): Boolean =
+    !state.sending &&
+        !state.importingAttachments &&
+        (state.draftText.isNotBlank() || state.pendingAttachments.isNotEmpty())
+
+internal fun safeAttachmentDisplayName(value: String): String {
+    val cleaned = buildString(value.length) {
+        value.forEach { character ->
+            if (Character.getType(character) != Character.CONTROL.toInt()) append(character)
+        }
+    }.trim()
+    return cleaned.ifEmpty { "Image" }
+}
+
 @Composable
 fun ChatScreen(
     state: AppUiState,
@@ -70,8 +90,12 @@ fun ChatScreen(
     onNewChat: () -> Unit,
     onSend: (String) -> Unit,
     onCancel: () -> Unit,
+    onDraftChange: (String) -> Unit,
+    onAttach: () -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    onDismissAttachmentError: () -> Unit,
+    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
 ) {
-    var draft by remember { mutableStateOf("") }
     var menuOpen by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
@@ -90,6 +114,7 @@ fun ChatScreen(
                 Box {
                     OutlinedIconButton(
                         onClick = { menuOpen = true },
+                        enabled = !state.sending && !state.importingAttachments,
                         modifier = Modifier
                             .size(48.dp)
                             .testTag("model_selector")
@@ -121,7 +146,6 @@ fun ChatScreen(
                 }
                 OutlinedIconButton(
                     onClick = {
-                        draft = ""
                         onNewChat()
                     },
                     enabled = !state.sending,
@@ -139,32 +163,93 @@ fun ChatScreen(
         }
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(state.visibleMessages, key = Message::id) { message ->
-                MessageRow(message.role, message.content, Modifier.testTag("message_${message.id}"))
+                MessageRow(
+                    message = message,
+                    loadAttachmentPreview = loadAttachmentPreview,
+                    modifier = Modifier.testTag("message_${message.id}"),
+                )
             }
             state.visibleStreamingText?.let { liveText ->
                 item {
                     MessageRow(
-                        "ASSISTANT",
-                        liveText,
-                        Modifier.testTag("active_assistant_response"),
+                        message = Message(
+                            id = "active_assistant_response",
+                            conversationId = state.activeConversationId.orEmpty(),
+                            role = "ASSISTANT",
+                            content = liveText,
+                            modelId = null,
+                            createdAt = Long.MAX_VALUE,
+                            status = "STREAMING",
+                        ),
+                        loadAttachmentPreview = loadAttachmentPreview,
+                        modifier = Modifier.testTag("active_assistant_response"),
                     )
                 }
             }
         }
-        state.errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        OutlinedTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            modifier = Modifier.fillMaxWidth().testTag("message_composer"),
-            label = { Text("Message") },
-            enabled = !state.sending,
-        )
+        state.attachmentError?.let { failure ->
+            AttachmentErrorBox(failure, onDismissAttachmentError)
+        }
+        state.errorMessage?.let { errorMessage ->
+            val typedMessage = state.attachmentError?.let { failure ->
+                when (failure) {
+                    AttachmentFailure.UNSUPPORTED_MODEL,
+                    AttachmentFailure.UNVERIFIED_MODEL,
+                    -> AttachmentPolicy.UNSUPPORTED_MESSAGE
+                    else -> attachmentErrorCopy(failure).primary
+                }
+            }
+            if (typedMessage == null || errorMessage != typedMessage) {
+                Text(errorMessage, color = MaterialTheme.colorScheme.error)
+            }
+        }
+        if (state.pendingAttachments.isNotEmpty()) {
+            Column(
+                modifier = Modifier.fillMaxWidth().testTag("pending_attachments"),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                state.pendingAttachments.forEach { image ->
+                    PendingAttachmentRow(
+                        image = image,
+                        enabled = !state.sending && !state.importingAttachments,
+                        onRemove = onRemoveAttachment,
+                        loadAttachmentPreview = loadAttachmentPreview,
+                    )
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = state.draftText,
+                onValueChange = onDraftChange,
+                modifier = Modifier.weight(1f).testTag("message_composer"),
+                label = { Text("Message") },
+                enabled = !state.sending && !state.importingAttachments,
+            )
+            OutlinedIconButton(
+                onClick = onAttach,
+                enabled = !state.sending && !state.importingAttachments,
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("attach_image")
+                    .semantics { contentDescription = "Attach image" },
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_paperclip),
+                    contentDescription = null,
+                )
+            }
+        }
         if (state.sending) {
             OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth().testTag("cancel_send")) { Text("Cancel") }
         } else {
             Button(
-                onClick = { val outgoing = draft; draft = ""; onSend(outgoing) },
-                enabled = draft.isNotBlank(),
+                onClick = { onSend(state.draftText) },
+                enabled = sendButtonEnabled(state),
                 modifier = Modifier.fillMaxWidth().testTag("send_message"),
             ) { Text("Send") }
         }
@@ -172,22 +257,100 @@ fun ChatScreen(
 }
 
 @Composable
-private fun MessageRow(role: String, content: String, modifier: Modifier = Modifier) {
-    val isUser = messageSide(role) == MessageSide.END
+private fun MessageRow(
+    message: Message,
+    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
+    modifier: Modifier = Modifier,
+) {
+    val isUser = messageSide(message.role) == MessageSide.END
     val colours = MaterialTheme.colorScheme
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
         Surface(
-            color = messageContainerColour(role, colours),
-            contentColor = messageContentColour(role, colours),
+            color = messageContainerColour(message.role, colours),
+            contentColor = messageContentColour(message.role, colours),
             tonalElevation = if (isUser) 1.dp else 3.dp,
             modifier = modifier
                 .fillMaxWidth(0.86f)
                 .semantics { contentDescription = if (isUser) "User message" else "Assistant message" },
         ) {
-            Text(content, modifier = Modifier.padding(12.dp))
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (message.content.isNotEmpty()) Text(message.content)
+                message.attachments.forEach { image ->
+                    SavedAttachmentRow(image, loadAttachmentPreview)
+                }
+            }
         }
     }
 }
+
+@Composable
+private fun PendingAttachmentRow(
+    image: ImageAttachment,
+    enabled: Boolean,
+    onRemove: (String) -> Unit,
+    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("pending_attachment_${image.id}"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        AttachmentPreview(
+            image = image,
+            maxEdge = THUMBNAIL_MAX_EDGE,
+            load = loadAttachmentPreview,
+            modifier = Modifier.defaultMinSize(minWidth = 72.dp, minHeight = 72.dp),
+        )
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = safeAttachmentDisplayName(image.displayName),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(formatStorageBytes(image.originalBytes), style = MaterialTheme.typography.labelSmall)
+        }
+        OutlinedButton(
+            onClick = { onRemove(image.id) },
+            enabled = enabled,
+            modifier = Modifier
+                .testTag("remove_attachment_${image.id}")
+                .semantics { contentDescription = "Remove ${safeAttachmentDisplayName(image.displayName)}" },
+        ) { Text("Remove") }
+    }
+}
+
+@Composable
+private fun SavedAttachmentRow(
+    image: ImageAttachment,
+    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("message_attachment_${image.id}"),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        AttachmentPreview(
+            image = image,
+            maxEdge = THUMBNAIL_MAX_EDGE,
+            load = loadAttachmentPreview,
+            modifier = Modifier.defaultMinSize(minWidth = 72.dp, minHeight = 72.dp),
+        )
+        Text(
+            text = safeAttachmentDisplayName(image.displayName),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(formatStorageBytes(image.originalBytes), style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+private const val THUMBNAIL_MAX_EDGE = 256

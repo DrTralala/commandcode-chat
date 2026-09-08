@@ -1,6 +1,8 @@
 package com.commandcode.chat
 
+import android.graphics.Bitmap
 import android.graphics.RectF
+import android.net.Uri
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.setContent
@@ -27,6 +29,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.StreamEvent
+import com.commandcode.chat.data.attachments.AttachmentOperations
+import com.commandcode.chat.data.attachments.PreparedAttachmentTurn
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
@@ -35,11 +39,13 @@ import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
 import com.commandcode.chat.ui.AppRoot
 import com.commandcode.chat.ui.AppViewModel
 import com.commandcode.chat.data.security.KeyRecoveryRequired
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
@@ -249,6 +255,7 @@ class AppSmokeTest {
             streamSource = StreamSource { _: CharArray, _: ChatModel, _: List<ApiMessage>, _: Boolean -> emptyFlow() },
             modelCatalogue = EmptyCatalogue(),
             quota = EmptyQuota(),
+            attachmentOperations = NoopAttachmentOperations(),
         )
         compose.activity.setContent { AppRoot(viewModel = viewModel) }
 
@@ -260,6 +267,39 @@ class AppSmokeTest {
         assertEquals(1, secrets.readCalls)
         assertEquals(0, secrets.mutationCalls)
         assertEquals(0, chats.mutationCalls)
+    }
+
+    @Test
+    fun injectedRootSendsThroughOfflineStreamWithoutCallingAProvider() {
+        val chats = OfflineChatStore()
+        val streamedContexts = mutableListOf<List<ApiMessage>>()
+        val viewModel = AppViewModel(
+            secrets = ConfiguredKeys(),
+            settings = TestSettings(),
+            chats = chats,
+            streamSource = StreamSource { _, _, messages, _ ->
+                streamedContexts += messages
+                flowOf(StreamEvent.Delta("offline response"), StreamEvent.Done)
+            },
+            modelCatalogue = EmptyCatalogue(),
+            quota = EmptyQuota(),
+            attachmentOperations = OfflineAttachmentOperations(chats),
+        )
+        compose.activity.setContent { AppRoot(viewModel = viewModel) }
+        compose.waitUntil(timeoutMillis = 5_000) {
+            compose.onAllNodesWithText("New Chat").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        compose.onNodeWithTag("message_composer").performTextInput("offline prompt")
+        compose.onNodeWithTag("send_message").performClick()
+        compose.waitUntil(timeoutMillis = 5_000) {
+            compose.onAllNodesWithText("offline response").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        assertEquals(1, streamedContexts.size)
+        assertEquals("offline prompt", streamedContexts.single().single().content)
+        assertEquals("offline response", chats.completedText)
+        assertTrue(viewModel.state.value.errorMessage == null)
     }
 
     private class FailingStartupSecrets : ApiKeyStore {
@@ -278,12 +318,55 @@ class AppSmokeTest {
         override var amoled = false
     }
 
+    private class ConfiguredKeys : ApiKeyStore {
+        override fun saveApiKey(value: CharArray) = Unit
+        override fun readApiKey(): CharArray = "offline-test-key".toCharArray()
+        override fun clearApiKey() = Unit
+    }
+
+    private class NoopAttachmentOperations : AttachmentOperations {
+        override suspend fun initialise() = Unit
+        override suspend fun importImage(uri: Uri, modelId: String): ImageAttachment =
+            error("not expected")
+        override suspend fun discard(images: List<ImageAttachment>) = Unit
+        override suspend fun prepareTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            images: List<ImageAttachment>,
+        ): PreparedAttachmentTurn = error("not expected")
+        override suspend fun deleteConversation(id: String) = Unit
+        override suspend fun preview(id: String, maxEdge: Int): Bitmap = error("not expected")
+    }
+
+    private class OfflineAttachmentOperations(private val chats: ChatStore) : AttachmentOperations {
+        override suspend fun initialise() = Unit
+        override suspend fun importImage(uri: Uri, modelId: String): ImageAttachment = error("not expected")
+        override suspend fun discard(images: List<ImageAttachment>) = Unit
+        override suspend fun prepareTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            images: List<ImageAttachment>,
+        ): PreparedAttachmentTurn = PreparedAttachmentTurn(
+            pending = chats.beginTurn(conversationId, text, model, images),
+            messages = listOf(ApiMessage("user", text)),
+        )
+        override suspend fun deleteConversation(id: String) = Unit
+        override suspend fun preview(id: String, maxEdge: Int): Bitmap = error("not expected")
+    }
+
     private class MutationRecordingChats : ChatStore {
         var mutationCalls = 0
         override fun observeConversations(): Flow<List<Conversation>> = flowOf(emptyList())
         override fun observeMessages(conversationId: String): Flow<List<Message>> = flowOf(emptyList())
         override suspend fun messagesSnapshot(conversationId: String): List<Message> = emptyList()
-        override suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn {
+        override suspend fun beginTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            attachments: List<ImageAttachment>,
+        ): PendingTurn {
             mutationCalls += 1
             error("not expected")
         }
@@ -294,6 +377,54 @@ class AppSmokeTest {
         }
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) { mutationCalls += 1 }
         override suspend fun deleteConversation(id: String) { mutationCalls += 1 }
+    }
+
+    private class OfflineChatStore : ChatStore {
+        private val conversations = MutableStateFlow<List<Conversation>>(emptyList())
+        private val messages = mutableMapOf<String, MutableStateFlow<List<Message>>>()
+        var completedText: String? = null
+
+        override fun observeConversations(): Flow<List<Conversation>> = conversations
+
+        override fun observeMessages(conversationId: String): Flow<List<Message>> =
+            messages[conversationId] ?: MutableStateFlow(emptyList())
+
+        override suspend fun messagesSnapshot(conversationId: String): List<Message> =
+            messages[conversationId]?.value.orEmpty()
+
+        override suspend fun beginTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            attachments: List<ImageAttachment>,
+        ): PendingTurn {
+            val id = conversationId ?: "offline-conversation"
+            val flow = messages.getOrPut(id) { MutableStateFlow(emptyList()) }
+            if (conversationId == null) {
+                conversations.value = listOf(Conversation(id, text, model.apiId, 1L, 2L))
+            }
+            val user = Message("offline-user-${flow.value.size}", id, "USER", text, null, flow.value.size.toLong() + 1, "COMPLETE", attachments)
+            val assistant = Message("offline-assistant-${flow.value.size}", id, "ASSISTANT", "", model.apiId, flow.value.size.toLong() + 2, "PENDING")
+            flow.value += user
+            flow.value += assistant
+            return PendingTurn(id, user.id, assistant.id)
+        }
+
+        override suspend fun checkpointAssistant(messageId: String, text: String) = Unit
+
+        override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
+            completedText = text
+            messages.values.forEach { flow ->
+                flow.value = flow.value.map { message ->
+                    if (message.id == messageId) message.copy(content = text, status = "COMPLETE") else message
+                }
+            }
+            return true
+        }
+
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
+
+        override suspend fun deleteConversation(id: String) = Unit
     }
 
     private class EmptyCatalogue : ModelCatalogueSource {

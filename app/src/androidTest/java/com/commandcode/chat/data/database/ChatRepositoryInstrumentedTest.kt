@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
@@ -15,6 +16,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ChatRepositoryInstrumentedTest {
@@ -58,6 +60,36 @@ class ChatRepositoryInstrumentedTest {
         assertNull(event.estimatedModelCost)
         assertNull(event.estimatedGoatCredits)
         assertTrue(!event.usageComplete)
+    }
+
+    @Test
+    fun imageOnlyTurnPersistsOwnedAttachmentMetadataAndCascadesOnConversationDelete() = runTest {
+        val (repository, database) = testRepository()
+        val image = ImageAttachment(
+            id = UUID.randomUUID().toString(),
+            displayName = "owned.png",
+            mimeType = "image/png",
+            originalBytes = 6L,
+            encryptedBytes = 39L,
+            width = 3,
+            height = 2,
+        )
+
+        val turn = repository.beginTurn(null, "", ChatModel.SOL, listOf(image))
+
+        val conversation = repository.observeConversations().first().single()
+        assertEquals("Image chat", conversation.title)
+        assertEquals(1, conversation.attachmentCount)
+        assertEquals(image.encryptedBytes, conversation.attachmentBytes)
+        val user = repository.messagesSnapshot(turn.conversationId).first { it.role == "USER" }
+        assertEquals("", user.content)
+        assertEquals(listOf(image), user.attachments)
+        assertEquals(listOf(image.id), database.attachments().listForConversation(turn.conversationId).map { it.id })
+
+        repository.deleteConversation(turn.conversationId)
+
+        assertTrue(database.attachments().listIds().isEmpty())
+        assertTrue(repository.observeConversations().first().isEmpty())
     }
 
     @Test

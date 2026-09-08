@@ -35,6 +35,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 
 class CommandCodeClientTest {
     @Test fun `default zdr and production request are sent through shared path`() = runBlocking {
@@ -95,6 +96,27 @@ class CommandCodeClientTest {
         try {
             val events = withTimeout(2_000) { CommandCodeClient(endpoint = server.url("/").toString()).stream(charArrayOf('k'), ChatModel.SOL, emptyList()).toList() }
             assertEquals(listOf(StreamEvent.Delta("ok"), StreamEvent.Done), events)
+        } finally { server.close() }
+    }
+
+    @Test fun `image request uses the same direct mock server stream path`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse(body = "data: [DONE]\n\n"))
+        server.start()
+        try {
+            val image = ApiImage("image/png", 3) { it.write("AQID".toByteArray()) }
+            val events = withTimeout(2_000) {
+                CommandCodeClient(endpoint = server.url("/").toString())
+                    .stream(charArrayOf('k'), ChatModel.SOL, listOf(ApiMessage("user", "look", listOf(image))))
+                    .toList()
+            }
+            val request = server.takeRequest()
+            val json = JSONObject(request.body!!.utf8())
+            val content = json.getJSONArray("messages").getJSONObject(0).getJSONArray("content")
+
+            assertEquals(listOf(StreamEvent.Done), events)
+            assertEquals("data:image/png;base64,AQID", content.getJSONObject(1).getJSONObject("image_url").getString("url"))
+            assertEquals("1", request.headers["x-cmd-zdr"])
         } finally { server.close() }
     }
 

@@ -3,14 +3,23 @@ package com.commandcode.chat.data.database
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase as FrameworkSQLiteDatabase
 import android.database.sqlite.SQLiteDatabaseCorruptException
+import android.database.sqlite.SQLiteException
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.commandcode.chat.data.attachments.AndroidImageTestFixtures
+import com.commandcode.chat.data.attachments.AttachmentService
+import com.commandcode.chat.data.attachments.ImageImporter
+import com.commandcode.chat.data.attachments.ImageInspector
+import com.commandcode.chat.data.attachments.OwnedImageSources
 import com.commandcode.chat.data.security.DatabaseKeyManager
 import com.commandcode.chat.data.security.EncryptedBlob
 import com.commandcode.chat.data.security.EncryptedBlobStore
 import com.commandcode.chat.data.security.DatabaseRecoveryRequired
 import com.commandcode.chat.data.security.KeystoreCipher
 import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
+import com.commandcode.chat.domain.ChatModel
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import org.junit.Test
 import org.junit.Assert.*
 import org.junit.runner.RunWith
@@ -192,6 +201,163 @@ class EncryptedDatabaseTest {
             }
         } finally {
             resources.cleanUp()
+        }
+    }
+
+    @Test
+    fun encryptedExportedV1MigratesToProductionV2AndReopensOwnedImageAfterSourceRevocation() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val environment = EncryptedTestEnvironment(context)
+        var migrated: ChatDatabase? = null
+        var reopened: ChatDatabase? = null
+        try {
+            // The fixture passphrase is generated and wrapped by the test-owned
+            // Android Keystore alias, then consumed again by ChatDatabase.open.
+            environment.keyManager.initialiseIfMissing()
+            assertTrue(environment.hasDatabaseAlias())
+            val wrapperBefore = requireNotNull(environment.blobStore.rawValue(environment.databaseBlobKey))
+            val databaseFile = context.getDatabasePath(environment.databaseName)
+            environment.keyManager.withPassphrase { passphrase ->
+                SqlCipherV1TestFixture.create(databaseFile, passphrase)
+            }
+
+            val v1Bytes = databaseFile.readBytes()
+            assertFalse(String(v1Bytes.copyOf(15), Charsets.US_ASCII).startsWith("SQLite format 3"))
+            assertThrows(SQLiteException::class.java) {
+                FrameworkSQLiteDatabase.openDatabase(
+                    databaseFile.path,
+                    null,
+                    FrameworkSQLiteDatabase.OPEN_READONLY,
+                ).use { plaintextDatabase ->
+                    plaintextDatabase.rawQuery("SELECT name FROM sqlite_master", null).use { cursor ->
+                        cursor.moveToFirst()
+                    }
+                }
+            }
+
+            val migratedDatabase = environment.openDatabase()
+            migrated = migratedDatabase
+            assertTrue(environment.hasDatabaseAlias())
+            assertEquals(wrapperBefore, environment.blobStore.rawValue(environment.databaseBlobKey))
+            assertEquals(
+                ConversationEntity(
+                    SqlCipherV1TestFixture.CONVERSATION_ID,
+                    "Migrated image history",
+                    "gpt-5.6-sol",
+                    1000L,
+                    2000L,
+                ),
+                migratedDatabase.conversations().find(SqlCipherV1TestFixture.CONVERSATION_ID),
+            )
+            assertEquals(
+                MessageEntity(
+                    SqlCipherV1TestFixture.USER_MESSAGE_ID,
+                    SqlCipherV1TestFixture.CONVERSATION_ID,
+                    "USER",
+                    "v1 prompt",
+                    null,
+                    3000L,
+                    "COMPLETE",
+                ),
+                migratedDatabase.messages().find(SqlCipherV1TestFixture.USER_MESSAGE_ID),
+            )
+            assertEquals(
+                MessageEntity(
+                    SqlCipherV1TestFixture.ASSISTANT_MESSAGE_ID,
+                    SqlCipherV1TestFixture.CONVERSATION_ID,
+                    "ASSISTANT",
+                    "v1 answer",
+                    "gpt-5.6-sol",
+                    4000L,
+                    "COMPLETE",
+                ),
+                migratedDatabase.messages().find(SqlCipherV1TestFixture.ASSISTANT_MESSAGE_ID),
+            )
+            assertEquals(
+                UsageEventEntity(
+                    SqlCipherV1TestFixture.USAGE_ID,
+                    SqlCipherV1TestFixture.ASSISTANT_MESSAGE_ID,
+                    SqlCipherV1TestFixture.CONVERSATION_ID,
+                    "gpt-5.6-luna",
+                    5000L,
+                    10L,
+                    2L,
+                    7L,
+                    "0.0001",
+                    "0.0002",
+                    true,
+                ),
+                migratedDatabase.usageEvents()
+                    .observeForConversation(SqlCipherV1TestFixture.CONVERSATION_ID)
+                    .first()
+                    .single(),
+            )
+
+            val migratedRepository = ChatRepository(migratedDatabase)
+            val attachmentFiles = environment.newAttachmentStore()
+            val attachmentService = AttachmentService(
+                chatStore = DatabaseChatStore(migratedRepository),
+                attachmentDao = migratedDatabase.attachments(),
+                imageImporter = ImageImporter(
+                    context.contentResolver,
+                    ImageInspector(),
+                    attachmentFiles,
+                ),
+                files = attachmentFiles,
+            )
+            attachmentService.initialise()
+            val source = OwnedImageSources.publish(AndroidImageTestFixtures.all().first())
+            val image = attachmentService.importImage(source.uri, ChatModel.SOL.apiId)
+            val turn = attachmentService.prepareTurn(
+                conversationId = SqlCipherV1TestFixture.CONVERSATION_ID,
+                text = "",
+                model = ChatModel.SOL,
+                images = listOf(image),
+            )
+            assertEquals(SqlCipherV1TestFixture.CONVERSATION_ID, turn.pending.conversationId)
+            assertEquals(1, turn.messages.single().images.size)
+
+            // The provider source is no longer available; the app-owned ciphertext is
+            // the only input used by the reopened service below.
+            OwnedImageSources.revoke(source)
+            assertFalse(OwnedImageSources.isAvailable(source.uri))
+            migratedDatabase.close()
+            migrated = null
+
+            val reopenedDatabase = environment.openDatabase()
+            reopened = reopenedDatabase
+            assertTrue(environment.hasDatabaseAlias())
+            assertEquals(wrapperBefore, environment.blobStore.rawValue(environment.databaseBlobKey))
+            val reopenedRepository = ChatRepository(reopenedDatabase)
+            val reloadedImage = reopenedRepository.messagesSnapshot(SqlCipherV1TestFixture.CONVERSATION_ID)
+                .flatMap { it.attachments }
+                .single { it.id == image.id }
+            assertEquals(image, reloadedImage)
+
+            val reopenedFiles = environment.newAttachmentStore()
+            val reopenedService = AttachmentService(
+                chatStore = DatabaseChatStore(reopenedRepository),
+                attachmentDao = reopenedDatabase.attachments(),
+                imageImporter = ImageImporter(
+                    context.contentResolver,
+                    ImageInspector(),
+                    reopenedFiles,
+                ),
+                files = reopenedFiles,
+            )
+            reopenedService.initialise()
+            val preview = reopenedService.preview(image.id, maxEdge = 256)
+            try {
+                assertEquals(image.width, preview.width)
+                assertEquals(image.height, preview.height)
+            } finally {
+                preview.recycle()
+            }
+        } finally {
+            reopened?.close()
+            migrated?.close()
+            OwnedImageSources.clear()
+            environment.cleanUp()
         }
     }
 

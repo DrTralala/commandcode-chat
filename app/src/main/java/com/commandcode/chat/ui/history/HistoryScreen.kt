@@ -1,6 +1,7 @@
 package com.commandcode.chat.ui.history
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -9,6 +10,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -26,25 +29,73 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.commandcode.chat.data.database.Conversation
 
+internal fun historySortLabel(sort: HistorySort): String = when (sort) {
+    HistorySort.MOST_RECENT -> "Most recent"
+    HistorySort.LARGEST_FIRST -> "Largest first"
+    HistorySort.SMALLEST_FIRST -> "Smallest first"
+}
+
 @Composable
 fun HistoryScreen(
     conversations: List<Conversation>,
+    sort: HistorySort,
+    onSortChange: (HistorySort) -> Unit,
     modelDisplayName: (String) -> String,
     onOpen: (String) -> Unit,
     onDelete: (String) -> Unit,
 ) {
     var pendingDelete by remember { mutableStateOf<Conversation?>(null) }
+    var sortMenuOpen by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().padding(16.dp).testTag("history_screen"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("History", style = MaterialTheme.typography.headlineSmall)
         Text("ENCRYPTED ON DEVICE", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
+        Text("Estimated message and attachment storage; excludes shared database overhead.")
+        Box {
+            OutlinedButton(
+                onClick = { sortMenuOpen = true },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("history_sort")
+                    .semantics {
+                        contentDescription = "Sort history. Current: ${historySortLabel(sort)}"
+                    },
+            ) { Text(historySortLabel(sort)) }
+            DropdownMenu(
+                expanded = sortMenuOpen,
+                onDismissRequest = { sortMenuOpen = false },
+                modifier = Modifier.testTag("history_sort_menu"),
+            ) {
+                HistorySort.entries.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(historySortLabel(option)) },
+                        onClick = {
+                            onSortChange(option)
+                            sortMenuOpen = false
+                        },
+                        modifier = Modifier.testTag("history_sort_option_${option.name}"),
+                    )
+                }
+            }
+        }
         if (conversations.isEmpty()) Text("No local conversations yet.")
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(conversations, key = Conversation::id) { conversation ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            items(sortConversations(conversations, sort), key = Conversation::id) { conversation ->
+                val sizeLabel = conversationSizeLabel(conversation)
+                Row(
+                    Modifier.fillMaxWidth().testTag("conversation_row_${conversation.id}"),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
                     TextButton(onClick = { onOpen(conversation.id) }, modifier = Modifier.weight(1f)) {
                         Column(Modifier.fillMaxWidth()) {
                             Text(conversation.title)
                             Text(modelDisplayName(conversation.defaultModelId), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall)
+                            Text(
+                                sizeLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.semantics {
+                                    contentDescription = "Estimated storage: $sizeLabel"
+                                },
+                            )
                         }
                     }
                     OutlinedButton(
@@ -61,7 +112,7 @@ fun HistoryScreen(
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("Delete conversation?") },
-            text = { Text("This permanently removes the encrypted local conversation.") },
+            text = { Text("This removes the conversation and its encrypted attachment copies from this device.") },
             confirmButton = {
                 TextButton(
                     onClick = { onDelete(conversation.id); pendingDelete = null },

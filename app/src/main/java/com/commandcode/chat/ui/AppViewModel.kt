@@ -1,5 +1,7 @@
 package com.commandcode.chat.ui
 
+import android.graphics.Bitmap
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -11,6 +13,7 @@ import com.commandcode.chat.StreamSource
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeException
 import com.commandcode.chat.data.commandcode.StreamEvent
+import com.commandcode.chat.data.attachments.AttachmentOperations
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
@@ -20,10 +23,18 @@ import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.data.service.ServiceException
+import com.commandcode.chat.domain.AttachmentException
+import com.commandcode.chat.domain.AttachmentFailure
+import com.commandcode.chat.domain.AttachmentPolicy
+import com.commandcode.chat.domain.AttachmentSupport
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
+import com.commandcode.chat.ui.chat.PickerTicket
+import com.commandcode.chat.ui.history.HistorySort
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -66,6 +77,11 @@ data class AppUiState(
     val sending: Boolean = false,
     val errorMessage: String? = null,
     val budget: BudgetUiState = BudgetUiState(),
+    val draftText: String = "",
+    val pendingAttachments: List<ImageAttachment> = emptyList(),
+    val importingAttachments: Boolean = false,
+    val attachmentError: AttachmentFailure? = null,
+    val historySort: HistorySort = HistorySort.MOST_RECENT,
 ) {
     val visibleMessages: List<Message>
         get() = if (currentConversationId == activeConversationId && activeAssistantMessageId != null) {
@@ -87,6 +103,7 @@ class AppViewModel(
     private val streamSource: StreamSource,
     private val modelCatalogue: ModelCatalogueSource,
     private val quota: QuotaSource,
+    private val attachmentOperations: AttachmentOperations,
     private val elapsedMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     private val apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
 ) : ViewModel() {
@@ -95,10 +112,17 @@ class AppViewModel(
 
     private var messageCollection: Job? = null
     private var sendJob: Job? = null
+    private var sendHandoff: CompletableDeferred<String?>? = null
+    private var attachmentImportJob: Job? = null
+    private var attachmentImportConversationId: String? = null
     private var quotaJob: Job? = null
     private val keyMutationMutex = Mutex()
     private var activeTurn: ActiveTurn? = null
     private var sendTargetConversationId: String? = null
+    private var draftGeneration = 0L
+    private var attachmentActionsReady = false
+    private var pendingModels: List<ChatModel>? = null
+    private val deletingConversationIds = mutableSetOf<String>()
 
     init {
         viewModelScope.launch {
@@ -125,6 +149,15 @@ class AppViewModel(
             } catch (_: Exception) {
                 null
             }
+            var attachmentFailure: AttachmentFailure? = null
+            try {
+                attachmentOperations.initialise()
+                attachmentActionsReady = true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                attachmentFailure = attachmentFailureOf(error, AttachmentFailure.STORAGE)
+            }
             mutableState.value = mutableState.value.copy(
                 loading = false,
                 recoveryMessage = recoveryMessage,
@@ -136,6 +169,8 @@ class AppViewModel(
                 budget = cachedQuota?.takeIf { configured }?.let {
                     BudgetUiState(snapshot = it, freshness = BudgetFreshness.STALE)
                 } ?: BudgetUiState(),
+                attachmentError = attachmentFailure,
+                errorMessage = attachmentFailure?.let(::safeAttachmentMessage),
             )
             refreshModels()
             if (configured && recoveryMessage == null) refreshQuota()
@@ -228,8 +263,139 @@ class AppViewModel(
         mutableState.value = mutableState.value.copy(amoled = enabled)
     }
 
+    fun updateDraft(text: String) {
+        val current = mutableState.value
+        if (selectionIsFrozen()) return
+        mutableState.value = current.copy(draftText = text)
+    }
+
+    fun requestAttachmentPicker(): PickerTicket? {
+        val current = mutableState.value
+        if (!attachmentActionsReady || current.loading || selectionIsFrozen()) {
+            return null
+        }
+        return when (AttachmentPolicy.capability(current.selectedModel.apiId).support) {
+            AttachmentSupport.DOCUMENTED -> PickerTicket(
+                generation = draftGeneration,
+                conversationId = current.currentConversationId,
+                modelId = current.selectedModel.apiId,
+            )
+            AttachmentSupport.UNSUPPORTED -> null.also {
+                publishAttachmentFailure(AttachmentFailure.UNSUPPORTED_MODEL)
+            }
+            AttachmentSupport.UNVERIFIED -> null.also {
+                publishAttachmentFailure(AttachmentFailure.UNVERIFIED_MODEL)
+            }
+        }
+    }
+
+    fun importAttachments(ticket: PickerTicket, uris: List<Uri>) {
+        if (!validatePickerTicket(ticket) || uris.isEmpty()) return
+        mutableState.value = mutableState.value.copy(importingAttachments = true)
+        attachmentImportConversationId = ticket.conversationId
+        attachmentImportJob = viewModelScope.launch {
+            try {
+                uris.forEach { uri ->
+                    ensurePickerStillCurrent(ticket)
+                    val current = mutableState.value
+                    val savedCount = current.conversations.firstOrNull {
+                        it.id == ticket.conversationId
+                    }?.attachmentCount ?: 0
+                    AttachmentPolicy.requireCount(
+                        saved = savedCount,
+                        pending = current.pendingAttachments.size,
+                        incoming = 1,
+                    )
+
+                    var imported: ImageAttachment? = null
+                    try {
+                        imported = attachmentOperations.importImage(uri, ticket.modelId)
+                        if (!isPickerCurrent(ticket)) {
+                            val stale = requireNotNull(imported)
+                            imported = null
+                            discardImportedSafely(stale)
+                            throw attachmentFailure(AttachmentFailure.STALE_SELECTION)
+                        }
+                        val accepted = requireNotNull(imported)
+                        mutableState.value = mutableState.value.copy(
+                            pendingAttachments = mutableState.value.pendingAttachments + accepted,
+                        )
+                    } catch (cancelled: CancellationException) {
+                        imported?.let { discardImportedSafely(it) }
+                        throw cancelled
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (isPickerCurrent(ticket)) {
+                    publishAttachmentFailure(attachmentFailureOf(error, AttachmentFailure.STORAGE))
+                }
+            } finally {
+                if (attachmentImportJob === currentCoroutineContext()[Job]) {
+                    attachmentImportJob = null
+                    attachmentImportConversationId = null
+                    mutableState.value = mutableState.value.copy(importingAttachments = false)
+                    applyPendingModelsIfIdle()
+                }
+            }
+        }
+    }
+
+    fun removeAttachment(id: String) {
+        val current = mutableState.value
+        if (selectionIsFrozen()) return
+        val image = current.pendingAttachments.firstOrNull { it.id == id } ?: return
+        val removalGeneration = nextDraftGeneration()
+        mutableState.value = current.copy(
+            pendingAttachments = current.pendingAttachments.filterNot { it.id == id },
+        )
+        viewModelScope.launch {
+            try {
+                withContext(NonCancellable) { attachmentOperations.discard(listOf(image)) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (draftGeneration == removalGeneration &&
+                    mutableState.value.pendingAttachments.none { it.id == id }
+                ) {
+                    mutableState.value = mutableState.value.copy(
+                        pendingAttachments = mutableState.value.pendingAttachments + image,
+                    )
+                    publishAttachmentFailure(attachmentFailureOf(error, AttachmentFailure.CLEANUP))
+                }
+            }
+        }
+    }
+
+    fun dismissAttachmentError() {
+        val current = mutableState.value
+        val wasAttachmentMessage = current.attachmentError?.let(::safeAttachmentMessage) == current.errorMessage
+        mutableState.value = current.copy(
+            attachmentError = null,
+            errorMessage = if (wasAttachmentMessage) null else current.errorMessage,
+        )
+    }
+
+    suspend fun loadAttachmentPreview(id: String, maxEdge: Int): Bitmap {
+        return try {
+            attachmentOperations.preview(id, maxEdge)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            publishAttachmentFailure(attachmentFailureOf(error, AttachmentFailure.STORAGE))
+            throw error
+        }
+    }
+
+    fun setHistorySort(sort: HistorySort) {
+        mutableState.value = mutableState.value.copy(historySort = sort)
+    }
+
     fun selectModel(model: ChatModel) {
+        if (selectionIsFrozen()) return
         val currentModel = mutableState.value.models.firstOrNull { it.apiId == model.apiId } ?: return
+        if (mutableState.value.selectedModel.apiId != currentModel.apiId) nextDraftGeneration()
         mutableState.value = mutableState.value.copy(selectedModel = currentModel)
     }
 
@@ -273,8 +439,47 @@ class AppViewModel(
 
     fun openConversation(id: String) {
         if (mutableState.value.currentConversationId == id) return
+        if (isCurrentConversationDeleting() || id in deletingConversationIds) return
+        showConversation(id, invalidateDraft = true)
+    }
+
+    fun newChat() {
+        if (isSendBusy() || isCurrentConversationDeleting()) return
+        invalidateAttachmentImport()
+        nextDraftGeneration()
+        discardCurrentDraft()
         messageCollection?.cancel()
-        mutableState.value = mutableState.value.copy(currentConversationId = id, messages = emptyList())
+        messageCollection = null
+        mutableState.value = mutableState.value.copy(
+            currentConversationId = null,
+            messages = emptyList(),
+            draftText = "",
+            pendingAttachments = emptyList(),
+            errorMessage = null,
+            attachmentError = null,
+            importingAttachments = attachmentImportJob != null,
+        )
+    }
+
+    private fun showConversation(id: String, invalidateDraft: Boolean) {
+        if (id in deletingConversationIds) return
+        if (invalidateDraft) {
+            invalidateAttachmentImport()
+            nextDraftGeneration()
+            discardCurrentDraft()
+        } else if (mutableState.value.currentConversationId != id) {
+            nextDraftGeneration()
+        }
+        messageCollection?.cancel()
+        mutableState.value = mutableState.value.copy(
+            currentConversationId = id,
+            messages = emptyList(),
+            draftText = "",
+            pendingAttachments = emptyList(),
+            errorMessage = null,
+            attachmentError = null,
+            importingAttachments = attachmentImportJob != null,
+        )
         messageCollection = viewModelScope.launch {
             chats.observeMessages(id).collectLatest { messages ->
                 mutableState.value = mutableState.value.copy(messages = messages)
@@ -282,82 +487,259 @@ class AppViewModel(
         }
     }
 
-    fun newChat() {
-        if (mutableState.value.sending) return
-        messageCollection?.cancel()
-        messageCollection = null
+    private fun discardCurrentDraft() {
+        val images = mutableState.value.pendingAttachments
+        if (images.isEmpty()) return
+        val generation = draftGeneration
+        viewModelScope.launch {
+            try {
+                withContext(NonCancellable) { attachmentOperations.discard(images) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (draftGeneration == generation) {
+                    publishAttachmentFailure(AttachmentFailure.CLEANUP)
+                }
+            }
+        }
+    }
+
+    private fun invalidateAttachmentImport() {
+        val job = attachmentImportJob
+        if (job != null) {
+            job.cancel()
+            if (job.isCompleted) {
+                attachmentImportJob = null
+                mutableState.value = mutableState.value.copy(importingAttachments = false)
+            } else {
+                // Keep the handle as a completion barrier until its NonCancellable
+                // discard path has finished.
+                mutableState.value = mutableState.value.copy(importingAttachments = true)
+            }
+        }
+    }
+
+    private fun validatePickerTicket(ticket: PickerTicket): Boolean {
+        val current = mutableState.value
+        if (!attachmentActionsReady ||
+            current.loading ||
+            selectionIsFrozen() ||
+            current.importingAttachments ||
+            ticket.conversationId in deletingConversationIds
+        ) {
+            if (current.importingAttachments) publishAttachmentFailure(AttachmentFailure.STALE_SELECTION)
+            return false
+        }
+        if (ticket.generation != draftGeneration ||
+            ticket.conversationId != current.currentConversationId ||
+            ticket.modelId != current.selectedModel.apiId
+        ) {
+            publishAttachmentFailure(AttachmentFailure.STALE_SELECTION)
+            return false
+        }
+        return when (AttachmentPolicy.capability(ticket.modelId).support) {
+            AttachmentSupport.DOCUMENTED -> true
+            AttachmentSupport.UNSUPPORTED -> false.also {
+                publishAttachmentFailure(AttachmentFailure.UNSUPPORTED_MODEL)
+            }
+            AttachmentSupport.UNVERIFIED -> false.also {
+                publishAttachmentFailure(AttachmentFailure.UNVERIFIED_MODEL)
+            }
+        }
+    }
+
+    private fun ensurePickerStillCurrent(ticket: PickerTicket) {
+        if (!isPickerCurrent(ticket)) throw attachmentFailure(AttachmentFailure.STALE_SELECTION)
+        if (AttachmentPolicy.capability(ticket.modelId).support != AttachmentSupport.DOCUMENTED) {
+            throw attachmentFailure(AttachmentFailure.UNVERIFIED_MODEL)
+        }
+    }
+
+    private fun isPickerCurrent(ticket: PickerTicket): Boolean {
+        val current = mutableState.value
+        return attachmentActionsReady &&
+            !current.loading &&
+            !isSendBusy() &&
+            !isConversationDeleting(ticket.conversationId) &&
+            ticket.generation == draftGeneration &&
+            ticket.conversationId == current.currentConversationId &&
+            ticket.modelId == current.selectedModel.apiId
+    }
+
+    private suspend fun discardImportedSafely(image: ImageAttachment) {
+        try {
+            withContext(NonCancellable) { attachmentOperations.discard(listOf(image)) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // The service retains failed cleanup ownership for reconciliation/retry.
+        }
+    }
+
+    private fun nextDraftGeneration(): Long {
+        draftGeneration += 1L
+        return draftGeneration
+    }
+
+    private fun isSendBusy(): Boolean = mutableState.value.sending || sendJob?.isActive == true
+
+    private fun isConversationDeleting(id: String?): Boolean = id != null && id in deletingConversationIds
+
+    private fun isCurrentConversationDeleting(): Boolean =
+        isConversationDeleting(mutableState.value.currentConversationId)
+
+    private fun selectionIsFrozen(): Boolean =
+        isSendBusy() ||
+            mutableState.value.importingAttachments ||
+            attachmentImportJob != null ||
+            isCurrentConversationDeleting()
+
+    private fun publishAttachmentFailure(failure: AttachmentFailure) {
         mutableState.value = mutableState.value.copy(
-            currentConversationId = null,
-            messages = emptyList(),
-            errorMessage = null,
+            attachmentError = failure,
+            errorMessage = safeAttachmentMessage(failure),
         )
     }
 
     fun deleteConversation(id: String) {
+        if (id in deletingConversationIds) return
+        val snapshot = mutableState.value
+        val ownsCurrentDraft = snapshot.currentConversationId == id
+        val draft = if (ownsCurrentDraft) snapshot.pendingAttachments.toList() else emptyList()
+        val targetsActiveSend = activeTurn?.pending?.conversationId == id || sendTargetConversationId == id
+        val unresolvedSendHandoff = if (sendTargetConversationId == null && sendJob?.isActive == true) {
+            sendHandoff
+        } else {
+            null
+        }
+        val importJobToJoin = if (attachmentImportConversationId == id) attachmentImportJob else null
+        deletingConversationIds += id
+        if (ownsCurrentDraft) {
+            // Reserve the draft and invalidate every picker ticket before the
+            // first suspension. The deletion job owns this snapshot until the
+            // database operation and its cleanup have settled.
+            nextDraftGeneration()
+            invalidateAttachmentImport()
+        } else {
+            importJobToJoin?.cancel()
+        }
         viewModelScope.launch {
-            val targetsActiveSend = activeTurn?.pending?.conversationId == id || sendTargetConversationId == id
             try {
-                if (targetsActiveSend) {
+                val handedOffSendTarget = unresolvedSendHandoff?.await()
+                if (targetsActiveSend || handedOffSendTarget == id) {
                     sendJob?.cancelAndJoin()
                 }
-                chats.deleteConversation(id)
-                if (mutableState.value.currentConversationId == id) {
+                if (importJobToJoin != null) {
+                    importJobToJoin.cancelAndJoin()
+                    if (attachmentImportJob === importJobToJoin) attachmentImportJob = null
+                }
+                var cleanupWarning: Throwable? = null
+                try {
+                    attachmentOperations.deleteConversation(id)
+                } catch (error: AttachmentException) {
+                    if (error.kind != AttachmentFailure.CLEANUP || error.databaseDeleted != true) throw error
+                    cleanupWarning = error
+                }
+
+                if (ownsCurrentDraft && mutableState.value.currentConversationId == id) {
                     messageCollection?.cancelAndJoin()
+                    messageCollection = null
                     mutableState.value = mutableState.value.copy(
                         currentConversationId = null,
                         messages = emptyList(),
+                        draftText = "",
+                        pendingAttachments = emptyList(),
+                        importingAttachments = false,
                     )
                 }
+                if (draft.isNotEmpty()) {
+                    try {
+                        withContext(NonCancellable) { attachmentOperations.discard(draft) }
+                    } catch (error: Exception) {
+                        cleanupWarning = cleanupWarning ?: error
+                    }
+                }
+                if (cleanupWarning != null) {
+                    publishAttachmentFailure(AttachmentFailure.CLEANUP)
+                    mutableState.value = mutableState.value.copy(
+                        errorMessage = ATTACHMENT_CLEANUP_WARNING,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 mutableState.value = mutableState.value.copy(
                     errorMessage = "Conversation could not be deleted. Try again.",
                 )
+            } finally {
+                deletingConversationIds -= id
+                applyPendingModelsIfIdle()
             }
         }
     }
 
     fun send(text: String) {
         val prompt = text.trim()
-        if (prompt.isEmpty() || sendJob?.isActive == true || !mutableState.value.keyConfigured) return
-        val selectedModel = mutableState.value.selectedModel
-        val zdr = mutableState.value.zdr
-        val requestedConversationId = mutableState.value.currentConversationId
+        val snapshot = mutableState.value
+        if ((prompt.isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
+            selectionIsFrozen() ||
+            !snapshot.keyConfigured
+        ) return
+        if (snapshot.draftText != text) {
+            mutableState.value = snapshot.copy(draftText = text)
+        }
+        val selectedModel = snapshot.selectedModel
+        val zdr = snapshot.zdr
+        val requestedConversationId = snapshot.currentConversationId
+        val snapshotImages = snapshot.pendingAttachments.toList()
+        val snapshotGeneration = draftGeneration
         sendTargetConversationId = requestedConversationId
+        val handoff = CompletableDeferred<String?>()
+        sendHandoff = handoff
         sendJob = viewModelScope.launch {
             var turn: ActiveTurn? = null
             var apiKey: CharArray? = null
             try {
                 mutableState.value = mutableState.value.copy(sending = true, streamingText = "", errorMessage = null)
-                val registeredTurn = withContext(NonCancellable) {
-                    val pending = chats.beginTurn(requestedConversationId, prompt, selectedModel)
-                    sendTargetConversationId = pending.conversationId
-                    ActiveTurn(pending).also { active ->
+                val registered = withContext(NonCancellable) {
+                    val prepared = attachmentOperations.prepareTurn(
+                        requestedConversationId,
+                        prompt,
+                        selectedModel,
+                        snapshotImages,
+                    )
+                    val active = ActiveTurn(
+                        pending = prepared.pending,
+                        draftGeneration = snapshotGeneration,
+                        draftImages = snapshotImages,
+                    ).also { active ->
                         turn = active
                         activeTurn = active
+                        sendTargetConversationId = prepared.pending.conversationId
                         mutableState.value = mutableState.value.copy(
-                            activeConversationId = pending.conversationId,
-                            activeAssistantMessageId = pending.assistantMessageId,
+                            activeConversationId = prepared.pending.conversationId,
+                            activeAssistantMessageId = prepared.pending.assistantMessageId,
+                        )
+                        handoff.complete(prepared.pending.conversationId)
+                    }
+                    if (draftGeneration == snapshotGeneration) {
+                        mutableState.value = mutableState.value.copy(
+                            draftText = "",
+                            pendingAttachments = emptyList(),
                         )
                     }
+                    RegisteredTurn(active, prepared.messages)
                 }
                 currentCoroutineContext().ensureActive()
+                val registeredTurn = registered.turn
                 val pending = registeredTurn.pending
-                if (requestedConversationId != pending.conversationId) openConversation(pending.conversationId)
-
-                val context = chats.messagesSnapshot(pending.conversationId)
-                    .asSequence()
-                    .filterNot { it.id == pending.assistantMessageId }
-                    .filter { it.content.isNotEmpty() }
-                    .mapNotNull { message ->
-                        when (message.role) {
-                            "USER" -> ApiMessage("user", message.content)
-                            "ASSISTANT" -> ApiMessage("assistant", message.content)
-                            else -> null
-                        }
-                    }
-                    .toList()
+                if (requestedConversationId != pending.conversationId &&
+                    mutableState.value.currentConversationId == requestedConversationId
+                ) {
+                    showConversation(pending.conversationId, invalidateDraft = false)
+                }
                 apiKey = secrets.readApiKey() ?: error("API key is not configured")
-                collectStream(registeredTurn, apiKey, selectedModel, context, zdr)
+                collectStream(registeredTurn, apiKey, selectedModel, registered.messages, zdr)
                 currentCoroutineContext().ensureActive()
                 withContext(NonCancellable) {
                     registeredTurn.completionCommitted = chats.completeTurn(
@@ -381,12 +763,21 @@ class AppViewModel(
                 if (turn?.completionCommitted != true) turn?.let { interruptSafely(it, "failed") }
                 if (error is KeyRecoveryRequired) {
                     finishTurn(turn, null, recoveryMessage = API_KEY_RECOVERY_MESSAGE)
+                } else if (error is AttachmentException) {
+                    val failure = error.kind
+                    finishTurn(turn, safeAttachmentMessage(failure), attachmentFailure = failure)
                 } else {
-                    finishTurn(turn, safeMessage(error))
+                    finishTurn(turn, if (turn == null) PREPARE_FAILURE_MESSAGE else safeMessage(error))
                 }
             } finally {
                 apiKey?.fill('\u0000')
+                handoff.complete(null)
+                if (sendHandoff === handoff) sendHandoff = null
                 sendTargetConversationId = null
+                if (sendJob === currentCoroutineContext()[Job]) {
+                    sendJob = null
+                    applyPendingModelsIfIdle()
+                }
             }
         }
     }
@@ -438,7 +829,12 @@ class AppViewModel(
         }
     }
 
-    private fun finishTurn(turn: ActiveTurn?, errorMessage: String?, recoveryMessage: String? = null) {
+    private fun finishTurn(
+        turn: ActiveTurn?,
+        errorMessage: String?,
+        recoveryMessage: String? = null,
+        attachmentFailure: AttachmentFailure? = null,
+    ) {
         if (turn == null || activeTurn?.pending?.assistantMessageId == turn.pending.assistantMessageId) {
             activeTurn = null
             mutableState.value = mutableState.value.copy(
@@ -448,6 +844,8 @@ class AppViewModel(
                 sending = false,
                 errorMessage = errorMessage,
                 recoveryMessage = recoveryMessage ?: mutableState.value.recoveryMessage,
+                attachmentError = attachmentFailure ?:
+                    if (errorMessage == null) null else mutableState.value.attachmentError,
             )
         }
     }
@@ -456,16 +854,33 @@ class AppViewModel(
         viewModelScope.launch {
             try {
                 val models = modelCatalogue.refresh().models.requireSolModel()
-                val selected = models.firstOrNull {
-                    it.apiId == mutableState.value.selectedModel.apiId
-                } ?: ChatModel.SOL
-                mutableState.value = mutableState.value.copy(models = models, selectedModel = selected)
+                if (selectionIsFrozen()) {
+                    pendingModels = models
+                } else {
+                    publishModels(models)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 // The validated local catalogue remains active when refresh fails.
             }
         }
+    }
+
+    private fun applyPendingModelsIfIdle() {
+        if (selectionIsFrozen()) return
+        pendingModels?.let { models ->
+            pendingModels = null
+            publishModels(models)
+        }
+    }
+
+    private fun publishModels(models: List<ChatModel>) {
+        val selected = models.firstOrNull {
+            it.apiId == mutableState.value.selectedModel.apiId
+        } ?: ChatModel.SOL
+        if (selected.apiId != mutableState.value.selectedModel.apiId) nextDraftGeneration()
+        mutableState.value = mutableState.value.copy(models = models, selectedModel = selected)
     }
 
     private fun safeQuotaMessage(error: Exception): String = when ((error as? ServiceException)?.kind) {
@@ -488,6 +903,7 @@ class AppViewModel(
         is CommandCodeException.ZdrUnavailable -> "No ZDR-capable provider is available"
         is CommandCodeException.RateLimited -> "Request rate or plan limit reached"
         is CommandCodeException.ServerFailure -> "Command Code service failure"
+        is AttachmentException -> safeAttachmentMessage(error.kind)
         is TurnFailure -> when (error.kind) {
             TurnFailureKind.EARLY_EOF -> "Response stream ended early. Partial response saved. Try again."
             TurnFailureKind.FRAME_ERROR -> "Response stream could not be read. Partial response saved. Try again."
@@ -497,11 +913,44 @@ class AppViewModel(
         else -> "The request could not be completed. Try again."
     }
 
+    private fun attachmentFailureOf(error: Throwable, fallback: AttachmentFailure): AttachmentFailure = when (error) {
+        is AttachmentException -> error.kind
+        is KeyRecoveryRequired -> AttachmentFailure.KEY_UNAVAILABLE
+        else -> fallback
+    }
+
+    private fun attachmentFailure(kind: AttachmentFailure, cause: Throwable? = null): AttachmentException =
+        AttachmentException(kind).also { if (cause != null) it.initCause(cause) }
+
+    private fun safeAttachmentMessage(failure: AttachmentFailure): String = when (failure) {
+        AttachmentFailure.UNSUPPORTED_MODEL,
+        AttachmentFailure.UNVERIFIED_MODEL,
+        -> AttachmentPolicy.UNSUPPORTED_MESSAGE
+        AttachmentFailure.INVALID_FORMAT -> "This image format is not supported. Choose JPEG, PNG, or WebP."
+        AttachmentFailure.CORRUPT_IMAGE -> "The image could not be read. Try another image."
+        AttachmentFailure.TOO_LARGE -> "This image is too large. The maximum is 10 MB."
+        AttachmentFailure.TOO_MANY -> "This chat already has the maximum number of images."
+        AttachmentFailure.EXCESSIVE_DIMENSIONS -> "This image exceeds the 8000-pixel dimension limit."
+        AttachmentFailure.ANIMATED_IMAGE -> "Animated images are not supported."
+        AttachmentFailure.STORAGE -> "Attachment storage is unavailable. Try again."
+        AttachmentFailure.KEY_UNAVAILABLE -> "Encrypted attachment storage requires recovery."
+        AttachmentFailure.STALE_SELECTION -> "This attachment selection is no longer current. Try again."
+        AttachmentFailure.INCOMPATIBLE_HISTORY -> "This chat contains incompatible attachment history."
+        AttachmentFailure.CLEANUP -> "Attachment cleanup could not be completed. Try again."
+    }
+
     private data class ActiveTurn(
         val pending: PendingTurn,
+        val draftGeneration: Long,
+        val draftImages: List<ImageAttachment>,
         val partial: StringBuilder = StringBuilder(),
         var usage: TokenUsage? = null,
         var completionCommitted: Boolean = false,
+    )
+
+    private data class RegisteredTurn(
+        val turn: ActiveTurn,
+        val messages: List<ApiMessage>,
     )
 
     private enum class StreamPhase { COLLECTING, DONE }
@@ -514,6 +963,9 @@ class AppViewModel(
         private const val API_KEY_RECOVERY_MESSAGE = "The encrypted API key cannot be opened. Recovery is required."
         private const val API_KEY_CLEAR_FAILURE_MESSAGE = "API key could not be cleared. Try again."
         private const val QUOTA_CACHE_CLEAR_FAILURE_MESSAGE = "Saved quota could not be cleared. Try again."
+        private const val PREPARE_FAILURE_MESSAGE = "The request could not be completed. Try again."
+        private const val ATTACHMENT_CLEANUP_WARNING =
+            "Conversation deleted, but encrypted attachment cleanup could not be completed."
 
         fun factory(container: AppContainer): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
@@ -524,6 +976,7 @@ class AppViewModel(
                 container.streamSource,
                 container.modelCatalogue,
                 container.quota,
+                container.attachmentOperations,
             ) as T
         }
     }

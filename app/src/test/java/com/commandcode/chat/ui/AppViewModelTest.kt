@@ -1,5 +1,7 @@
 package com.commandcode.chat.ui
 
+import android.graphics.Bitmap
+import android.net.Uri
 import androidx.lifecycle.viewModelScope
 import com.commandcode.chat.ApiKeyStore
 import com.commandcode.chat.ChatStore
@@ -8,6 +10,8 @@ import com.commandcode.chat.StreamSource
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeException
 import com.commandcode.chat.data.commandcode.StreamEvent
+import com.commandcode.chat.data.attachments.AttachmentOperations
+import com.commandcode.chat.data.attachments.PreparedAttachmentTurn
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
@@ -19,8 +23,11 @@ import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.data.service.RemainingQuota
 import com.commandcode.chat.data.service.ServiceException
 import com.commandcode.chat.data.service.UsedQuota
+import com.commandcode.chat.domain.AttachmentException
+import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
 import java.io.IOException
 import java.time.Instant
@@ -29,7 +36,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
@@ -973,6 +982,684 @@ class AppViewModelTest {
         assertEquals(BudgetFreshness.UNAVAILABLE, viewModel.state.value.budget.freshness)
     }
 
+    @Test
+    fun unsupportedOrUnverifiedModelReturnsNoPickerTicketAndTypedError() = runTest(dispatcher) {
+        val operations = FakeAttachmentOperations(FakeChats())
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL, model("model-1"))),
+        )
+        val viewModel = viewModel(
+            FakeChats(), successfulSource("unused"),
+            operations = operations,
+            catalogue = catalogue,
+        )
+        advanceUntilIdle()
+
+        viewModel.selectModel(model("model-1"))
+
+        assertNull(viewModel.requestAttachmentPicker())
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+        assertTrue(operations.imported.isEmpty())
+    }
+
+    @Test
+    fun pickerTicketIsInvalidatedByModelConversationAndUnsavedNewChatChanges() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("other") }
+        val operations = FakeAttachmentOperations(chats)
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL, model("model-1"))),
+        )
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations, catalogue = catalogue)
+        advanceUntilIdle()
+
+        val modelTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.selectModel(model("model-1"))
+        viewModel.importAttachments(modelTicket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        assertEquals(0, operations.imported.size)
+        assertEquals(AttachmentFailure.STALE_SELECTION, viewModel.state.value.attachmentError)
+
+        viewModel.selectModel(ChatModel.SOL)
+        val conversationTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.openConversation("other")
+        viewModel.importAttachments(conversationTicket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        assertEquals(0, operations.imported.size)
+        assertEquals(AttachmentFailure.STALE_SELECTION, viewModel.state.value.attachmentError)
+
+        viewModel.newChat()
+        val unsavedTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.newChat()
+        viewModel.importAttachments(unsavedTicket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        assertEquals(0, operations.imported.size)
+        assertEquals(AttachmentFailure.STALE_SELECTION, viewModel.state.value.attachmentError)
+    }
+
+    @Test
+    fun changingModelWhileDraftIsPendingRetainsImagesForLaterPreflight() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL, model("model-1"))),
+        )
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations, catalogue = catalogue)
+        advanceUntilIdle()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        val retained = viewModel.state.value.pendingAttachments
+        assertEquals(1, retained.size)
+
+        viewModel.selectModel(model("model-1"))
+
+        assertEquals(retained, viewModel.state.value.pendingAttachments)
+        assertNull(viewModel.requestAttachmentPicker())
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+    }
+
+    @Test
+    fun navigationInvalidatesAndDiscardsTheFormerDraftBeforeShowingAnotherConversation() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("other") }
+        val operations = FakeAttachmentOperations(chats)
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.updateDraft("discard on navigation")
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        val former = viewModel.state.value.pendingAttachments.single()
+
+        viewModel.openConversation("other")
+        assertEquals("other", viewModel.state.value.currentConversationId)
+        assertEquals("", viewModel.state.value.draftText)
+        assertTrue(viewModel.state.value.pendingAttachments.isEmpty())
+        advanceUntilIdle()
+
+        assertEquals(listOf(former), operations.discarded)
+    }
+
+    @Test
+    fun navigationCancelsFormerImportBeforeAcceptingAnewPickerResult() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("other") }
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            importEntered = entered
+            importRelease = release
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        val formerTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(formerTicket, listOf(Uri.EMPTY))
+        runCurrent()
+        entered.await()
+
+        viewModel.openConversation("other")
+        assertNull(viewModel.requestAttachmentPicker())
+        release.complete(Unit)
+        advanceUntilIdle()
+        val newTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(newTicket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+
+        assertEquals("other", viewModel.state.value.currentConversationId)
+        assertEquals(1, viewModel.state.value.pendingAttachments.size)
+        assertEquals(1, operations.imported.size)
+        assertTrue(operations.discarded.isEmpty())
+    }
+
+    @Test
+    fun imageOnlySendUsesAttachmentPreparationAndClearsDraftAfterRegistration() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val viewModel = viewModel(
+            chats,
+            StreamSource { _, _, messages, _ ->
+                operations.streamCalls++
+                operations.streamContextImages = messages.sumOf { it.images.size }
+                successfulEvents("answer")
+            },
+            operations = operations,
+        )
+        configureKey(viewModel)
+        advanceUntilIdle()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        viewModel.updateDraft("")
+
+        viewModel.send("")
+        advanceUntilIdle()
+
+        assertEquals(
+            "attachmentError=${viewModel.state.value.attachmentError}, importing=${viewModel.state.value.importingAttachments}, calls=${operations.importCalls}",
+            1,
+            operations.prepared.size,
+        )
+        assertEquals(1, operations.prepared.single().images.size)
+        assertEquals(1, operations.preparedContexts.single().last().images.size)
+        assertEquals(1, chats.beginTurnCalls)
+        assertEquals(1, operations.streamContextImages)
+        assertEquals(1, operations.streamCalls)
+        assertEquals("", viewModel.state.value.draftText)
+        assertTrue(viewModel.state.value.pendingAttachments.isEmpty())
+    }
+
+    @Test
+    fun preflightFailureRetainsTextAndImagesAndDoesNotStartStream() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            prepareFailure = AttachmentException(AttachmentFailure.INCOMPATIBLE_HISTORY)
+        }
+        val viewModel = viewModel(chats, successfulSource("must-not-run"), operations = operations)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        viewModel.updateDraft("preserve me")
+        val before = viewModel.state.value.pendingAttachments
+
+        viewModel.send("preserve me")
+        advanceUntilIdle()
+
+        assertEquals("preserve me", viewModel.state.value.draftText)
+        assertEquals(before, viewModel.state.value.pendingAttachments)
+        assertEquals(AttachmentFailure.INCOMPATIBLE_HISTORY, viewModel.state.value.attachmentError)
+        assertEquals(0, operations.streamCalls)
+        assertEquals(0, chats.beginTurnCalls)
+    }
+
+    @Test
+    fun persistenceFailureDuringAttachmentPreparationRetainsDraftAndDoesNotStream() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            prepareFailure = IOException("database failure")
+        }
+        val viewModel = viewModel(chats, successfulSource("must-not-run"), operations = operations)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        viewModel.updateDraft("retain on persistence failure")
+
+        viewModel.send("retain on persistence failure")
+        advanceUntilIdle()
+
+        assertEquals("retain on persistence failure", viewModel.state.value.draftText)
+        assertTrue(viewModel.state.value.pendingAttachments.isEmpty())
+        assertEquals(0, operations.streamCalls)
+        assertEquals(0, chats.beginTurnCalls)
+    }
+
+    @Test
+    fun draftIsRetainedUntilCommittedTurnIsRegistered() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            prepareEntered = entered
+            prepareRelease = release
+        }
+        val viewModel = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(viewModel)
+        viewModel.updateDraft("commit me")
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        viewModel.send("commit me")
+        runCurrent()
+        entered.await()
+
+        assertEquals("commit me", viewModel.state.value.draftText)
+        assertEquals(1, viewModel.state.value.pendingAttachments.size)
+
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("", viewModel.state.value.draftText)
+    }
+
+    @Test
+    fun sendReservesDraftAgainstImmediateMutationBeforeCoroutineStarts() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            prepareEntered = entered
+            prepareRelease = release
+        }
+        val viewModel = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(viewModel)
+        viewModel.updateDraft("first")
+
+        viewModel.send("first")
+        viewModel.updateDraft("second")
+
+        assertEquals("first", viewModel.state.value.draftText)
+
+        release.complete(Unit)
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun cancellationAfterCommittedRegistrationInterruptsPendingTurn() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val viewModel = viewModel(
+            chats,
+            StreamSource { _, _, _, _ -> flow {
+                emit(StreamEvent.Delta("partial"))
+                awaitCancellation()
+            } },
+            operations = operations,
+        )
+        configureKey(viewModel)
+        viewModel.updateDraft("cancel me")
+        viewModel.send("cancel me")
+        runCurrent()
+
+        viewModel.cancel()
+        advanceUntilIdle()
+
+        assertEquals("partial", chats.interruptedText)
+        assertFalse(viewModel.state.value.sending)
+        assertEquals("", viewModel.state.value.draftText)
+    }
+
+    @Test
+    fun modelSelectionIsFrozenUntilImportSettles() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL, model("model-1"))),
+        )
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations, catalogue = catalogue)
+        advanceUntilIdle()
+        val firstTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(firstTicket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        val previous = viewModel.state.value.pendingAttachments.single()
+
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        operations.importEntered = entered
+        operations.importRelease = release
+        val staleTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(staleTicket, listOf(Uri.EMPTY))
+        runCurrent()
+        entered.await()
+
+        viewModel.selectModel(model("model-1"))
+        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf(previous, operations.imported.last()), viewModel.state.value.pendingAttachments)
+        assertTrue(operations.discarded.isEmpty())
+    }
+
+    @Test
+    fun importStopsAtTwentySavedPlusPendingImagesAndKeepsEarlierSelection() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("full") }
+        chats.conversations.value = chats.conversations.value.map {
+            if (it.id == "full") it.copy(attachmentCount = 19) else it
+        }
+        val operations = FakeAttachmentOperations(chats)
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("full")
+        runCurrent()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+
+        viewModel.importAttachments(
+            ticket,
+            listOf(Uri.EMPTY, Uri.EMPTY),
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            "attachmentError=${viewModel.state.value.attachmentError}, importing=${viewModel.state.value.importingAttachments}, calls=${operations.importCalls}",
+            1,
+            operations.imported.size,
+        )
+        assertEquals(1, viewModel.state.value.pendingAttachments.size)
+        assertEquals(AttachmentFailure.TOO_MANY, viewModel.state.value.attachmentError)
+    }
+
+    @Test
+    fun attachmentInitialisationFailureDisablesAttachmentActionsWithTypedSafeError() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            initialiseFailure = AttachmentException(AttachmentFailure.KEY_UNAVAILABLE)
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.loading)
+        assertEquals(AttachmentFailure.KEY_UNAVAILABLE, viewModel.state.value.attachmentError)
+        assertNull(viewModel.requestAttachmentPicker())
+        assertTrue(operations.imported.isEmpty())
+    }
+
+    @Test
+    fun attachmentActionsRemainDisabledUntilInitialisationCompletes() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            initialiseEntered = entered
+            initialiseRelease = release
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        runCurrent()
+        entered.await()
+
+        assertTrue(viewModel.state.value.loading)
+        assertNull(viewModel.requestAttachmentPicker())
+
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.loading)
+        assertTrue(viewModel.requestAttachmentPicker() != null)
+    }
+
+    @Test
+    fun cleanupWarningClearsDeletedConversationWithoutClaimingReclaimedBytes() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val operations = FakeAttachmentOperations(chats).apply {
+            deleteFailure = AttachmentException(AttachmentFailure.CLEANUP, databaseDeleted = true)
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("conversation")
+        runCurrent()
+
+        viewModel.deleteConversation("conversation")
+        advanceUntilIdle()
+
+        assertNull(viewModel.state.value.currentConversationId)
+        assertEquals(AttachmentFailure.CLEANUP, viewModel.state.value.attachmentError)
+        assertEquals(listOf("conversation"), operations.deleted)
+        assertTrue(!viewModel.state.value.errorMessage.orEmpty().contains("reclaim", ignoreCase = true))
+        assertTrue(!viewModel.state.value.errorMessage.orEmpty().contains("bytes", ignoreCase = true))
+    }
+
+    @Test
+    fun catalogueRefreshDuringImportDefersSelectionAndSettlesImport() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val refreshEntered = CompletableDeferred<Unit>()
+        val refreshRelease = CompletableDeferred<Unit>()
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL, ChatModel.LUNA)),
+            remote = catalogueSnapshot(version = "remote", models = listOf(ChatModel.SOL)),
+        ).apply {
+            refreshBlock = {
+                refreshEntered.complete(Unit)
+                refreshRelease.await()
+                remote
+            }
+        }
+        val importEntered = CompletableDeferred<Unit>()
+        val importRelease = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            this.importEntered = importEntered
+            this.importRelease = importRelease
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), catalogue = catalogue, operations = operations)
+        runCurrent()
+        refreshEntered.await()
+
+        viewModel.selectModel(ChatModel.LUNA)
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        runCurrent()
+        importEntered.await()
+
+        refreshRelease.complete(Unit)
+        runCurrent()
+
+        assertEquals(ChatModel.LUNA, viewModel.state.value.selectedModel)
+        assertTrue(viewModel.state.value.importingAttachments)
+
+        importRelease.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertFalse(viewModel.state.value.importingAttachments)
+        assertEquals(1, viewModel.state.value.pendingAttachments.size)
+    }
+
+    @Test
+    fun catalogueRefreshDuringPrepareDefersSelectionAndClearsCommittedDraft() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val refreshEntered = CompletableDeferred<Unit>()
+        val refreshRelease = CompletableDeferred<Unit>()
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL, ChatModel.LUNA)),
+            remote = catalogueSnapshot(version = "remote", models = listOf(ChatModel.SOL)),
+        ).apply {
+            refreshBlock = {
+                refreshEntered.complete(Unit)
+                refreshRelease.await()
+                remote
+            }
+        }
+        val operations = FakeAttachmentOperations(chats)
+        val viewModel = viewModel(
+            chats,
+            successfulSource("answer"),
+            catalogue = catalogue,
+            operations = operations,
+        )
+        runCurrent()
+        refreshEntered.await()
+        viewModel.selectModel(ChatModel.LUNA)
+        viewModel.openConversation("conversation")
+        runCurrent()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        viewModel.updateDraft("preserve until commit")
+
+        val prepareEntered = CompletableDeferred<Unit>()
+        val prepareRelease = CompletableDeferred<Unit>()
+        operations.prepareEntered = prepareEntered
+        operations.prepareRelease = prepareRelease
+        configureKey(viewModel)
+        viewModel.send("preserve until commit")
+        runCurrent()
+        prepareEntered.await()
+
+        refreshRelease.complete(Unit)
+        runCurrent()
+
+        assertEquals(ChatModel.LUNA, viewModel.state.value.selectedModel)
+        assertEquals("preserve until commit", viewModel.state.value.draftText)
+        assertEquals(1, viewModel.state.value.pendingAttachments.size)
+
+        prepareRelease.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertEquals("", viewModel.state.value.draftText)
+        assertTrue(viewModel.state.value.pendingAttachments.isEmpty())
+    }
+
+    @Test
+    fun deletionReservesCurrentDraftAndBlocksConcurrentEntriesUntilComplete() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val operations = FakeAttachmentOperations(chats).apply {
+            deleteEntered = CompletableDeferred()
+            deleteRelease = CompletableDeferred()
+        }
+        val viewModel = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        viewModel.openConversation("conversation")
+        runCurrent()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        viewModel.updateDraft("delete me")
+
+        viewModel.deleteConversation("conversation")
+        runCurrent()
+        operations.deleteEntered!!.await()
+
+        assertNull(viewModel.requestAttachmentPicker())
+        viewModel.send("escape")
+        assertEquals(0, operations.prepared.size)
+        assertEquals(1, operations.imported.size)
+        assertEquals("delete me", viewModel.state.value.draftText)
+
+        operations.deleteRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertNull(viewModel.state.value.currentConversationId)
+        assertTrue(viewModel.state.value.pendingAttachments.isEmpty())
+        assertEquals(0, operations.prepared.size)
+    }
+
+    @Test
+    fun deletingNewConversationWaitsForSendRegistrationBeforeServiceDelete() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            prepareEntered = CompletableDeferred()
+            prepareRelease = CompletableDeferred()
+            deleteEntered = CompletableDeferred()
+        }
+        val viewModel = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(viewModel)
+        advanceUntilIdle()
+
+        viewModel.send("unsaved conversation")
+        runCurrent()
+        operations.prepareEntered!!.await()
+        assertEquals("conversation", chats.conversations.value.single().id)
+
+        viewModel.deleteConversation("conversation")
+        runCurrent()
+
+        assertFalse(operations.deleteEntered!!.isCompleted)
+
+        operations.prepareRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf("prepare-return", "delete"), operations.events)
+        assertNull(viewModel.state.value.currentConversationId)
+    }
+
+    @Test
+    fun deletingFormerConversationWaitsForNavigationCancelledImportCleanup() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("conversation")
+            addConversation("other")
+        }
+        val operations = FakeAttachmentOperations(chats).apply {
+            importEntered = CompletableDeferred()
+            importRelease = CompletableDeferred()
+            importIgnoresCancellation = true
+            deleteEntered = CompletableDeferred()
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("conversation")
+        runCurrent()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        runCurrent()
+        operations.importEntered!!.await()
+
+        viewModel.openConversation("other")
+        viewModel.deleteConversation("conversation")
+        runCurrent()
+
+        assertFalse(operations.deleteEntered!!.isCompleted)
+
+        operations.importRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(operations.events.indexOf("discard") < operations.events.indexOf("delete"))
+        assertTrue(chats.conversations.value.none { it.id == "conversation" })
+        assertEquals("other", viewModel.state.value.currentConversationId)
+    }
+
+    @Test
+    fun preDatabaseCleanupFailurePreservesCurrentConversationAndDraft() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val operations = FakeAttachmentOperations(chats).apply {
+            deleteFailure = AttachmentException(AttachmentFailure.CLEANUP, databaseDeleted = false)
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.updateDraft("keep on failure")
+
+        viewModel.deleteConversation("conversation")
+        advanceUntilIdle()
+
+        assertEquals("conversation", viewModel.state.value.currentConversationId)
+        assertEquals("keep on failure", viewModel.state.value.draftText)
+        assertEquals("Conversation could not be deleted. Try again.", viewModel.state.value.errorMessage)
+    }
+
+    @Test
+    fun cancelledImportCleanupSettlesBeforeNewPickerIsAccepted() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("other") }
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            importEntered = entered
+            importRelease = release
+            importIgnoresCancellation = true
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        val formerTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(formerTicket, listOf(Uri.EMPTY))
+        runCurrent()
+        entered.await()
+
+        viewModel.openConversation("other")
+
+        assertTrue(viewModel.state.value.importingAttachments)
+        assertNull(viewModel.requestAttachmentPicker())
+
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        val newTicket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(newTicket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+
+        assertEquals(1, viewModel.state.value.pendingAttachments.size)
+        assertEquals(2, operations.imported.size)
+        assertEquals(1, operations.discarded.size)
+        assertTrue(operations.discarded.single().id != viewModel.state.value.pendingAttachments.single().id)
+    }
+
+    @Test
+    fun preflightIOExceptionUsesNonStreamingSafeMessage() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            prepareFailure = IOException("database failure")
+        }
+        val viewModel = viewModel(chats, successfulSource("must-not-run"), operations = operations)
+        configureKey(viewModel)
+        advanceUntilIdle()
+
+        viewModel.send("before stream")
+        advanceUntilIdle()
+
+        assertEquals("The request could not be completed. Try again.", viewModel.state.value.errorMessage)
+        assertFalse(viewModel.state.value.errorMessage.orEmpty().contains("Partial response"))
+        assertFalse(viewModel.state.value.errorMessage.orEmpty().contains("Network stream"))
+        assertEquals(0, operations.streamCalls)
+    }
+
     private fun successfulSource(answer: String) = StreamSource { _, _, _, _ -> successfulEvents(answer) }
     private fun successfulEvents(answer: String) = flowOf(
         StreamEvent.Delta(answer), StreamEvent.Usage(TokenUsage(1, 0, 1)), StreamEvent.Done,
@@ -995,6 +1682,7 @@ class AppViewModelTest {
         quota: FakeQuota = FakeQuota(),
         settings: SettingsStore = FakeSettings(),
         apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
+        operations: FakeAttachmentOperations = FakeAttachmentOperations(chats),
     ) = AppViewModel(
         secrets = keys,
         settings = settings,
@@ -1002,6 +1690,7 @@ class AppViewModelTest {
         streamSource = source,
         modelCatalogue = catalogue,
         quota = quota,
+        attachmentOperations = operations,
         elapsedMillis = elapsedMillis,
         apiKeyCopier = apiKeyCopier,
     )
@@ -1113,6 +1802,129 @@ class AppViewModelTest {
     ) : SettingsStore {
     }
 
+    private class FakeAttachmentOperations(
+        private val chats: FakeChats,
+    ) : AttachmentOperations {
+        var initialiseFailure: Exception? = null
+        var initialiseEntered: CompletableDeferred<Unit>? = null
+        var initialiseRelease: CompletableDeferred<Unit>? = null
+        var prepareFailure: Exception? = null
+        var importFailure: Exception? = null
+        var discardFailure: Exception? = null
+        var deleteFailure: Exception? = null
+        var importEntered: CompletableDeferred<Unit>? = null
+        var importRelease: CompletableDeferred<Unit>? = null
+        var importIgnoresCancellation = false
+        var deleteEntered: CompletableDeferred<Unit>? = null
+        var deleteRelease: CompletableDeferred<Unit>? = null
+        var prepareEntered: CompletableDeferred<Unit>? = null
+        var prepareRelease: CompletableDeferred<Unit>? = null
+        val imported = mutableListOf<ImageAttachment>()
+        val discarded = mutableListOf<ImageAttachment>()
+        val prepared = mutableListOf<PreparedRequest>()
+        val preparedContexts = mutableListOf<List<ApiMessage>>()
+        val deleted = mutableListOf<String>()
+        val events = mutableListOf<String>()
+        var importCalls = 0
+        var streamCalls = 0
+        var streamContextImages = 0
+        private var id = 0
+
+        override suspend fun initialise() {
+            initialiseEntered?.complete(Unit)
+            initialiseRelease?.await()
+            initialiseFailure?.let { throw it }
+        }
+
+        override suspend fun importImage(uri: Uri, modelId: String): ImageAttachment {
+            importCalls++
+            importFailure?.let { throw it }
+            importEntered?.complete(Unit)
+            if (importIgnoresCancellation) {
+                withContext(NonCancellable) { importRelease?.await() }
+            } else {
+                importRelease?.await()
+            }
+            val image = ImageAttachment(
+                id = "00000000-0000-0000-0000-${(++id).toString().padStart(12, '0')}",
+                displayName = "Image.png",
+                mimeType = "image/png",
+                originalBytes = 4,
+                encryptedBytes = 37,
+                width = 2,
+                height = 2,
+            )
+            imported += image
+            events += "import-return"
+            return image
+        }
+
+        override suspend fun discard(images: List<ImageAttachment>) {
+            discardFailure?.let { throw it }
+            discarded += images
+            events += "discard"
+        }
+
+        override suspend fun prepareTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            images: List<ImageAttachment>,
+        ): PreparedAttachmentTurn {
+            prepareFailure?.let { throw it }
+            val history = conversationId?.let { chats.messagesSnapshot(it) }.orEmpty()
+            val context = history.mapNotNull { message ->
+                when (message.role) {
+                    "USER" -> ApiMessage(
+                        "user",
+                        message.content,
+                        message.attachments.map { com.commandcode.chat.data.commandcode.ApiImage(it.mimeType, it.originalBytes) {} },
+                    )
+                    "ASSISTANT" -> ApiMessage("assistant", message.content)
+                    else -> null
+                }.takeIf { message.content.isNotEmpty() }
+            }.toMutableList()
+            context += ApiMessage(
+                "user",
+                text,
+                images.map { com.commandcode.chat.data.commandcode.ApiImage(it.mimeType, it.originalBytes) {} },
+            )
+            val pending = chats.beginTurn(conversationId, text, model, images)
+            prepared += PreparedRequest(text, model, images)
+            preparedContexts += context
+            prepareEntered?.complete(Unit)
+            prepareRelease?.await()
+            events += "prepare-return"
+            return PreparedAttachmentTurn(pending, context)
+        }
+
+        override suspend fun deleteConversation(id: String) {
+            deleted += id
+            events += "delete"
+            deleteEntered?.complete(Unit)
+            deleteRelease?.await()
+            deleteFailure?.let { failure ->
+                if (failure is AttachmentException &&
+                    failure.kind == AttachmentFailure.CLEANUP &&
+                    failure.databaseDeleted == true
+                ) {
+                    chats.deleteConversation(id)
+                }
+                throw failure
+            }
+            chats.deleteConversation(id)
+        }
+
+        override suspend fun preview(id: String, maxEdge: Int): Bitmap =
+            throw UnsupportedOperationException("preview is not used by AppViewModel tests")
+
+        data class PreparedRequest(
+            val text: String,
+            val model: ChatModel,
+            val images: List<ImageAttachment>,
+        )
+    }
+
     private class FakeChats : ChatStore {
         val conversations = MutableStateFlow<List<Conversation>>(emptyList())
         private val messageFlows = mutableMapOf<String, MutableStateFlow<List<Message>>>()
@@ -1136,7 +1948,12 @@ class AppViewModelTest {
         override fun observeMessages(conversationId: String): Flow<List<Message>> = messages(conversationId)
         override suspend fun messagesSnapshot(conversationId: String): List<Message> = messages(conversationId).value
 
-        override suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn {
+        override suspend fun beginTurn(
+            conversationId: String?,
+            text: String,
+            model: ChatModel,
+            attachments: List<ImageAttachment>,
+        ): PendingTurn {
             beginTurnCalls += 1
             val id = conversationId ?: "conversation"
             turnCount += 1
@@ -1147,7 +1964,7 @@ class AppViewModelTest {
             if (conversations.value.none { it.id == id }) addConversation(id)
             val existing = messages(id).value
             messages(id).value = existing +
-                Message(userId, id, "USER", text, null, turnCount * 2L, "COMPLETE") +
+                Message(userId, id, "USER", text, null, turnCount * 2L, "COMPLETE", attachments) +
                 Message(assistantId, id, "ASSISTANT", "", model.apiId, turnCount * 2L + 1, "PENDING")
             usageCompleteByRequest[assistantId] = false
             beginTurnCommitted?.complete(Unit)

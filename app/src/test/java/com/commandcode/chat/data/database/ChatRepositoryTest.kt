@@ -1,7 +1,10 @@
 package com.commandcode.chat.data.database
 
 import android.app.Application
+import com.commandcode.chat.domain.AttachmentException
+import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
 import android.content.Context
 import androidx.room.Room
@@ -229,6 +232,207 @@ class ChatRepositoryTest {
         assertEquals("checkpoint text", database.messages().find(streaming.assistantMessageId)?.content)
         assertTrue(database.usageEvents().observeForConversation(pending.conversationId).first().all { !it.usageComplete })
     }
+
+    @Test
+    fun beginTurnWithImageStoresMetadataAndReactiveSizesExactly() = runTest {
+        val (repository, database) = testRepository()
+        val image = ImageAttachment("image-1", "Image.png", "image/png", 100, 133, 2, 2)
+
+        val turn = repository.beginTurn(null, "é", ChatModel.SOL, listOf(image))
+
+        val user = repository.messagesSnapshot(turn.conversationId).first { it.role == "USER" }
+        assertEquals(listOf(image), user.attachments)
+        val conversation = repository.observeConversations().first().single()
+        assertEquals(2L, conversation.textBytes)
+        assertEquals(133L, conversation.attachmentBytes)
+        assertEquals(1, conversation.attachmentCount)
+        assertEquals(135L, conversation.totalBytes)
+        assertEquals(image.id, database.attachments().listForConversation(turn.conversationId).single().id)
+    }
+
+    @Test
+    fun imageOnlyTurnUsesImageChatTitleAndBlankTextWithoutImagesIsRejected() = runTest {
+        val (repository, database) = testRepository()
+        val image = ImageAttachment("image-only", "Image.png", "image/png", 10, 43, 1, 1)
+
+        val turn = repository.beginTurn(null, "   ", ChatModel.SOL, listOf(image))
+
+        val conversation = repository.observeConversations().first().single()
+        assertEquals("Image chat", conversation.title)
+        val user = repository.messagesSnapshot(turn.conversationId).first { it.role == "USER" }
+        assertEquals(listOf(image), user.attachments)
+        assertTrue(user.content.isBlank())
+
+        assertTrue(
+            runCatching { repository.beginTurn(null, "   ", ChatModel.SOL) }.exceptionOrNull() is
+                IllegalArgumentException,
+        )
+        assertEquals(1, database.conversations().observeAll().first().size)
+    }
+
+    @Test
+    fun twentyImageSlotsSpanTurnsAndTheTwentyFirstIsRejectedAtomically() = runTest {
+        val (repository, database) = testRepository()
+        val first = repository.beginTurn(null, "first", ChatModel.SOL, (1..12).map { image(it.toString()) })
+        assertEquals(12, repository.observeConversations().first().single().attachmentCount)
+
+        val second = repository.beginTurn(first.conversationId, "second", ChatModel.SOL, (13..20).map { image(it.toString()) })
+        assertEquals(second.conversationId, first.conversationId)
+        val conversation = repository.observeConversations().first().single()
+        assertEquals(20, conversation.attachmentCount)
+        assertEquals(20L * 133L, conversation.attachmentBytes)
+
+        val failure = runCatching {
+            repository.beginTurn(first.conversationId, "overflow", ChatModel.SOL, listOf(image("21")))
+        }.exceptionOrNull()
+        assertTrue(failure is AttachmentException && failure.kind == AttachmentFailure.TOO_MANY)
+        assertEquals(20, repository.observeConversations().first().single().attachmentCount)
+        assertEquals(4, repository.observeMessages(first.conversationId).first().size)
+        assertEquals(2, database.usageEvents().observeForConversation(first.conversationId).first().size)
+    }
+
+    @Test
+    fun duplicateAttachmentIdsRollBackUserAssistantAndUsage() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "first", ChatModel.SOL, listOf(image("a-1")))
+        val duplicate = image("duplicate")
+
+        val error = runCatching {
+            repository.beginTurn(turn.conversationId, "second", ChatModel.SOL, listOf(duplicate, duplicate))
+        }.exceptionOrNull()
+
+        assertTrue(error is IllegalArgumentException)
+        assertEquals(2, repository.observeMessages(turn.conversationId).first().size)
+        assertEquals(1, database.attachments().countForConversation(turn.conversationId))
+        assertEquals(1, database.usageEvents().observeForConversation(turn.conversationId).first().size)
+    }
+
+    @Test
+    fun reusingAnOwnedAttachmentIdRollsBackTheWholeTurn() = runTest {
+        val (repository, database) = testRepository()
+        val owned = image("owned-1")
+        val first = repository.beginTurn(null, "first", ChatModel.SOL, listOf(owned))
+
+        val error = runCatching {
+            repository.beginTurn(first.conversationId, "second", ChatModel.SOL, listOf(image("owned-1")))
+        }.exceptionOrNull()
+
+        assertTrue(error is IllegalArgumentException)
+        assertEquals(2, repository.observeMessages(first.conversationId).first().size)
+        assertEquals(1, database.attachments().countForConversation(first.conversationId))
+        assertEquals(1, repository.observeConversations().first().single().attachmentCount)
+    }
+
+    @Test
+    fun unsupportedModelOrMimeTypeFailsBeforeAnyRowIsPersisted() = runTest {
+        val (repository, database) = testRepository()
+        val unknownModel = ChatModel("example/unknown", "Unknown", ChatModel.SOL.apiFamily)
+
+        val modelError = runCatching {
+            repository.beginTurn(null, "x", unknownModel, listOf(image("model-reject")))
+        }.exceptionOrNull()
+        assertTrue(modelError is AttachmentException && modelError.kind == AttachmentFailure.UNVERIFIED_MODEL)
+
+        val gif = ImageAttachment("mime-reject", "Image.gif", "image/gif", 10, 43, 1, 1)
+        val mimeError = runCatching {
+            repository.beginTurn(null, "x", ChatModel.SOL, listOf(gif))
+        }.exceptionOrNull()
+        assertTrue(mimeError is AttachmentException && mimeError.kind == AttachmentFailure.INVALID_FORMAT)
+
+        assertTrue(repository.observeConversations().first().isEmpty())
+        assertTrue(database.usageEvents().observeForConversation("any").first().isEmpty())
+    }
+
+    @Test
+    fun assistantCheckpointsUpdateReactiveTextSizes() = runTest {
+        val (repository, _) = testRepository()
+        val turn = repository.beginTurn(null, "hi", ChatModel.SOL)
+        assertEquals(2L, repository.observeConversations().first().single().textBytes)
+
+        repository.checkpointAssistant(turn.assistantMessageId, "streamed")
+
+        assertEquals(10L, repository.observeConversations().first().single().textBytes)
+        assertEquals(10L, repository.observeConversations().first().single().totalBytes)
+
+        repository.completeTurn(turn.assistantMessageId, "done", null)
+
+        assertEquals(6L, repository.observeConversations().first().single().textBytes)
+    }
+
+    @Test
+    fun deletingConversationCascadesToAttachmentRowsAndUpdatesSizes() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(
+            null,
+            "delete me",
+            ChatModel.SOL,
+            listOf(image("cascade-1"), image("cascade-2")),
+        )
+        assertEquals(2, repository.observeConversations().first().single().attachmentCount)
+
+        repository.deleteConversation(turn.conversationId)
+
+        assertTrue(repository.observeConversations().first().isEmpty())
+        assertEquals(0, database.attachments().countForConversation(turn.conversationId))
+        assertTrue(database.attachments().listForConversation(turn.conversationId).isEmpty())
+    }
+
+    @Test
+    fun attachmentSizesAreIsolatedPerConversation() = runTest {
+        val (repository, _) = testRepository()
+        val withImages = repository.beginTurn(null, "hi", ChatModel.SOL, listOf(image("chat-a-image")))
+        val textOnly = repository.beginTurn(null, "hello", ChatModel.SOL)
+
+        val conversations = repository.observeConversations().first().associateBy { it.id }
+        val imagesConversation = conversations.getValue(withImages.conversationId)
+        val textConversation = conversations.getValue(textOnly.conversationId)
+        assertEquals(2L, imagesConversation.textBytes)
+        assertEquals(133L, imagesConversation.attachmentBytes)
+        assertEquals(1, imagesConversation.attachmentCount)
+        assertEquals(5L, textConversation.textBytes)
+        assertEquals(0L, textConversation.attachmentBytes)
+        assertEquals(0, textConversation.attachmentCount)
+
+        repository.deleteConversation(withImages.conversationId)
+
+        val remaining = repository.observeConversations().first().single()
+        assertEquals(5L, remaining.textBytes)
+        assertEquals(0L, remaining.attachmentBytes)
+        assertEquals(0, remaining.attachmentCount)
+    }
+
+    @Test
+    fun observedMessagesKeepInsertionOrderAndRefreshAfterLaterTurns() = runTest {
+        val (repository, database) = testRepository()
+        val zebra = image("zebra")
+        val apple = image("apple")
+        val turn = repository.beginTurn(null, "order", ChatModel.SOL, listOf(zebra, apple))
+
+        val snapshot = repository.messagesSnapshot(turn.conversationId).first { it.role == "USER" }
+        assertEquals(listOf(zebra, apple), snapshot.attachments)
+        assertEquals(
+            listOf("zebra", "apple"),
+            database.attachments().listForConversation(turn.conversationId).map { it.id },
+        )
+
+        val second = repository.beginTurn(turn.conversationId, "second", ChatModel.SOL, listOf(image("gamma")))
+
+        val messages = repository.observeMessages(turn.conversationId).first()
+        assertEquals(listOf(zebra, apple), messages[0].attachments)
+        assertTrue(messages[1].attachments.isEmpty())
+        assertEquals(listOf(image("gamma")), messages[2].attachments)
+        assertEquals(second.conversationId, turn.conversationId)
+    }
+
+    private fun image(
+        id: String,
+        name: String = "Image.png",
+        mime: String = "image/png",
+        original: Long = 100,
+        encrypted: Long = 133,
+        width: Int = 2,
+        height: Int = 2,
+    ) = ImageAttachment(id, name, mime, original, encrypted, width, height)
 
     private fun testRepository(nowMillis: () -> Long = System::currentTimeMillis): Pair<ChatRepository, ChatDatabase> {
         val context = ApplicationProvider.getApplicationContext<Context>()

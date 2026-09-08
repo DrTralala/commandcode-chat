@@ -1,7 +1,9 @@
 package com.commandcode.chat.data.database
 
 import androidx.room.withTransaction
+import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -13,7 +15,12 @@ data class Conversation(
     val defaultModelId: String,
     val createdAt: Long,
     val updatedAt: Long,
-)
+    val textBytes: Long = 0,
+    val attachmentBytes: Long = 0,
+    val attachmentCount: Int = 0,
+) {
+    val totalBytes: Long get() = textBytes + attachmentBytes
+}
 
 data class Message(
     val id: String,
@@ -23,6 +30,7 @@ data class Message(
     val modelId: String?,
     val createdAt: Long,
     val status: String,
+    val attachments: List<ImageAttachment> = emptyList(),
 )
 
 data class PendingTurn(
@@ -42,15 +50,17 @@ class ChatRepository(
         const val COMPLETE = "COMPLETE"
         const val INTERRUPTED = "INTERRUPTED"
     }
+    private val IMAGE_CHAT_TITLE: String = "Image chat"
+
     fun observeConversations(): Flow<List<Conversation>> = database.conversations().observeAll()
         .map { rows -> rows.map { it.toDomain() } }
 
     fun observeMessages(conversationId: String): Flow<List<Message>> =
-        database.messages().observeForConversation(conversationId)
+        database.messages().observeWithAttachments(conversationId)
             .map { rows -> rows.map { it.toDomain() } }
 
     suspend fun messagesSnapshot(conversationId: String): List<Message> = database.withTransaction {
-        database.messages().listForConversation(conversationId).map { it.toDomain() }
+        database.messages().listWithAttachments(conversationId).map { it.toDomain() }
     }
 
     suspend fun deleteConversation(id: String) {
@@ -59,7 +69,16 @@ class ChatRepository(
         }
     }
 
-    suspend fun beginTurn(conversationId: String?, text: String, model: ChatModel): PendingTurn {
+    suspend fun beginTurn(
+        conversationId: String?,
+        text: String,
+        model: ChatModel,
+        attachments: List<ImageAttachment> = emptyList(),
+    ): PendingTurn {
+        require(text.isNotBlank() || attachments.isNotEmpty()) { "A turn needs text or at least one image" }
+        val ids = attachments.map { it.id }
+        require(ids.size == ids.toSet().size) { "Attachment ids must be unique within a turn" }
+        val title = if (text.isBlank()) IMAGE_CHAT_TITLE else titleFor(text)
         val turnStartedAt = nowMillis()
         return database.withTransaction {
             val id = conversationId ?: UUID.randomUUID().toString()
@@ -67,16 +86,36 @@ class ChatRepository(
             val assistantAt = nextTimestamp(userAt, userAt)
             if (conversationId == null) {
                 database.conversations().insert(
-                    ConversationEntity(id, titleFor(text), model.apiId, userAt, assistantAt),
+                    ConversationEntity(id, title, model.apiId, userAt, assistantAt),
                 )
             } else {
                 val conversation = database.conversations().find(id) ?: error("Conversation not found")
                 database.conversations().touch(id, maxOf(assistantAt, nextTimestamp(userAt, conversation.updatedAt)))
             }
+            attachments.forEach { requireOwnershipReuseAbsent(it.id) }
+            attachments.forEach { AttachmentPolicy.requireAllowed(model.apiId, it.mimeType) }
+            AttachmentPolicy.requireCount(database.attachments().countForConversation(id), 0, attachments.size)
             val userId = UUID.randomUUID().toString()
             val assistantId = UUID.randomUUID().toString()
             database.messages().insert(MessageEntity(userId, id, Role.USER, text, null, userAt, Status.USER_COMPLETE))
             database.messages().insert(MessageEntity(assistantId, id, Role.ASSISTANT, "", model.apiId, assistantAt, Status.PENDING))
+            if (attachments.isNotEmpty()) {
+                database.attachments().insert(
+                    attachments.mapIndexed { position, image ->
+                        AttachmentEntity(
+                            id = image.id,
+                            messageId = userId,
+                            displayName = image.displayName,
+                            mimeType = image.mimeType,
+                            originalBytes = image.originalBytes,
+                            encryptedBytes = image.encryptedBytes,
+                            width = image.width,
+                            height = image.height,
+                            position = position,
+                        )
+                    },
+                )
+            }
             database.usageEvents().insert(
                 UsageEventEntity(
                     id = UUID.randomUUID().toString(),
@@ -151,8 +190,13 @@ class ChatRepository(
         database.messages().find(id)?.also { check(it.role == Role.ASSISTANT) { "Message is not an assistant turn" } }
             ?: error("Message not found")
 
-    private fun ConversationEntity.toDomain() = Conversation(id, title, defaultModel, createdAt, updatedAt)
-    private fun MessageEntity.toDomain() = Message(id, conversationId, role, content, modelId, createdAt, status)
+    private fun requireOwnershipReuseAbsent(id: String) {
+        require(!database.attachments().listIds().contains(id)) { "Attachment id is already owned by another message" }
+    }
+
+    private fun ConversationRow.toDomain() =
+        Conversation(id, title, defaultModel, createdAt, updatedAt, textBytes, attachmentBytes, attachmentCount)
+    private fun MessageWithAttachments.toDomain() = Message(id, conversationId, role, content, modelId, createdAt, status, attachments.map { it.toDomain() })
 
     private fun titleFor(text: String): String {
         val normalised = buildString {

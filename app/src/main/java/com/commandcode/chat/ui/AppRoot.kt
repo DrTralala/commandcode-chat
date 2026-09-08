@@ -1,6 +1,8 @@
 package com.commandcode.chat.ui
 
 import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -57,7 +60,9 @@ import com.commandcode.chat.ui.chat.ChatScreen
 import com.commandcode.chat.ui.history.HistoryScreen
 import com.commandcode.chat.ui.settings.SettingsScreen
 import com.commandcode.chat.R
+import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.ui.chat.PickerTicket
 
 private val Ink = Color(0xFF0B111B)
 private val Slate = Color(0xFF131E2C)
@@ -146,6 +151,15 @@ fun AppRoot(viewModel: AppViewModel?, startupRecovery: Boolean = false) {
 @Composable
 private fun AppContent(viewModel: AppViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    var pendingPickerTicket by remember { mutableStateOf<PickerTicket?>(null) }
+    val pickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        val ticket = pendingPickerTicket
+        pendingPickerTicket = null
+        ticket?.let { viewModel.importAttachments(it, uris) }
+    }
+
     if (state.loading) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
         return
@@ -180,11 +194,25 @@ private fun AppContent(viewModel: AppViewModel) {
                         onNewChat = viewModel::newChat,
                         onSend = viewModel::send,
                         onCancel = viewModel::cancel,
+                        onDraftChange = viewModel::updateDraft,
+                        onAttach = {
+                            if (pendingPickerTicket == null) {
+                                viewModel.requestAttachmentPicker()?.let { ticket ->
+                                    pendingPickerTicket = ticket
+                                    pickerLauncher.launch(attachmentPickerMimeTypes(ticket.modelId))
+                                }
+                            }
+                        },
+                        onRemoveAttachment = viewModel::removeAttachment,
+                        onDismissAttachmentError = viewModel::dismissAttachmentError,
+                        loadAttachmentPreview = viewModel::loadAttachmentPreview,
                     )
                 }
                 composable(Route.HISTORY) {
                     HistoryScreen(
                         conversations = state.conversations,
+                        sort = state.historySort,
+                        onSortChange = viewModel::setHistorySort,
                         modelDisplayName = { modelId -> modelDisplayName(state.models, modelId) },
                         onOpen = { viewModel.openConversation(it); navController.navigate(Route.CHAT) },
                         onDelete = viewModel::deleteConversation,
@@ -292,3 +320,6 @@ internal fun navigationTarget(previouslyConfigured: Boolean, keyConfigured: Bool
 
 internal fun modelDisplayName(models: List<ChatModel>, modelId: String): String =
     models.firstOrNull { it.apiId == modelId }?.displayName ?: modelId
+
+internal fun attachmentPickerMimeTypes(modelId: String): Array<String> =
+    AttachmentPolicy.capability(modelId).mimeTypes.toTypedArray()
