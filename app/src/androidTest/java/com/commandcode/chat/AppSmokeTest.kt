@@ -69,7 +69,9 @@ class AppSmokeTest {
         compose.activity.viewModelForTests.clearApiKey()
         compose.activity.appContainer.settings.resetForTests()
         compose.activity.viewModelForTests.setZdr(true)
-        compose.activity.viewModelForTests.setAmoled(false)
+        // An installation upgrading from the old non-AMOLED preference must also use black.
+        compose.activity.getSharedPreferences("app_settings", android.content.Context.MODE_PRIVATE)
+            .edit().putBoolean("amoled", false).commit()
         compose.activity.recreateUiForTests()
         compose.waitForIdle()
     }
@@ -145,7 +147,11 @@ class AppSmokeTest {
         compose.onAllNodesWithTag("billing_day").assertCountEquals(0)
         compose.onNodeWithContentDescription("Zero data retention (ZDR)").performClick().assertIsOff()
         compose.onNodeWithTag("security_zdr_status").assertTextEquals("ZDR OFF")
-        compose.onNodeWithContentDescription("AMOLED dark mode").performClick().assertIsOn()
+        compose.onNodeWithTag("amoled_toggle").assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(android.graphics.Color.BLACK, compose.activity.window.statusBarColor)
+            assertEquals(android.graphics.Color.BLACK, compose.activity.window.navigationBarColor)
+        }
 
         compose.onNodeWithTag("nav_budget").performClick()
         compose.activityRule.scenario.recreate()
@@ -154,7 +160,7 @@ class AppSmokeTest {
         compose.onAllNodesWithText("Estimated from this app").assertCountEquals(0)
         compose.onAllNodesWithText("Add your API key").assertCountEquals(0)
         compose.onNodeWithTag("nav_settings").performClick()
-        compose.onNodeWithTag("amoled_toggle").assertIsOn()
+        compose.onNodeWithTag("amoled_toggle").assertDoesNotExist()
 
         compose.activityRule.scenario.close()
         ActivityScenario.launch(MainActivity::class.java).use {
@@ -332,7 +338,6 @@ class AppSmokeTest {
 
     private class TestSettings : SettingsStore {
         override var zdr = true
-        override var amoled = false
     }
 
     private class ConfiguredKeys : ApiKeyStore {
@@ -401,7 +406,7 @@ class AppSmokeTest {
             mutationCalls += 1
             return false
         }
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) { mutationCalls += 1 }
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) { mutationCalls += 1 }
         override suspend fun deleteConversation(id: String) { mutationCalls += 1 }
         override suspend fun backfillInitialModel(conversationId: String) = Unit
     }
@@ -450,7 +455,7 @@ class AppSmokeTest {
             return true
         }
 
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) = Unit
 
         override suspend fun deleteConversation(id: String) = Unit
 

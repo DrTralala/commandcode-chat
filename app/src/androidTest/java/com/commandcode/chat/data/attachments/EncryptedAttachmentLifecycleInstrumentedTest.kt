@@ -460,8 +460,8 @@ class EncryptedAttachmentLifecycleInstrumentedTest {
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean =
             delegate.completeTurn(messageId, text, usage)
 
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) =
-            delegate.interruptTurn(messageId, partialText, reason)
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) =
+            delegate.interruptTurn(messageId, partialText, reason, usage)
 
         override suspend fun deleteConversation(id: String) = delegate.deleteConversation(id)
     }

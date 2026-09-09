@@ -66,7 +66,6 @@ class SettingsScreenComposeTest {
                     onSaveApiKey = {},
                     onClearApiKey = {},
                     onSetZdr = {},
-                    onSetAmoled = {},
                     onSaveSystemPrompt = { value -> state = onSave(state, value, state.systemPromptCommit) },
                     onClearSystemPrompt = { state = onClear(state, state.systemPromptCommit) },
                 )
@@ -88,7 +87,6 @@ class SettingsScreenComposeTest {
                         state = state.copy(keyConfigured = false)
                     },
                     onSetZdr = {},
-                    onSetAmoled = {},
                     onSaveSystemPrompt = {},
                     onClearSystemPrompt = {},
                 )
@@ -118,7 +116,6 @@ class SettingsScreenComposeTest {
                     onSaveApiKey = {},
                     onClearApiKey = {},
                     onSetZdr = {},
-                    onSetAmoled = {},
                     onSaveSystemPrompt = {},
                     onClearSystemPrompt = {},
                 )
@@ -128,6 +125,8 @@ class SettingsScreenComposeTest {
         compose.onNodeWithText("Zero data retention (ZDR)").assertIsDisplayed()
         compose.onNodeWithContentDescription("Zero data retention (ZDR)").assertIsDisplayed()
         compose.onAllNodesWithText("Zero data retention").assertCountEquals(0)
+        compose.onAllNodesWithTag("amoled_toggle").assertCountEquals(0)
+        compose.onAllNodesWithText("AMOLED dark mode").assertCountEquals(0)
     }
 
     @Test
@@ -191,7 +190,6 @@ class SettingsScreenComposeTest {
                     onSaveApiKey = {},
                     onClearApiKey = {},
                     onSetZdr = {},
-                    onSetAmoled = {},
                     onSaveSystemPrompt = {},
                     onClearSystemPrompt = {},
                 )
@@ -214,7 +212,6 @@ class SettingsScreenComposeTest {
                     onSaveApiKey = {},
                     onClearApiKey = {},
                     onSetZdr = {},
-                    onSetAmoled = {},
                     onSaveSystemPrompt = {},
                     onClearSystemPrompt = {},
                 )

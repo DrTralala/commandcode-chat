@@ -3,6 +3,13 @@ package com.commandcode.chat.ui.chat
 import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
+import com.commandcode.chat.domain.ConversationTokenUsage
+import com.commandcode.chat.domain.ReportedUsage
+import com.commandcode.chat.data.service.ContextWindowCatalogue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.material3.MaterialTheme
@@ -49,6 +56,50 @@ import org.junit.runner.RunWith
 class ChatScreenComposeTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test fun contextIndicatorRemainsTappableWhileStreamingAndResetsDialogOnNavigation() {
+        val live = mutableStateOf(state().copy(
+            sending = true, activeConversationId = "conversation",
+            tokenUsage = ConversationTokenUsage.aggregate(listOf(
+                ReportedUsage("event", null, ChatModel.SOL.apiId, 1, 200, 0, 50, true),
+            )),
+            contextWindows = ContextWindowCatalogue(mapOf(ChatModel.SOL.apiId to 1000L)),
+        ))
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(live.value, {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") })
+            }
+        }
+        compose.onNodeWithTag("context_usage").assertIsDisplayed().assertIsEnabled().performClick()
+        compose.onNodeWithTag("context_usage_dialog").assertIsDisplayed()
+        compose.onNodeWithText("A response is streaming.", substring = true).assertExists()
+        compose.onAllNodesWithText("250", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("1000", substring = true).assertCountEquals(0)
+        compose.runOnIdle { live.value = live.value.copy(currentConversationId = "another", tokenUsage = ConversationTokenUsage()) }
+        compose.onNodeWithTag("context_usage_dialog").assertDoesNotExist()
+        compose.onNodeWithText("Context —").assertIsDisplayed()
+    }
+
+    @Test fun narrowLargeTextComposerKeepsContextAndActionButtonsVisible() {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, 1.5f)) {
+                MaterialTheme {
+                    Box(Modifier.width(320.dp).height(320.dp)) {
+                        ChatScreen(state().copy(selectedModel = ChatModel.SOL.copy(displayName = "A very long model display name")),
+                            {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") })
+                    }
+                }
+            }
+        }
+        compose.onNodeWithTag("context_usage").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Close").performClick()
+        compose.onNodeWithTag("attach_image").assertIsDisplayed()
+        compose.onNodeWithTag("send_message").assertIsDisplayed()
+        val context = compose.onNodeWithTag("context_usage").fetchSemanticsNode().boundsInRoot
+        val attach = compose.onNodeWithTag("attach_image").fetchSemanticsNode().boundsInRoot
+        assertTrue("context must not overlap attachment target", context.right <= attach.left)
+    }
 
     @Test
     fun failedMessageLongPressOffersRetryAndDeleteAndSuccessfulMessagesDoNot() {

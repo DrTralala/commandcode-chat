@@ -22,6 +22,10 @@ import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
 import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.security.effectiveSystemPrompt
 import com.commandcode.chat.data.service.ModelCatalogueSource
+import com.commandcode.chat.data.service.ContextWindowCatalogue
+import com.commandcode.chat.domain.ConversationTokenUsage
+import com.commandcode.chat.ui.chat.ContextUsagePresentation
+import com.commandcode.chat.ui.chat.contextUsagePresentation
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.data.service.ServiceException
@@ -47,6 +51,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -73,12 +79,13 @@ data class AppUiState(
     val recoveryMessage: String? = null,
     val keyConfigured: Boolean = false,
     val zdr: Boolean = true,
-    val amoled: Boolean = false,
     val models: List<ChatModel> = listOf(ChatModel.SOL),
     val selectedModel: ChatModel = ChatModel.SOL,
     val conversations: List<Conversation> = emptyList(),
     val currentConversationId: String? = null,
     val messages: List<Message> = emptyList(),
+    val tokenUsage: ConversationTokenUsage = ConversationTokenUsage(),
+    val contextWindows: ContextWindowCatalogue = ContextWindowCatalogue(),
     val activeConversationId: String? = null,
     val activeAssistantMessageId: String? = null,
     val streamingText: String = "",
@@ -96,6 +103,8 @@ data class AppUiState(
     val systemPromptFeedback: SystemPromptFeedback? = null,
     val systemPromptCommit: Int = 0,
 ) {
+    val contextUsage: ContextUsagePresentation get() = contextUsagePresentation(this)
+
     val visibleMessages: List<Message>
         get() = if (currentConversationId == activeConversationId && activeAssistantMessageId != null) {
             messages.filterNot { it.id == activeAssistantMessageId }
@@ -123,8 +132,9 @@ class AppViewModel(
     private val elapsedMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     private val apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
     private val systemPromptStore: SystemPromptStore,
+    private val contextWindowLoader: suspend () -> ContextWindowCatalogue = { ContextWindowCatalogue() },
 ) : ViewModel() {
-    private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr, amoled = settings.amoled))
+    private val mutableState = MutableStateFlow(AppUiState(zdr = settings.zdr))
     val state: StateFlow<AppUiState> = mutableState.asStateFlow()
 
     private var messageCollection: Job? = null
@@ -167,6 +177,13 @@ class AppViewModel(
             } catch (_: Exception) {
                 null
             }
+            val contextWindows = try {
+                contextWindowLoader()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                ContextWindowCatalogue()
+            }
             var attachmentFailure: AttachmentFailure? = null
             try {
                 attachmentOperations.initialise()
@@ -189,6 +206,7 @@ class AppViewModel(
                 recoveryMessage = recoveryMessage,
                 keyConfigured = configured,
                 models = localModels,
+                contextWindows = contextWindows,
                 selectedModel = localModels.firstOrNull {
                     it.apiId == mutableState.value.selectedModel.apiId
                 } ?: ChatModel.SOL,
@@ -290,11 +308,6 @@ class AppViewModel(
     fun setZdr(enabled: Boolean) {
         settings.zdr = enabled
         mutableState.value = mutableState.value.copy(zdr = enabled)
-    }
-
-    fun setAmoled(enabled: Boolean) {
-        settings.amoled = enabled
-        mutableState.value = mutableState.value.copy(amoled = enabled)
     }
 
     fun saveSystemPrompt(value: String) {
@@ -571,6 +584,7 @@ class AppViewModel(
         messageCollection = null
         mutableState.value = mutableState.value.copy(
             currentConversationId = null,
+            tokenUsage = ConversationTokenUsage(),
             messages = emptyList(),
             draftText = "",
             pendingAttachments = emptyList(),
@@ -592,6 +606,7 @@ class AppViewModel(
         messageCollection?.cancel()
         mutableState.value = mutableState.value.copy(
             currentConversationId = id,
+            tokenUsage = ConversationTokenUsage(),
             selectedModel = if (invalidateDraft) {
                 val modelId = mutableState.value.conversations.firstOrNull { it.id == id }?.defaultModelId
                 mutableState.value.models.firstOrNull { it.apiId == modelId } ?: mutableState.value.selectedModel
@@ -611,8 +626,16 @@ class AppViewModel(
             } catch (_: Exception) {
                 // Best-effort backfill: the conversation still opens without it.
             }
-            chats.observeMessages(id).collectLatest { messages ->
-                mutableState.value = mutableState.value.copy(messages = messages)
+            combine(
+                chats.observeMessages(id),
+                chats.observeTokenUsage(id).catch { error ->
+                    if (error is CancellationException) throw error
+                    emit(ConversationTokenUsage())
+                },
+            ) { messages, usage -> messages to usage }.collectLatest { (messages, usage) ->
+                if (mutableState.value.currentConversationId == id) {
+                    mutableState.value = mutableState.value.copy(messages = messages, tokenUsage = usage)
+                }
             }
         }
     }
@@ -793,6 +816,7 @@ class AppViewModel(
                     messageCollection = null
                     mutableState.value = mutableState.value.copy(
                         currentConversationId = null,
+                        tokenUsage = ConversationTokenUsage(),
                         messages = emptyList(),
                         draftText = "",
                         pendingAttachments = emptyList(),
@@ -926,7 +950,7 @@ class AppViewModel(
                 if (turn?.completionCommitted != true) turn?.let { active ->
                     if (zdr && error is CommandCodeException.ZdrUnavailable && active.partial.isEmpty()) {
                         try {
-                            withContext(NonCancellable) { chats.failZdrTurn(active.pending.assistantMessageId) }
+                            withContext(NonCancellable) { chats.failZdrTurn(active.pending.assistantMessageId, active.usage) }
                         } catch (_: Exception) {
                             interruptSafely(active, "failed")
                         }
@@ -1026,7 +1050,7 @@ class AppViewModel(
     private suspend fun interruptSafely(turn: ActiveTurn, reason: String) {
         try {
             withContext(NonCancellable) {
-                chats.interruptTurn(turn.pending.assistantMessageId, turn.partial.toString(), reason)
+                chats.interruptTurn(turn.pending.assistantMessageId, turn.partial.toString(), reason, turn.usage)
             }
         } catch (_: Exception) {
             // UI still settles; repository terminal methods are idempotent and deletion waits for this path.
@@ -1182,6 +1206,7 @@ class AppViewModel(
                 container.quota,
                 container.attachmentOperations,
                 systemPromptStore = container.systemPromptStore,
+                contextWindowLoader = container::loadContextWindows,
             ) as T
         }
     }

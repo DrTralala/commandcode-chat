@@ -963,9 +963,9 @@ class AttachmentServiceTest {
 
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean = true
 
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) = Unit
 
-        override suspend fun failZdrTurn(assistantMessageId: String) {
+        override suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage?) {
             val rows = messages.values.single { list -> list.value.any { it.id == assistantMessageId } }
             val index = rows.value.indexOfFirst { it.id == assistantMessageId }
             rows.value = rows.value.mapIndexed { i, m -> if (i == index || i == index - 1) m.copy(status = "FAILED_ZDR") else m }

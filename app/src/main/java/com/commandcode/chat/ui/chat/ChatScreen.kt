@@ -50,6 +50,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -398,17 +399,20 @@ fun ChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = state.selectedModel.displayName,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(start = 8.dp)
-                        .testTag("composer_model"),
-                )
+                BoxWithConstraints(Modifier.weight(1f)) {
+                    val inline = maxWidth / LocalDensity.current.fontScale >= 320.dp
+                    if (inline) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            ComposerModelName(state.selectedModel.displayName, Modifier.weight(1f))
+                            ContextUsageIndicator(state.contextUsage, state.currentConversationId)
+                        }
+                    } else {
+                        Column {
+                            ComposerModelName(state.selectedModel.displayName)
+                            ContextUsageIndicator(state.contextUsage, state.currentConversationId)
+                        }
+                    }
+                }
                 IconButton(
                     onClick = onAttach,
                     enabled = composerEnabled,
@@ -454,6 +458,18 @@ fun ChatScreen(
         }
     }
     }
+}
+
+@Composable
+private fun ComposerModelName(name: String, modifier: Modifier = Modifier) {
+    Text(
+        text = name,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier.padding(start = 8.dp).testTag("composer_model"),
+    )
 }
 
 @Composable

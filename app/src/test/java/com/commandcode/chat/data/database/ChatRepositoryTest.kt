@@ -27,6 +27,56 @@ import java.util.concurrent.CopyOnWriteArrayList
 class ChatRepositoryTest {
     private val databases = CopyOnWriteArrayList<ChatDatabase>()
 
+    @Test fun failedRoutingRetainsReportedUsageAfterMessageDeletionWithoutContextPromotion() = runTest {
+        val (repository, database) = testRepository()
+        val turn = repository.beginTurn(null, "failed", ChatModel.SOL)
+        repository.failZdrTurn(turn.assistantMessageId, TokenUsage(200, 50, 25))
+        repository.failZdrTurn(turn.assistantMessageId)
+        repository.deleteFailedTurn(turn.userMessageId)
+        val usage = repository.observeTokenUsage(turn.conversationId).first()
+        assertEquals(225L, usage.totalProcessedTokens)
+        assertEquals(50L, usage.cachedInputTokens)
+        assertNull(usage.measurement)
+        assertTrue(usage.accountingIncomplete)
+        assertTrue(!database.usageEvents().observeForConversation(turn.conversationId).first().single().usageComplete)
+    }
+
+    @Test fun interruptionPersistsReceivedUsageWithoutPromotingContextOrOverwritingTerminalState() = runTest {
+        val (repository, database) = testRepository()
+        val first = repository.beginTurn(null, "hello", ChatModel.SOL)
+        repository.completeTurn(first.assistantMessageId, "answer", TokenUsage(500, 100, 200))
+        repository.interruptTurn(first.assistantMessageId, "late", "late", TokenUsage(9, 0, 9))
+        val second = repository.beginTurn(first.conversationId, "next", ChatModel.SOL)
+        repository.interruptTurn(second.assistantMessageId, "partial", "cancel", TokenUsage(750, 100, 50))
+        repository.interruptTurn(second.assistantMessageId, "duplicate", "cancel", null)
+        assertTrue(!repository.completeTurn(second.assistantMessageId, "late", TokenUsage(9, 0, 9)))
+        val usage = repository.observeTokenUsage(first.conversationId).first()
+        assertEquals(1500L, usage.totalProcessedTokens)
+        assertEquals(700L, usage.measurement?.currentContextTokens)
+        assertTrue(usage.accountingIncomplete)
+        val interrupted = database.usageEvents().observeForConversation(first.conversationId).first().last()
+        assertEquals(750L, interrupted.inputTokens)
+        assertTrue(!interrupted.usageComplete)
+        assertEquals("partial", database.messages().find(second.assistantMessageId)?.content)
+    }
+
+    @Test fun sameClockHistoricalRetryUsesLatestAttemptInsteadOfMessagePosition() = runTest {
+        val (repository, database) = testRepository(nowMillis = { 1000L })
+        val first = repository.beginTurn(null, "failed", ChatModel.SOL)
+        repository.failZdrTurn(first.assistantMessageId)
+        val later = repository.beginTurn(first.conversationId, "later", ChatModel.SOL)
+        repository.completeTurn(later.assistantMessageId, "answer", TokenUsage(500, 0, 100))
+        val retry = repository.retryFailedTurn(first.userMessageId, ChatModel.LUNA)
+        repository.completeTurn(retry.assistantMessageId, "retry", TokenUsage(50, 0, 10))
+        assertEquals(listOf(1000L, 1001L, 1002L), database.usageEvents().observeForConversation(first.conversationId).first().map { it.timestamp })
+        val measured = repository.observeTokenUsage(first.conversationId).first().measurement!!
+        assertEquals(retry.assistantMessageId, measured.requestId)
+        assertEquals(ChatModel.LUNA.apiId, measured.modelId)
+        assertEquals(60L, measured.currentContextTokens)
+        assertTrue(repository.messagesSnapshot(first.conversationId).last().id != measured.requestId)
+        assertNull(repository.observeTokenUsage("another-conversation").first().measurement)
+    }
+
     @After
     fun closeDatabases() {
         databases.forEach { runCatching { it.close() } }

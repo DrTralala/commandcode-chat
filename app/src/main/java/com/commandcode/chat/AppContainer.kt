@@ -28,17 +28,19 @@ import com.commandcode.chat.data.service.QuotaRepository
 import com.commandcode.chat.data.service.QuotaSource
 import com.commandcode.chat.data.service.ServiceSnapshotStore
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.ConversationTokenUsage
+import com.commandcode.chat.data.service.ContextWindowCatalogue
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 import okhttp3.Call
 import okhttp3.OkHttpClient
 
 interface SettingsStore {
     var zdr: Boolean
-    var amoled: Boolean
 }
 
 interface ApiKeyStore {
@@ -50,6 +52,7 @@ interface ApiKeyStore {
 interface ChatStore {
     fun observeConversations(): Flow<List<Conversation>>
     fun observeMessages(conversationId: String): Flow<List<Message>>
+    fun observeTokenUsage(conversationId: String): Flow<ConversationTokenUsage> = flowOf(ConversationTokenUsage())
     suspend fun messagesSnapshot(conversationId: String): List<Message>
     suspend fun beginTurn(
         conversationId: String?,
@@ -60,9 +63,9 @@ interface ChatStore {
     ): PendingTurn
     suspend fun checkpointAssistant(messageId: String, text: String)
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
-    suspend fun interruptTurn(messageId: String, partialText: String, reason: String)
+    suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage? = null)
     suspend fun deleteConversation(id: String)
-    suspend fun failZdrTurn(assistantMessageId: String): Unit = error("Message recovery is not supported by this store")
+    suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage? = null): Unit = error("Message recovery is not supported by this store")
     suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String = ""): PendingTurn = error("Message recovery is not supported by this store")
     suspend fun deleteFailedTurn(userMessageId: String): Unit = error("Message recovery is not supported by this store")
     suspend fun changeConversationModel(conversationId: String, model: ChatModel): Unit = error("Model events are not supported by this store")
@@ -76,15 +79,10 @@ class AppSettings(context: Context) : SettingsStore {
         get() = preferences.getBoolean(KEY_ZDR, true)
         set(value) { preferences.edit().putBoolean(KEY_ZDR, value).apply() }
 
-    override var amoled: Boolean
-        get() = preferences.getBoolean(KEY_AMOLED, false)
-        set(value) { preferences.edit().putBoolean(KEY_AMOLED, value).apply() }
-
     internal fun resetForTests() { preferences.edit().clear().commit() }
 
     private companion object {
         const val KEY_ZDR = "zdr"
-        const val KEY_AMOLED = "amoled"
     }
 }
 
@@ -125,6 +123,7 @@ class AppContainer(
         .build()
     private val serviceSnapshotStore = ServiceSnapshotStore(applicationContext)
     val modelCatalogue: ModelCatalogueSource = ModelCatalogueRepository(applicationContext)
+    suspend fun loadContextWindows(): ContextWindowCatalogue = ContextWindowCatalogue.load(applicationContext)
     val quota: QuotaSource = QuotaRepository(
         applicationContext,
         quotaApiFactory(serviceHttpClient),
@@ -138,6 +137,7 @@ class AppContainer(
     val chatStore: ChatStore = object : ChatStore {
         override fun observeConversations() = chatRepository.observeConversations()
         override fun observeMessages(conversationId: String) = chatRepository.observeMessages(conversationId)
+        override fun observeTokenUsage(conversationId: String) = chatRepository.observeTokenUsage(conversationId)
         override suspend fun messagesSnapshot(conversationId: String) = chatRepository.messagesSnapshot(conversationId)
         override suspend fun beginTurn(
             conversationId: String?,
@@ -151,10 +151,10 @@ class AppContainer(
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
             return chatRepository.completeTurn(messageId, text, usage)
         }
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) =
-            chatRepository.interruptTurn(messageId, partialText, reason)
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) =
+            chatRepository.interruptTurn(messageId, partialText, reason, usage)
         override suspend fun deleteConversation(id: String) = chatRepository.deleteConversation(id)
-        override suspend fun failZdrTurn(assistantMessageId: String) = chatRepository.failZdrTurn(assistantMessageId)
+        override suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage?) = chatRepository.failZdrTurn(assistantMessageId, usage)
         override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String) = chatRepository.retryFailedTurn(userMessageId, model, systemPrompt)
         override suspend fun deleteFailedTurn(userMessageId: String) = chatRepository.deleteFailedTurn(userMessageId)
         override suspend fun changeConversationModel(conversationId: String, model: ChatModel) = chatRepository.changeConversationModel(conversationId, model)

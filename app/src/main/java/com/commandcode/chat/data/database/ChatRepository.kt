@@ -6,6 +6,8 @@ import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
+import com.commandcode.chat.domain.ConversationTokenUsage
+import com.commandcode.chat.domain.ReportedUsage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import java.util.UUID
@@ -61,6 +63,14 @@ class ChatRepository(
     fun observeMessages(conversationId: String): Flow<List<Message>> =
         database.messages().observeWithAttachments(conversationId)
             .map { rows -> rows.map { it.toDomain() } }
+
+    fun observeTokenUsage(conversationId: String): Flow<ConversationTokenUsage> =
+        database.usageEvents().observeForConversation(conversationId).map { rows ->
+            ConversationTokenUsage.aggregate(rows.map {
+                ReportedUsage(it.id, it.requestId, it.modelId, it.timestamp,
+                    it.inputTokens, it.cachedInputTokens, it.outputTokens, it.usageComplete)
+            })
+        }
 
     suspend fun messagesSnapshot(conversationId: String): List<Message> = database.withTransaction {
         database.messages().listWithAttachments(conversationId).map { it.toDomain() }
@@ -164,7 +174,7 @@ class ChatRepository(
                     requestId = assistantId,
                     conversationId = id,
                     modelId = model.apiId,
-                    timestamp = turnStartedAt,
+                    timestamp = nextUsageTimestamp(id, turnStartedAt),
                     inputTokens = null,
                     cachedInputTokens = null,
                     outputTokens = null,
@@ -204,12 +214,19 @@ class ChatRepository(
         database.messages().find(messageId)?.status == Status.COMPLETE
     }
 
-    suspend fun interruptTurn(messageId: String, partialText: String, reason: String) {
+    suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage? = null) {
         // The reason is intentionally not persisted: it may contain transport details or secrets.
-        updateAssistant(messageId, partialText, Status.INTERRUPTED)
+        database.withTransaction {
+            val message = assistant(messageId)
+            if (message.status !in setOf(Status.PENDING, Status.STREAMING)) return@withTransaction
+            if (database.messages().updateIfStatus(messageId, message.status, partialText, Status.INTERRUPTED) == 0) return@withTransaction
+            check(database.usageEvents().recordInterrupted(messageId, usage?.inputTokens,
+                usage?.cachedInputTokens, usage?.outputTokens) == 1) { "Usage anchor missing" }
+            touchConversation(message.conversationId)
+        }
     }
 
-    suspend fun failZdrTurn(assistantMessageId: String) = database.withTransaction {
+    suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage? = null) = database.withTransaction {
         val reply = assistant(assistantMessageId)
         val user = database.messages().find(requireNotNull(reply.replyToMessageId)) ?: error("Message not found")
         check(user.role == Role.USER && user.conversationId == reply.conversationId)
@@ -219,6 +236,8 @@ class ChatRepository(
         check(reply.status in setOf(Status.PENDING, Status.STREAMING) && user.status == Status.USER_COMPLETE)
         check(database.messages().updateIfStatus(reply.id, reply.status, "", failed) == 1)
         check(database.messages().updateIfStatus(user.id, user.status, user.content, failed) == 1)
+        check(database.usageEvents().recordInterrupted(reply.id, usage?.inputTokens,
+            usage?.cachedInputTokens, usage?.outputTokens) == 1) { "Usage anchor missing" }
         touchConversation(user.conversationId)
     }
 
@@ -245,7 +264,7 @@ class ChatRepository(
         database.messages().insert(reply.copy(id = newId, modelId = model.apiId, status = Status.PENDING))
         check(database.messages().updateIfStatus(user.id, user.status, user.content, Status.USER_COMPLETE) == 1)
         database.usageEvents().insert(UsageEventEntity(
-            UUID.randomUUID().toString(), newId, conversationId, model.apiId, nowMillis(),
+            UUID.randomUUID().toString(), newId, conversationId, model.apiId, nextUsageTimestamp(conversationId, nowMillis()),
             null, null, null, null, null, false,
         ))
         touchConversation(conversationId)
@@ -328,6 +347,9 @@ class ChatRepository(
         check(previous < Long.MAX_VALUE) { "Timestamp space exhausted" }
         return maxOf(now, previous + 1)
     }
+
+    private fun nextUsageTimestamp(conversationId: String, now: Long): Long =
+        nextTimestamp(now, database.usageEvents().latestTimestamp(conversationId) ?: Long.MIN_VALUE)
 
     private fun effectivePrompt(value: String): String = if (value.isBlank()) "" else value
 

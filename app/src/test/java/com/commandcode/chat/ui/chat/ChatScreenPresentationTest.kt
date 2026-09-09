@@ -10,7 +10,6 @@ import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.ui.AmoledAppColours
 import com.commandcode.chat.ui.AppUiState
-import com.commandcode.chat.ui.StandardAppColours
 import com.commandcode.chat.ui.attachmentPickerMimeTypes
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -27,8 +26,9 @@ class ChatScreenPresentationTest {
     }
 
     @Test
-    fun userUsesGreenContainerAndAssistantUsesBlueContainerInBothThemes() {
-        listOf(StandardAppColours, AmoledAppColours).forEach { colours ->
+    fun userUsesGreenContainerAndAssistantUsesBlueContainer() {
+        with(AmoledAppColours) {
+            val colours = this
             assertEquals(colours.secondaryContainer, messageContainerColour("USER", colours))
             assertEquals(colours.onSecondaryContainer, messageContentColour("USER", colours))
             assertEquals(colours.primaryContainer, messageContainerColour("ASSISTANT", colours))
@@ -112,7 +112,8 @@ class ChatScreenPresentationTest {
 
     @Test
     fun disabledComposerDimsPlaceholderToMatchTheDimmedDraftText() {
-        listOf(StandardAppColours, AmoledAppColours).forEach { colours ->
+        with(AmoledAppColours) {
+            val colours = this
             assertEquals(colours.onSurface, composerContentColour(colours, enabled = true))
             assertEquals(colours.onSurface.copy(alpha = 0.38f), composerContentColour(colours, enabled = false))
             assertEquals(colours.onSurfaceVariant, composerPlaceholderColour(colours, enabled = true))

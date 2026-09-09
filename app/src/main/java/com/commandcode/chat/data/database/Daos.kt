@@ -87,6 +87,14 @@ data class MessageWithAttachments(
 
 @Dao interface UsageEventDao {
     @Insert fun insert(value: UsageEventEntity)
+    @Query("SELECT MAX(timestamp) FROM usage_events WHERE conversationId = :conversationId")
+    fun latestTimestamp(conversationId: String): Long?
+    @Query("""
+        UPDATE usage_events SET inputTokens = :inputTokens,
+            cachedInputTokens = :cachedInputTokens, outputTokens = :outputTokens
+        WHERE requestId = :requestId AND usageComplete = 0
+    """)
+    fun recordInterrupted(requestId: String, inputTokens: Long?, cachedInputTokens: Long?, outputTokens: Long?): Int
     @Query("""
         UPDATE usage_events SET
             inputTokens = :inputTokens,

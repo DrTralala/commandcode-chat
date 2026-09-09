@@ -305,7 +305,6 @@ class AttachmentPickerInstrumentedTest {
 
     private class TestSettings : SettingsStore {
         override var zdr = true
-        override var amoled = false
     }
 
     private class TestSystemPromptStore : SystemPromptStore {
@@ -327,7 +326,7 @@ class AttachmentPickerInstrumentedTest {
         ): PendingTurn = error("not expected")
         override suspend fun checkpointAssistant(messageId: String, text: String) = Unit
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean = false
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) = Unit
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) = Unit
         override suspend fun deleteConversation(id: String) = Unit
         override suspend fun backfillInitialModel(conversationId: String) = Unit
     }

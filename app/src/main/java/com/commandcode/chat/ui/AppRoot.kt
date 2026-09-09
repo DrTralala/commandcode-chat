@@ -65,8 +65,6 @@ import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.ui.chat.PickerTicket
 
-private val Ink = Color(0xFF0B111B)
-private val Slate = Color(0xFF131E2C)
 private val ElectricBlue = Color(0xFF2F8CFF)
 private val Amber = Color(0xFFFFB84D)
 private val MutedStatus = Color(0xFF9AA9BC)
@@ -74,21 +72,6 @@ internal val ZdrOnColour = Color(0xFF71D6AE)
 internal val ZdrOffColour = Color(0xFFFF6B6B)
 
 internal fun zdrStatusColour(zdr: Boolean): Color = if (zdr) ZdrOnColour else ZdrOffColour
-
-internal val StandardAppColours = darkColorScheme(
-    primary = ElectricBlue,
-    secondary = Amber,
-    background = Ink,
-    surface = Slate,
-    surfaceContainer = Slate,
-    primaryContainer = Color(0xFF123D6B),
-    secondaryContainer = Color(0xFF164744),
-    onPrimary = Color.White,
-    onBackground = Color(0xFFE8EEF7),
-    onSurface = Color(0xFFE8EEF7),
-    onPrimaryContainer = Color(0xFFE8EEF7),
-    onSecondaryContainer = Color(0xFFE8EEF7),
-)
 
 internal val AmoledAppColours = darkColorScheme(
     primary = ElectricBlue,
@@ -115,12 +98,7 @@ internal val AmoledAppColours = darkColorScheme(
 
 @Composable
 fun AppRoot(viewModel: AppViewModel?, startupRecovery: Boolean = false) {
-    val colours = if (viewModel != null) {
-        val state by viewModel.state.collectAsStateWithLifecycle()
-        if (state.amoled) AmoledAppColours else StandardAppColours
-    } else {
-        StandardAppColours
-    }
+    val colours = AmoledAppColours
     val view = LocalView.current
     SideEffect {
         val window = (view.context as? Activity)?.window ?: return@SideEffect
@@ -234,7 +212,6 @@ private fun AppContent(viewModel: AppViewModel) {
                         onSaveApiKey = viewModel::saveApiKey,
                         onClearApiKey = viewModel::clearApiKey,
                         onSetZdr = viewModel::setZdr,
-                        onSetAmoled = viewModel::setAmoled,
                         onSaveSystemPrompt = viewModel::saveSystemPrompt,
                         onClearSystemPrompt = viewModel::clearSystemPrompt,
                     )

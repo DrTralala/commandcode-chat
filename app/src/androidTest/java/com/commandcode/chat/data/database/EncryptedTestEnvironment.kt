@@ -72,6 +72,8 @@ internal class DatabaseChatStore(private val repository: ChatRepository) : ChatS
     override fun observeMessages(conversationId: String): Flow<List<Message>> =
         repository.observeMessages(conversationId)
 
+    override fun observeTokenUsage(conversationId: String) = repository.observeTokenUsage(conversationId)
+
     override suspend fun messagesSnapshot(conversationId: String): List<Message> =
         repository.messagesSnapshot(conversationId)
 
@@ -89,11 +91,11 @@ internal class DatabaseChatStore(private val repository: ChatRepository) : ChatS
     override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean =
         repository.completeTurn(messageId, text, usage)
 
-    override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) =
-        repository.interruptTurn(messageId, partialText, reason)
+    override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) =
+        repository.interruptTurn(messageId, partialText, reason, usage)
 
     override suspend fun deleteConversation(id: String) = repository.deleteConversation(id)
-    override suspend fun failZdrTurn(assistantMessageId: String) = repository.failZdrTurn(assistantMessageId)
+    override suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage?) = repository.failZdrTurn(assistantMessageId, usage)
     override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String) = repository.retryFailedTurn(userMessageId, model, systemPrompt)
     override suspend fun deleteFailedTurn(userMessageId: String) = repository.deleteFailedTurn(userMessageId)
     override suspend fun changeConversationModel(conversationId: String, model: ChatModel) = repository.changeConversationModel(conversationId, model)

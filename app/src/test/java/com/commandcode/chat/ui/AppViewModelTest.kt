@@ -31,6 +31,9 @@ import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
+import com.commandcode.chat.domain.ConversationTokenUsage
+import com.commandcode.chat.domain.ReportedUsage
+import com.commandcode.chat.data.service.ContextWindowCatalogue
 import java.io.IOException
 import java.time.Instant
 import kotlinx.coroutines.CompletableDeferred
@@ -66,6 +69,70 @@ class AppViewModelTest {
 
     @Before fun setMain() = Dispatchers.setMain(dispatcher)
     @After fun resetMain() = Dispatchers.resetMain()
+
+    @Test fun usageObservationIsScopedAndRestoredAfterNavigation() = runTest(dispatcher) {
+        val chats = FakeChats()
+        chats.addConversation("one")
+        chats.addConversation("two")
+        val measured = ConversationTokenUsage.aggregate(listOf(
+            ReportedUsage("event", null, ChatModel.SOL.apiId, 1, 200, 0, 50, true),
+        ))
+        chats.usage("one").value = measured
+        val vm = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(StreamEvent.Done) })
+        advanceUntilIdle()
+        vm.openConversation("one")
+        advanceUntilIdle()
+        assertEquals("Context ≈25%", vm.state.value.contextUsage.label)
+        vm.selectModel(model("model-1"))
+        advanceUntilIdle()
+        assertEquals("Context ≈25%", vm.state.value.contextUsage.label)
+        vm.openConversation("two")
+        assertNull(vm.state.value.tokenUsage.measurement)
+        advanceUntilIdle()
+        chats.usage("one").value = measured.copy(hasUnmeasuredAttempt = true)
+        advanceUntilIdle()
+        assertNull(vm.state.value.tokenUsage.measurement)
+        vm.openConversation("one")
+        advanceUntilIdle()
+        assertEquals(measured.measurement, vm.state.value.tokenUsage.measurement)
+        vm.newChat()
+        advanceUntilIdle()
+        assertNull(vm.state.value.tokenUsage.measurement)
+        vm.viewModelScope.cancel()
+    }
+
+    @Test fun cancellationForwardsAlreadyReceivedUsageWithoutCompletingIt() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val usage = TokenUsage(200, 50, 25)
+        val vm = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            emit(StreamEvent.Usage(usage))
+            awaitCancellation()
+        } })
+        configureKey(vm)
+        vm.send("hello")
+        runCurrent()
+        vm.cancel()
+        advanceUntilIdle()
+        assertEquals(usage, chats.interruptedUsage)
+        assertFalse(chats.usageCompleteByRequest.values.single())
+        vm.viewModelScope.cancel()
+    }
+
+    @Test fun routingFailureForwardsAlreadyReceivedUsageWithoutCompletingIt() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val usage = TokenUsage(200, 50, 25)
+        val vm = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            emit(StreamEvent.Usage(usage))
+            throw CommandCodeException.ZdrUnavailable()
+        } })
+        configureKey(vm)
+        vm.send("hello")
+        advanceUntilIdle()
+        assertEquals(usage, chats.interruptedUsage)
+        assertFalse(chats.usageCompleteByRequest.values.single())
+        assertEquals("FAILED_ZDR", vm.state.value.messages.single { it.role == "ASSISTANT" }.status)
+        vm.viewModelScope.cancel()
+    }
 
     @Test
     fun zdrOffAndPartialResponsesAreNeverMarkedAsRetryableRoutingFailures() = runTest(dispatcher) {
@@ -447,19 +514,6 @@ class AppViewModelTest {
         assertTrue(viewModel.state.value.sending)
         viewModel.cancel()
         advanceUntilIdle()
-    }
-
-    @Test
-    fun amoledLoadsFromSettingsAndPersistsChanges() = runTest(dispatcher) {
-        val settings = FakeSettings(amoled = true)
-        val viewModel = viewModel(FakeChats(), successfulSource("unused"), settings = settings)
-        runCurrent()
-        assertTrue(viewModel.state.value.amoled)
-
-        viewModel.setAmoled(false)
-
-        assertFalse(settings.amoled)
-        assertFalse(viewModel.state.value.amoled)
     }
 
     @Test
@@ -2056,6 +2110,7 @@ class AppViewModelTest {
         elapsedMillis = elapsedMillis,
         apiKeyCopier = apiKeyCopier,
         systemPromptStore = prompts,
+        contextWindowLoader = { ContextWindowCatalogue(mapOf(ChatModel.SOL.apiId to 1000L, "model-1" to 2000L)) },
     )
 
     private class FakeCatalogue(
@@ -2161,7 +2216,6 @@ class AppViewModelTest {
 
     private class FakeSettings(
         override var zdr: Boolean = true,
-        override var amoled: Boolean = false,
     ) : SettingsStore {
     }
 
@@ -2334,11 +2388,15 @@ class AppViewModelTest {
     private class FakeChats : ChatStore {
         val conversations = MutableStateFlow<List<Conversation>>(emptyList())
         private val messageFlows = mutableMapOf<String, MutableStateFlow<List<Message>>>()
+        private val usageFlows = mutableMapOf<String, MutableStateFlow<ConversationTokenUsage>>()
+        fun usage(id: String) = usageFlows.getOrPut(id) { MutableStateFlow(ConversationTokenUsage()) }
+        override fun observeTokenUsage(conversationId: String) = usage(conversationId)
         val checkpoints = mutableListOf<String>()
         val lifecycleEvents = mutableListOf<String>()
         var completedText: String? = null
         var completedUsage: TokenUsage? = null
         var interruptedText: String? = null
+        var interruptedUsage: TokenUsage? = null
         var completionEntered: CompletableDeferred<Unit>? = null
         var completionRelease: CompletableDeferred<Unit>? = null
         var beginTurnCommitted: CompletableDeferred<Unit>? = null
@@ -2395,10 +2453,11 @@ class AppViewModelTest {
             return true
         }
 
-        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String) {
+        override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) {
             check(messageConversation(messageId) !in deletedConversations) { "interrupt after delete" }
             lifecycleEvents += "interrupt:$messageId"
             interruptedText = partialText
+            interruptedUsage = usage
             updateAssistant(messageId, partialText, "INTERRUPTED")
         }
 
@@ -2410,7 +2469,8 @@ class AppViewModelTest {
             messageFlows.remove(id)
         }
 
-        override suspend fun failZdrTurn(assistantMessageId: String) {
+        override suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage?) {
+            interruptedUsage = usage
             val rows = messageFlows.values.single { flow -> flow.value.any { it.id == assistantMessageId } }
             val index = rows.value.indexOfFirst { it.id == assistantMessageId }
             rows.value = rows.value.mapIndexed { i, m -> if (i == index || i == index - 1) m.copy(status = "FAILED_ZDR") else m }
