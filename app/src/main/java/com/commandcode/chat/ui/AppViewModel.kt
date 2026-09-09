@@ -508,6 +508,7 @@ class AppViewModel(
         if (conversationId == null) {
             nextDraftGeneration()
             mutableState.value = mutableState.value.copy(selectedModel = currentModel)
+            dismissResolvedModelAttachmentError()
             return
         }
         messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
@@ -515,6 +516,7 @@ class AppViewModel(
                 chats.changeConversationModel(conversationId, currentModel)
                 nextDraftGeneration()
                 mutableState.value = mutableState.value.copy(selectedModel = currentModel)
+                dismissResolvedModelAttachmentError()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -527,6 +529,16 @@ class AppViewModel(
             }
         }
         messageMutationJob?.start()
+    }
+
+    private fun dismissResolvedModelAttachmentError() {
+        val current = mutableState.value
+        if ((current.attachmentError == AttachmentFailure.UNSUPPORTED_MODEL ||
+                current.attachmentError == AttachmentFailure.UNVERIFIED_MODEL) &&
+            AttachmentPolicy.capability(current.selectedModel.apiId).support == AttachmentSupport.DOCUMENTED
+        ) {
+            dismissAttachmentError()
+        }
     }
 
     fun refreshQuota() {

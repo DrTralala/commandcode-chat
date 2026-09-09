@@ -1132,6 +1132,86 @@ class AppViewModelTest {
     }
 
     @Test
+    fun switchingNewChatToSupportedModelClearsAttachmentSupportWarning() = runTest(dispatcher) {
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"))
+        advanceUntilIdle()
+        viewModel.selectModel(model("model-1"))
+        assertNull(viewModel.requestAttachmentPicker())
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+        assertEquals("This model does not support attachments", viewModel.state.value.errorMessage)
+
+        viewModel.selectModel(ChatModel.SOL)
+
+        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertNull(viewModel.state.value.attachmentError)
+        assertNull(viewModel.state.value.errorMessage)
+        assertTrue(viewModel.requestAttachmentPicker() != null)
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
+    fun switchingSavedChatClearsWarningOnlyAfterModelChangeSucceeds() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("chat") }
+        val viewModel = viewModel(chats, successfulSource("unused"))
+        advanceUntilIdle()
+        viewModel.openConversation("chat")
+        advanceUntilIdle()
+        viewModel.selectModel(model("model-1"))
+        advanceUntilIdle()
+        assertNull(viewModel.requestAttachmentPicker())
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+
+        viewModel.selectModel(ChatModel.SOL)
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+        advanceUntilIdle()
+
+        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertNull(viewModel.state.value.attachmentError)
+        assertNull(viewModel.state.value.errorMessage)
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
+    fun switchingToAnotherUnverifiedModelKeepsAttachmentWarning() = runTest(dispatcher) {
+        val catalogue = FakeCatalogue(local = catalogueSnapshot(
+            models = listOf(ChatModel.SOL, model("text-a"), model("text-b")),
+        ))
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
+        advanceUntilIdle()
+        viewModel.selectModel(model("text-a"))
+        assertNull(viewModel.requestAttachmentPicker())
+
+        viewModel.selectModel(model("text-b"))
+
+        assertEquals("text-b", viewModel.state.value.selectedModel.apiId)
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+        assertEquals("This model does not support attachments", viewModel.state.value.errorMessage)
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
+    fun switchingToSupportedModelKeepsUnrelatedAttachmentErrors() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats).apply {
+            importFailure = AttachmentException(AttachmentFailure.INVALID_FORMAT)
+        }
+        val catalogue = FakeCatalogue(local = catalogueSnapshot(models = listOf(ChatModel.SOL, ChatModel.LUNA)))
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations, catalogue = catalogue)
+        advanceUntilIdle()
+        viewModel.importAttachments(requireNotNull(viewModel.requestAttachmentPicker()), listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        assertEquals(AttachmentFailure.INVALID_FORMAT, viewModel.state.value.attachmentError)
+        val message = viewModel.state.value.errorMessage
+
+        viewModel.selectModel(ChatModel.LUNA)
+
+        assertEquals(ChatModel.LUNA, viewModel.state.value.selectedModel)
+        assertEquals(AttachmentFailure.INVALID_FORMAT, viewModel.state.value.attachmentError)
+        assertEquals(message, viewModel.state.value.errorMessage)
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
     fun pickerTicketIsInvalidatedByModelConversationAndUnsavedNewChatChanges() = runTest(dispatcher) {
         val chats = FakeChats().apply { addConversation("other") }
         val operations = FakeAttachmentOperations(chats)
