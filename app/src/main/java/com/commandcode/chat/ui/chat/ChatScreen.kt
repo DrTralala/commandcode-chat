@@ -113,6 +113,54 @@ internal fun initialModelName(content: String, modelId: String?, models: List<Ch
     return models.firstOrNull { it.apiId == catalogueId }?.displayName ?: content
 }
 
+private fun isConversationalMessage(message: Message): Boolean =
+    message.role == "USER" || message.role == "ASSISTANT"
+
+private fun comesBefore(left: Message, right: Message): Boolean =
+    left.createdAt < right.createdAt ||
+        (left.createdAt == right.createdAt && left.id < right.id)
+
+/**
+ * Hides only the persisted prompt fingerprint that established a chat's initial
+ * prompt baseline. The fingerprint remains in [Message] for request deduplication.
+ *
+ * New conversations record [conversationCreatedAt] at the first user turn, which
+ * distinguishes an initial marker from a later marker even if the first turn was
+ * subsequently deleted. When that metadata is unavailable (for example while an
+ * old chat is being reopened), the earliest remaining conversational row is used.
+ * If both forms of evidence are absent, the marker is kept rather than guessing;
+ * history deletion can otherwise make a later change indistinguishable from the
+ * initial baseline.
+ */
+internal fun timelineMessagesForDisplay(
+    messages: List<Message>,
+    conversationCreatedAt: Long? = null,
+): List<Message> {
+    val firstConversational = messages
+        .filter(::isConversationalMessage)
+        .minWithOrNull(compareBy<Message> { it.createdAt }.thenBy { it.id })
+    val firstPromptChange = messages
+        .filter { it.role == MessageState.SYSTEM_PROMPT_CHANGE }
+        .minWithOrNull(compareBy<Message> { it.createdAt }.thenBy { it.id })
+    val initialModel = messages
+        .filter { it.role == MessageState.INITIAL_MODEL }
+        .minWithOrNull(compareBy<Message> { it.createdAt }.thenBy { it.id })
+
+    val promptBaselineId = firstPromptChange?.takeIf { prompt ->
+        val precedesConversationStart = if (conversationCreatedAt != null) {
+            prompt.createdAt < conversationCreatedAt ||
+                (prompt.createdAt == conversationCreatedAt &&
+                    firstConversational?.let { comesBefore(prompt, it) } == true)
+        } else {
+            firstConversational?.let { comesBefore(prompt, it) } == true
+        }
+        val followsInitialModel = initialModel?.let { comesBefore(it, prompt) } ?: true
+        precedesConversationStart && followsInitialModel
+    }?.id
+
+    return messages.filterNot { it.id == promptBaselineId }
+}
+
 /** Local-only timeline notice copy. SYSTEM_PROMPT_CHANGE content is private metadata, never shown. */
 internal fun noticeText(message: Message, models: List<ChatModel>): String? = when (message.role) {
     MessageState.INITIAL_MODEL -> "Model: ${initialModelName(message.content, message.modelId, models)}"
@@ -147,7 +195,11 @@ fun ChatScreen(
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val activeId = state.activeAssistantMessageId.takeIf { state.sending && state.currentConversationId == state.activeConversationId }
-    val timeline = state.messages.filterNot { it.role == "ASSISTANT" && it.status == MessageState.FAILED_ZDR }.let { rows ->
+    val conversationCreatedAt = state.currentConversationId?.let { id ->
+        state.conversations.firstOrNull { it.id == id }?.createdAt
+    }
+    val timeline = timelineMessagesForDisplay(state.messages, conversationCreatedAt)
+        .filterNot { it.role == "ASSISTANT" && it.status == MessageState.FAILED_ZDR }.let { rows ->
         if (activeId != null && rows.none { it.id == activeId }) {
             rows + Message(activeId, state.currentConversationId.orEmpty(), "ASSISTANT", "", null, Long.MAX_VALUE, "PENDING")
         } else rows

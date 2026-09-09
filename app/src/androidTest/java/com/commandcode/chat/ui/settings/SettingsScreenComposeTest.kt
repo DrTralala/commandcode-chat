@@ -16,12 +16,14 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.commandcode.chat.data.security.effectiveSystemPrompt
 import com.commandcode.chat.ui.AppUiState
 import com.commandcode.chat.ui.SYSTEM_PROMPT_UNAVAILABLE_MESSAGE
 import com.commandcode.chat.ui.SystemPromptFeedback
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -197,5 +199,37 @@ class SettingsScreenComposeTest {
         }
 
         compose.onAllNodesWithText(SYSTEM_PROMPT_UNAVAILABLE_MESSAGE).assertCountEquals(1)
+    }
+
+    @Test
+    fun systemPromptActionsUseSaveLabelAndHaveAComfortableGapAfterTheField() {
+        compose.setContent {
+            MaterialTheme {
+                SettingsScreen(
+                    state = AppUiState(
+                        loading = false,
+                        keyConfigured = true,
+                        systemPromptLoaded = true,
+                    ),
+                    onSaveApiKey = {},
+                    onClearApiKey = {},
+                    onSetZdr = {},
+                    onSetAmoled = {},
+                    onSaveSystemPrompt = {},
+                    onClearSystemPrompt = {},
+                )
+            }
+        }
+
+        compose.onNodeWithTag("save_system_prompt").performScrollTo()
+        compose.onNodeWithText("Save").assertIsDisplayed()
+        compose.onAllNodesWithText("Save system prompt").assertCountEquals(0)
+
+        val field = compose.onNodeWithTag("system_prompt_field").fetchSemanticsNode().boundsInRoot
+        val save = compose.onNodeWithTag("save_system_prompt").fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            "save action must be separated from the prompt field: field=$field save=$save",
+            save.top - field.bottom >= with(compose.density) { 12.dp.toPx() } - 1f,
+        )
     }
 }

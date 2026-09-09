@@ -51,6 +51,8 @@ internal fun systemPromptFeedbackText(feedback: SystemPromptFeedback): String = 
     SystemPromptFeedback.LOAD_FAILED -> SYSTEM_PROMPT_UNAVAILABLE_MESSAGE
 }
 
+private val SYSTEM_PROMPT_ACTION_ROW_TOP_PADDING = 12.dp
+
 @Composable
 fun SettingsScreen(
     state: AppUiState,
@@ -150,14 +152,18 @@ fun SettingsScreen(
                     },
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier
+                    .padding(top = SYSTEM_PROMPT_ACTION_ROW_TOP_PADDING),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Button(
                     onClick = { onSaveSystemPrompt(promptDraft) },
                     enabled = !state.systemPromptSaving && !state.loading,
                     modifier = Modifier
                         .weight(1f)
                         .testTag("save_system_prompt"),
-                ) { Text("Save system prompt") }
+                ) { Text("Save") }
                 OutlinedButton(
                     onClick = onClearSystemPrompt,
                     enabled = !state.systemPromptSaving && !state.loading,

@@ -168,6 +168,50 @@ class ChatScreenPresentationTest {
     }
 
     @Test
+    fun initialPromptBaselineIsHiddenButLaterPromptChangesRemainVisible() {
+        val rows = listOf(
+            Message("initial-model", "conversation", MessageState.INITIAL_MODEL, "GPT-5.6 Sol", ChatModel.SOL.apiId, 1L, "COMPLETE"),
+            Message("initial-prompt", "conversation", MessageState.SYSTEM_PROMPT_CHANGE, "initial-fingerprint", null, 2L, "COMPLETE"),
+            Message("first-user", "conversation", "USER", "First", null, 3L, "COMPLETE"),
+            Message("first-answer", "conversation", "ASSISTANT", "Answer", ChatModel.SOL.apiId, 4L, "COMPLETE"),
+            Message("later-prompt", "conversation", MessageState.SYSTEM_PROMPT_CHANGE, "later-fingerprint", null, 5L, "COMPLETE"),
+        )
+
+        assertEquals(
+            listOf("initial-model", "first-user", "first-answer", "later-prompt"),
+            timelineMessagesForDisplay(rows, conversationCreatedAt = 3L).map(Message::id),
+        )
+    }
+
+    @Test
+    fun promptChangeAfterDeletedFirstTurnIsNotMistakenForTheInitialBaseline() {
+        val rows = listOf(
+            Message("initial-model", "conversation", MessageState.INITIAL_MODEL, "GPT-5.6 Sol", ChatModel.SOL.apiId, 1L, "COMPLETE"),
+            Message("later-prompt", "conversation", MessageState.SYSTEM_PROMPT_CHANGE, "later-fingerprint", null, 10L, "COMPLETE"),
+        )
+
+        assertEquals(
+            listOf("initial-model", "later-prompt"),
+            timelineMessagesForDisplay(rows, conversationCreatedAt = 3L).map(Message::id),
+        )
+    }
+
+    @Test
+    fun initialPromptBaselineUsesEarliestConversationEvidenceWhenMetadataIsUnavailable() {
+        val rows = listOf(
+            Message("initial-model", "conversation", MessageState.INITIAL_MODEL, "GPT-5.6 Sol", ChatModel.SOL.apiId, 1L, "COMPLETE"),
+            Message("initial-prompt", "conversation", MessageState.SYSTEM_PROMPT_CHANGE, "initial-fingerprint", null, 2L, "COMPLETE"),
+            Message("first-user", "conversation", "USER", "First", null, 3L, "COMPLETE"),
+            Message("first-answer", "conversation", "ASSISTANT", "Answer", ChatModel.SOL.apiId, 4L, "COMPLETE"),
+        )
+
+        assertEquals(
+            listOf("initial-model", "first-user", "first-answer"),
+            timelineMessagesForDisplay(rows).map(Message::id),
+        )
+    }
+
+    @Test
     fun disabledModelsShowOnlyTheSimpleAttachmentError() {
         val unsupported = attachmentErrorCopy(AttachmentFailure.UNSUPPORTED_MODEL)
         assertEquals("This model does not support attachments", unsupported.primary)
