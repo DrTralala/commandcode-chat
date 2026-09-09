@@ -74,6 +74,16 @@ class SettingsScreenComposeTest {
     }
 
     @Test
+    fun systemPromptOmitsEncryptionHelperCopyButKeepsEditingControls() {
+        promptHarness(AppUiState(loading = false, systemPromptLoaded = true, keyConfigured = true))
+        compose.onAllNodesWithText("Encrypted locally.", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("The actual instructions", substring = true).assertCountEquals(0)
+        compose.onNodeWithTag("system_prompt_field").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("save_system_prompt").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("clear_system_prompt").assertIsDisplayed()
+    }
+
+    @Test
     fun configuredKeyHidesEntryControlsAndClearRevealsThem() {
         var state by mutableStateOf(AppUiState(loading = false, keyConfigured = true))
         var clearCalls = 0

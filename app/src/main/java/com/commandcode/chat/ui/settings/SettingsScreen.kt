@@ -111,11 +111,6 @@ fun SettingsScreen(
         }
         Column {
             Text("System prompt")
-            Text(
-                "Encrypted locally. The actual instructions are sent to the provider with " +
-                    "every message you send, including images.",
-                style = MaterialTheme.typography.bodySmall,
-            )
             OutlinedTextField(
                 value = promptDraft,
                 onValueChange = { promptDraft = it },

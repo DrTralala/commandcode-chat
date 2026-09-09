@@ -3,7 +3,7 @@
 # Command Code Chat
 
 [![CI](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml/badge.svg)](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml)
-[![Version](https://img.shields.io/badge/version-v2.3.0-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v2.3.0)
+[![Version](https://img.shields.io/badge/version-v2.3.1-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v2.3.1)
 [![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
 
@@ -35,7 +35,7 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 - Bundles a pinned, validated GOAT model catalogue in the APK.
 - Shows plan-aware credit usage, including rolling windows when the account provides them, with safe stale-data fallback.
 - Stores conversations and usage history in an encrypted local database.
-- Shows estimated context-window usage as a percentage beside or below the composer model name.
+- Shows estimated context-window usage as a right-aligned percentage before the composer's attachment and send controls.
 - Enables zero data retention (ZDR) by default and can fail rather than use a non-ZDR provider.
 - Marks ZDR-routing failures with a red exclamation; long-press or tap it to Retry with current model/ZDR settings or Delete the failed message.
 - Persists local model-change notices without sending them to the provider.
@@ -46,11 +46,11 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 
 ### Context-window usage
 
-- Tap the context percentage for the last measured model and freshness information. No raw token counts or token fractions are displayed.
+- The non-interactive context percentage rounds to the nearest whole number (0.5% rounds up to 1%). There is no popup, prefix, approximation marker, raw token count or token fraction. The displayed value is blue at 0–49%, orange at 50–79%, and red at 80% or above.
 - The estimate uses the latest completed response's provider-reported input plus output, divided by that response model's context-window capacity. It does not sum historical prompts or add cached input again.
 - Switching models keeps the displayed percentage unchanged until a response supplies new usage; that response then uses its own model's capacity.
-- Drafts, unsent attachments and subsequent system-prompt changes are excluded. During streaming, cancellation or missing usage, the last measurement remains with an explanation. A retry of an earlier message can measure only that earlier part of the conversation.
-- New chats show `Context —`; measured models without verified limits show `Context unavailable`. Values above 100% are not clamped, and the indicator does not block sending or prune history.
+- Drafts, unsent attachments and subsequent system-prompt changes are excluded. During streaming, cancellation or missing usage, the last measurement remains. A retry of an earlier message can measure only that earlier part of the conversation.
+- New chats and measured models without verified limits show a neutral `—`, not 0%. Values above 100% are not clamped, and the indicator does not block sending or prune history.
 - Exact-model capacities are pinned in `catalogue/model-context-windows.json`, verified on 10 September 2026 against the public [Provider model list](https://api.commandcode.ai/provider/v1/models), documented in the [Provider API reference](https://commandcode.ai/docs/provider). Unlisted free variants remain unknown rather than inheriting paid-model limits. This metadata is bundled, not fetched at runtime.
 - Cumulative input, output and cached-input accounting remains internal and separate from context. Received usage is preserved for interrupted or failed requests without treating them as completed context measurements. Missing reports remain unknown, so these aggregates are not billing-grade totals.
 

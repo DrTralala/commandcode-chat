@@ -22,6 +22,8 @@ import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertHasNoClickAction
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -57,7 +59,7 @@ class ChatScreenComposeTest {
     @get:Rule
     val compose = createComposeRule()
 
-    @Test fun contextIndicatorRemainsTappableWhileStreamingAndResetsDialogOnNavigation() {
+    @Test fun contextIndicatorIsPercentageOnlyAndDoesNotOpenAPopupWhileStreaming() {
         val live = mutableStateOf(state().copy(
             sending = true, activeConversationId = "conversation",
             tokenUsage = ConversationTokenUsage.aggregate(listOf(
@@ -70,14 +72,16 @@ class ChatScreenComposeTest {
                 ChatScreen(live.value, {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") })
             }
         }
-        compose.onNodeWithTag("context_usage").assertIsDisplayed().assertIsEnabled().performClick()
-        compose.onNodeWithTag("context_usage_dialog").assertIsDisplayed()
-        compose.onNodeWithText("A response is streaming.", substring = true).assertExists()
+        compose.onNodeWithText("25%").assertIsDisplayed().assertHasNoClickAction()
+        compose.onNodeWithTag("context_usage")
+            .assertContentDescriptionEquals("Estimated context usage: 25%")
+            .performTouchInput { click() }
+        compose.onNodeWithTag("context_usage_dialog").assertDoesNotExist()
         compose.onAllNodesWithText("250", substring = true).assertCountEquals(0)
         compose.onAllNodesWithText("1000", substring = true).assertCountEquals(0)
         compose.runOnIdle { live.value = live.value.copy(currentConversationId = "another", tokenUsage = ConversationTokenUsage()) }
         compose.onNodeWithTag("context_usage_dialog").assertDoesNotExist()
-        compose.onNodeWithText("Context —").assertIsDisplayed()
+        compose.onNodeWithText("—").assertIsDisplayed()
     }
 
     @Test fun narrowLargeTextComposerKeepsContextAndActionButtonsVisible() {
@@ -86,19 +90,31 @@ class ChatScreenComposeTest {
             CompositionLocalProvider(LocalDensity provides Density(density.density, 1.5f)) {
                 MaterialTheme {
                     Box(Modifier.width(320.dp).height(320.dp)) {
-                        ChatScreen(state().copy(selectedModel = ChatModel.SOL.copy(displayName = "A very long model display name")),
+                        ChatScreen(state().copy(
+                            selectedModel = ChatModel.SOL.copy(displayName = "A very long model display name"),
+                            tokenUsage = ConversationTokenUsage.aggregate(listOf(
+                                ReportedUsage("event", null, ChatModel.SOL.apiId, 1, 1000, 0, 0, true),
+                            )),
+                            contextWindows = ContextWindowCatalogue(mapOf(ChatModel.SOL.apiId to 1000L)),
+                        ),
                             {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") })
                     }
                 }
             }
         }
-        compose.onNodeWithTag("context_usage").assertIsDisplayed().performClick()
-        compose.onNodeWithText("Close").performClick()
+        compose.onNodeWithText("100%").assertIsDisplayed().assertHasNoClickAction()
         compose.onNodeWithTag("attach_image").assertIsDisplayed()
         compose.onNodeWithTag("send_message").assertIsDisplayed()
         val context = compose.onNodeWithTag("context_usage").fetchSemanticsNode().boundsInRoot
         val attach = compose.onNodeWithTag("attach_image").fetchSemanticsNode().boundsInRoot
+        val model = compose.onNodeWithTag("composer_model").fetchSemanticsNode().boundsInRoot
+        val send = compose.onNodeWithTag("send_message").fetchSemanticsNode().boundsInRoot
+        assertTrue("model must remain left of context", model.right <= context.left)
         assertTrue("context must not overlap attachment target", context.right <= attach.left)
+        assertTrue("attachment must precede send", attach.right <= send.left)
+        assertEquals("context and icons share one row", attach.center.y, context.center.y, 1f)
+        assertEquals("model and icons share one row", attach.center.y, model.center.y, 1f)
+        assertEquals("action buttons share one row", attach.center.y, send.center.y, 1f)
     }
 
     @Test

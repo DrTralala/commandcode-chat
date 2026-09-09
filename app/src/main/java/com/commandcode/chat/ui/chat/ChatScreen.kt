@@ -50,7 +50,6 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -399,20 +398,8 @@ fun ChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                BoxWithConstraints(Modifier.weight(1f)) {
-                    val inline = maxWidth / LocalDensity.current.fontScale >= 320.dp
-                    if (inline) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            ComposerModelName(state.selectedModel.displayName, Modifier.weight(1f))
-                            ContextUsageIndicator(state.contextUsage, state.currentConversationId)
-                        }
-                    } else {
-                        Column {
-                            ComposerModelName(state.selectedModel.displayName)
-                            ContextUsageIndicator(state.contextUsage, state.currentConversationId)
-                        }
-                    }
-                }
+                ComposerModelName(state.selectedModel.displayName, Modifier.weight(1f))
+                ContextUsageIndicator(state.contextUsage)
                 IconButton(
                     onClick = onAttach,
                     enabled = composerEnabled,
