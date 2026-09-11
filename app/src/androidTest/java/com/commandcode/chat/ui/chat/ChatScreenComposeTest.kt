@@ -29,6 +29,7 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
@@ -118,9 +119,10 @@ class ChatScreenComposeTest {
     }
 
     @Test
-    fun failedMessageLongPressOffersRetryAndDeleteAndSuccessfulMessagesDoNot() {
+    fun failedMessageLongPressOffersNormalActionsAndRedIndicatorOffersRetryAndDelete() {
         var retried: String? = null
         var deleted: String? = null
+        var edited: String? = null
         val rows = listOf(
             Message("failed", "conversation", "USER", "Try this", null, 1, "FAILED_ZDR"),
             Message("empty", "conversation", "ASSISTANT", "", null, 2, "FAILED_ZDR", replyToMessageId = "failed"),
@@ -129,7 +131,8 @@ class ChatScreenComposeTest {
         compose.setContent {
             MaterialTheme {
                 ChatScreen(state().copy(messages = rows), {}, {}, {}, {}, {}, {}, {}, {}, { _, _ -> error("unused") },
-                    onRetryMessage = { retried = it }, onDeleteFailedMessage = { deleted = it })
+                    onRetryMessage = { retried = it }, onDeleteFailedMessage = { deleted = it },
+                    onStartMessageEdit = { edited = it })
             }
         }
         compose.onNodeWithTag("failed_message_failed").assertIsDisplayed()
@@ -137,11 +140,88 @@ class ChatScreenComposeTest {
         compose.onNodeWithTag("message_empty").assertDoesNotExist()
         compose.onNodeWithText("Model changed to GPT-5.6 Luna").assertIsDisplayed()
         compose.onNodeWithTag("message_failed").performTouchInput { longClick() }
+        compose.onNodeWithText("Edit message").performClick()
+        assertEquals("failed", edited)
+        compose.onNodeWithTag("message_failed").performTouchInput { longClick() }
+        compose.onNodeWithText("Copy").performClick()
+        assertEquals(null, retried)
+        compose.onNodeWithTag("failed_message_failed").performClick()
         compose.onNodeWithText("Retry").performClick()
         assertEquals("failed", retried)
         compose.onNodeWithTag("failed_message_failed").performClick()
         compose.onNodeWithText("Delete").performClick()
         assertEquals("failed", deleted)
+    }
+
+    @Test
+    fun selectTextClearsWhenFailedMessageActionIconOpens() {
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(
+                        messages = listOf(
+                            Message("failed", "conversation", "USER", "Failed", null, 1L, MessageState.FAILED_ZDR),
+                            Message("failed_reply", "conversation", "ASSISTANT", "", null, 2L, MessageState.FAILED_ZDR, replyToMessageId = "failed"),
+                            Message("other", "conversation", "USER", "Other message", null, 3L, "COMPLETE"),
+                        ),
+                    ),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+
+        enterTextSelection("other")
+        compose.onNodeWithTag("failed_message_failed").performClick()
+        compose.onNodeWithTag("failed_message_retry_failed").assertIsDisplayed()
+        compose.onNodeWithTag("message_selectable_text_other").assertDoesNotExist()
+    }
+
+    @Test
+    fun selectTextClearsWhenComposerAttachmentPickerOpens() {
+        var pickerCalls = 0
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state(),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = { pickerCalls += 1 }, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+
+        enterTextSelection("message")
+        compose.onNodeWithTag("attach_image").performClick()
+        assertEquals(1, pickerCalls)
+        compose.onNodeWithTag("message_selectable_text_message").assertDoesNotExist()
+    }
+
+    @Test
+    fun selectTextClearsWhenPendingComposerAttachmentIsRemoved() {
+        val pending = image()
+        compose.setContent {
+            var uiState by remember { mutableStateOf(state().copy(pendingAttachments = listOf(pending))) }
+            MaterialTheme {
+                ChatScreen(
+                    state = uiState,
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {},
+                    onRemoveAttachment = { removedId ->
+                        uiState = uiState.copy(
+                            pendingAttachments = uiState.pendingAttachments.filterNot { it.id == removedId },
+                        )
+                    },
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("preview not used") },
+                )
+            }
+        }
+
+        enterTextSelection("message")
+        compose.onNodeWithTag("remove_attachment_${pending.id}").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("message_selectable_text_message").assertDoesNotExist()
     }
 
     @Test
@@ -585,7 +665,9 @@ class ChatScreenComposeTest {
         compose.waitForIdle()
 
         compose.onNodeWithTag("message_image-message").assertIsDisplayed()
-        compose.onNodeWithTag("message_attachment_${image.id}").assertIsDisplayed()
+        compose.onNodeWithTag("message_attachment_${image.id}", useUnmergedTree = true)
+            .performScrollTo()
+            .assertIsDisplayed()
         compose.onNodeWithText("photo.png").assertIsDisplayed()
         compose.onNodeWithText("<0.01 MB").assertIsDisplayed()
         compose.onNodeWithText("Preview unavailable").assertIsDisplayed()
@@ -825,4 +907,9 @@ class ChatScreenComposeTest {
         width = 2,
         height = 2,
     )
+
+    private fun enterTextSelection(messageId: String) {
+        compose.onNodeWithTag("message_text_$messageId").performTouchInput { longClick() }
+        compose.onNodeWithTag("message_menu_select_text_$messageId").performClick()
+    }
 }

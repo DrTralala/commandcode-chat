@@ -66,4 +66,16 @@ class ConversationTokenUsageTest {
         assertEquals("z", usage.measurement?.requestId)
         assertEquals(15L, usage.measurement?.currentContextTokens)
     }
+
+    @Test fun explicitContextScopeOnlyChangesMeasurementAndFreshness() {
+        val usage = ConversationTokenUsage.aggregate(listOf(
+            ReportedUsage("e1", "a1", "m", 1, 100, 0, 20, true),
+            ReportedUsage("e2", "a2", "m", 2, 500, 0, 50, true),
+        ), setOf("a1"))
+
+        assertEquals(670L, usage.totalProcessedTokens)
+        assertEquals("a1", usage.measurement!!.requestId)
+        assertEquals(120L, usage.measurement!!.currentContextTokens)
+        assertFalse(usage.hasUnmeasuredAttempt)
+    }
 }

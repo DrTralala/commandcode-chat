@@ -12,6 +12,8 @@ import com.commandcode.chat.data.commandcode.CommandCodeException
 import com.commandcode.chat.data.commandcode.StreamEvent
 import com.commandcode.chat.data.attachments.AttachmentOperations
 import com.commandcode.chat.data.attachments.PreparedAttachmentTurn
+import com.commandcode.chat.data.database.AlternativeRequest
+import com.commandcode.chat.data.database.AlternativeSource
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
@@ -30,6 +32,7 @@ import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
+import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.domain.TokenUsage
 import com.commandcode.chat.domain.ConversationTokenUsage
 import com.commandcode.chat.domain.ReportedUsage
@@ -347,6 +350,26 @@ class AppViewModelTest {
         assertEquals(false, chats.usageCompleteByRequest["assistant-1"])
         assertTrue(chats.lifecycleEvents.contains("interrupt:assistant-1"))
         assertFalse(viewModel.state.value.sending)
+    }
+
+    @Test
+    fun cancellationImmediatelyAfterLazySendStartReleasesSendHandleAndHandoff() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val viewModel = viewModel(chats, successfulSource("answer"))
+        configureKey(viewModel)
+        viewModel.openConversation("conversation")
+        advanceUntilIdle()
+
+        viewModel.send("cancel before body")
+        viewModel.cancel()
+        advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.sending)
+        viewModel.send("after cancellation")
+        advanceUntilIdle()
+
+        assertEquals(1, chats.beginTurnCalls)
+        assertEquals("after cancellation", chats.messagesSnapshot("conversation").single { it.role == "USER" }.content)
     }
 
     @Test
@@ -1733,6 +1756,140 @@ class AppViewModelTest {
     }
 
     @Test
+    fun currentConversationDeletionPublishesBusyStateUntilComplete() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("conversation") }
+        val operations = FakeAttachmentOperations(chats).apply {
+            deleteEntered = CompletableDeferred()
+            deleteRelease = CompletableDeferred()
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("conversation")
+        runCurrent()
+        viewModel.updateDraft("before delete")
+
+        viewModel.deleteConversation("conversation")
+        runCurrent()
+        operations.deleteEntered!!.await()
+
+        assertTrue(viewModel.state.value.deletingCurrentConversation)
+        assertTrue(viewModel.state.value.messageActionsBusy)
+        viewModel.updateDraft("must remain blocked")
+        assertEquals("before delete", viewModel.state.value.draftText)
+
+        operations.deleteRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.deletingCurrentConversation)
+        assertFalse(viewModel.state.value.messageActionsBusy)
+        assertNull(viewModel.state.value.currentConversationId)
+    }
+
+    @Test
+    fun unrelatedConversationDeletionDoesNotFreezeCurrentMessageActions() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("current")
+            addConversation("other")
+        }
+        val operations = FakeAttachmentOperations(chats).apply {
+            deleteEntered = CompletableDeferred()
+            deleteRelease = CompletableDeferred()
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("current")
+        runCurrent()
+        viewModel.updateDraft("still editable")
+
+        viewModel.deleteConversation("other")
+        runCurrent()
+        operations.deleteEntered!!.await()
+
+        assertFalse(viewModel.state.value.deletingCurrentConversation)
+        assertFalse(viewModel.state.value.messageActionsBusy)
+        viewModel.updateDraft("still editable after unrelated delete starts")
+        assertEquals("still editable after unrelated delete starts", viewModel.state.value.draftText)
+
+        operations.deleteRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("current", viewModel.state.value.currentConversationId)
+        assertTrue(chats.conversations.value.none { it.id == "other" })
+    }
+
+    @Test
+    fun overlappingDeletionCleanupUsesConversationIdentityAfterCurrentIdIsCleared() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("old")
+            addConversation("new")
+        }
+        val oldDeleteEntered = CompletableDeferred<Unit>()
+        val oldDeleteRelease = CompletableDeferred<Unit>()
+        val oldDiscardEntered = CompletableDeferred<Unit>()
+        val oldDiscardRelease = CompletableDeferred<Unit>()
+        val operations = FakeAttachmentOperations(chats).apply {
+            deleteEntered = oldDeleteEntered
+            deleteRelease = oldDeleteRelease
+            discardEntered = oldDiscardEntered
+            discardRelease = oldDiscardRelease
+        }
+        val viewModel = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        viewModel.openConversation("old")
+        runCurrent()
+        val ticket = requireNotNull(viewModel.requestAttachmentPicker())
+        viewModel.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        viewModel.updateDraft("old draft")
+
+        viewModel.deleteConversation("old")
+        runCurrent()
+        oldDeleteEntered.await()
+        oldDeleteRelease.complete(Unit)
+        runCurrent()
+        oldDiscardEntered.await()
+
+        assertNull(viewModel.state.value.currentConversationId)
+        assertEquals(setOf("old"), viewModel.state.value.deletingConversationIds)
+        assertFalse(viewModel.state.value.deletingCurrentConversation)
+        assertFalse(viewModel.state.value.messageActionsBusy)
+
+        viewModel.newChat()
+        assertNull(viewModel.state.value.currentConversationId)
+        assertFalse(viewModel.state.value.deletingCurrentConversation)
+        assertFalse(viewModel.state.value.messageActionsBusy)
+
+        viewModel.openConversation("new")
+        assertEquals("new", viewModel.state.value.currentConversationId)
+
+        val newDeleteEntered = CompletableDeferred<Unit>()
+        val newDeleteRelease = CompletableDeferred<Unit>()
+        operations.deleteEntered = newDeleteEntered
+        operations.deleteRelease = newDeleteRelease
+        viewModel.deleteConversation("new")
+        runCurrent()
+        newDeleteEntered.await()
+
+        assertEquals(setOf("old", "new"), viewModel.state.value.deletingConversationIds)
+        assertTrue(viewModel.state.value.deletingCurrentConversation)
+        assertTrue(viewModel.state.value.messageActionsBusy)
+
+        oldDiscardRelease.complete(Unit)
+        runCurrent()
+
+        assertEquals(setOf("new"), viewModel.state.value.deletingConversationIds)
+        assertTrue(viewModel.state.value.deletingCurrentConversation)
+        assertTrue(viewModel.state.value.messageActionsBusy)
+
+        newDeleteRelease.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.state.value.deletingConversationIds.isEmpty())
+        assertFalse(viewModel.state.value.deletingCurrentConversation)
+        assertFalse(viewModel.state.value.messageActionsBusy)
+    }
+
+    @Test
     fun deletingNewConversationWaitsForSendRegistrationBeforeServiceDelete() = runTest(dispatcher) {
         val chats = FakeChats()
         val operations = FakeAttachmentOperations(chats).apply {
@@ -2155,6 +2312,533 @@ class AppViewModelTest {
         advanceUntilIdle()
     }
 
+    @Test
+    fun messageEditIsEphemeralAndIndependentFromTheOrdinaryComposer() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+
+        vm.send("target")
+        advanceUntilIdle()
+        val target = vm.state.value.messages.single { it.role == "USER" }
+        vm.updateDraft("ordinary draft")
+        val ticket = requireNotNull(vm.requestAttachmentPicker())
+        vm.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        val ordinaryImages = vm.state.value.pendingAttachments
+        val persistedBeforeEdit = chats.messagesSnapshot(requireNotNull(vm.state.value.currentConversationId))
+
+        vm.startMessageEdit(target.id)
+        vm.updateMessageEdit("changed")
+
+        assertEquals(MessageEdit("conversation", target.id, "changed"), vm.state.value.messageEdit)
+        assertEquals("ordinary draft", vm.state.value.draftText)
+        assertEquals(ordinaryImages, vm.state.value.pendingAttachments)
+        assertEquals(persistedBeforeEdit, chats.messagesSnapshot("conversation"))
+        assertNull(vm.requestAttachmentPicker())
+        vm.send("must not submit")
+        advanceUntilIdle()
+        assertEquals(1, operations.prepared.size)
+
+        assertFalse(vm.requestEditNavigation(EditNavigation.Tab("settings")))
+        vm.cancelEditNavigation()
+        assertEquals("changed", vm.state.value.messageEdit!!.text)
+        assertFalse(vm.requestEditNavigation(EditNavigation.NewChat))
+        assertEquals(EditNavigation.NewChat, vm.confirmEditNavigation())
+        assertNull(vm.state.value.messageEdit)
+        assertEquals(ordinaryImages, vm.state.value.pendingAttachments)
+
+        val restarted = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+        assertNull(restarted.state.value.messageEdit)
+        assertNull(restarted.state.value.pendingEditNavigation)
+    }
+
+    @Test
+    fun failedUserCanBeEditedThroughTheAlternativeLifecycle() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        var attempts = 0
+        val vm = viewModel(
+            chats,
+            StreamSource { _, _, _, _ ->
+                if (++attempts == 1) flow { throw CommandCodeException.ZdrUnavailable() }
+                else successfulEvents("edited answer")
+            },
+            operations = operations,
+        )
+        configureKey(vm)
+        advanceUntilIdle()
+
+        vm.send("failed")
+        advanceUntilIdle()
+        val failed = vm.state.value.messages.single { it.role == "USER" }
+        assertEquals(MessageState.FAILED_ZDR, failed.status)
+
+        vm.startMessageEdit(failed.id)
+        vm.updateMessageEdit("edited")
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+
+        assertEquals(
+            AlternativeRequest.Edit(failed.id, "edited"),
+            operations.preparedAlternatives.single().request,
+        )
+        assertNull(vm.state.value.messageEdit)
+        assertTrue(vm.state.value.messages.any { it.role == "USER" && it.content == "edited" })
+    }
+
+    @Test
+    fun cancelMessageEditClearsOnlyEditAndPendingNavigation() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("target")
+        advanceUntilIdle()
+        val target = vm.state.value.messages.single { it.role == "USER" }
+        vm.updateDraft("ordinary draft")
+        val ticket = requireNotNull(vm.requestAttachmentPicker())
+        vm.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        val ordinaryImages = vm.state.value.pendingAttachments
+        val persistedBeforeEdit = chats.messagesSnapshot("conversation")
+
+        vm.startMessageEdit(target.id)
+        vm.updateMessageEdit("changed")
+        assertFalse(vm.requestEditNavigation(EditNavigation.Tab("settings")))
+
+        vm.cancelMessageEdit()
+
+        assertNull(vm.state.value.messageEdit)
+        assertNull(vm.state.value.pendingEditNavigation)
+        assertNull(vm.confirmEditNavigation())
+        assertEquals("ordinary draft", vm.state.value.draftText)
+        assertEquals(ordinaryImages, vm.state.value.pendingAttachments)
+        assertEquals(persistedBeforeEdit, chats.messagesSnapshot("conversation"))
+        assertTrue(operations.preparedAlternatives.isEmpty())
+    }
+
+    @Test
+    fun cancelMessageEditIsIgnoredDuringAlternativeSubmissionHandoff() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        vm.updateDraft("ordinary draft")
+
+        val prepareEntered = CompletableDeferred<Unit>()
+        val prepareRelease = CompletableDeferred<Unit>()
+        operations.prepareEntered = prepareEntered
+        operations.prepareRelease = prepareRelease
+
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        assertFalse(vm.requestEditNavigation(EditNavigation.Tab("settings")))
+        vm.submitMessageEdit()
+        runCurrent()
+        prepareEntered.await()
+
+        val editDuringHandoff = vm.state.value.messageEdit
+        vm.cancelMessageEdit()
+
+        assertTrue(vm.state.value.sending)
+        assertEquals(editDuringHandoff, vm.state.value.messageEdit)
+        assertEquals(EditNavigation.Tab("settings"), vm.state.value.pendingEditNavigation)
+
+        prepareRelease.complete(Unit)
+        advanceUntilIdle()
+
+        assertNull(vm.state.value.messageEdit)
+        assertNull(vm.state.value.pendingEditNavigation)
+        assertEquals("ordinary draft", vm.state.value.draftText)
+    }
+
+    @Test
+    fun recoveryEditClearIsUnconditionalDuringAlternativeSubmissionHandoff() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+
+        val prepareEntered = CompletableDeferred<Unit>()
+        val prepareRelease = CompletableDeferred<Unit>()
+        operations.prepareEntered = prepareEntered
+        operations.prepareRelease = prepareRelease
+
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        assertFalse(vm.requestEditNavigation(EditNavigation.Tab("settings")))
+        vm.submitMessageEdit()
+        runCurrent()
+        prepareEntered.await()
+
+        vm.clearEphemeralEditForRecovery()
+
+        assertNull(vm.state.value.messageEdit)
+        assertNull(vm.state.value.pendingEditNavigation)
+        assertTrue(vm.state.value.sending)
+
+        prepareRelease.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(vm.state.value.sending)
+        assertNull(vm.state.value.messageEdit)
+    }
+
+    @Test
+    fun messageMutationBusyRemainsObservableUntilBranchSelectionSettles() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+
+        val assistant = vm.state.value.messages.single { it.role == "ASSISTANT" }
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        chats.selectAlternativeEntered = entered
+        chats.selectAlternativeRelease = release
+
+        vm.selectMessageAlternative(original.id)
+        runCurrent()
+        entered.await()
+
+        assertTrue(vm.state.value.messageMutationBusy)
+        vm.retryAssistant(assistant.id)
+        assertEquals(1, operations.preparedAlternatives.size)
+
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(vm.state.value.messageMutationBusy)
+    }
+
+    @Test
+    fun selectingAnotherMessageWhileEditingStoresAnEditAnotherGuard() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val vm = viewModel(chats, successfulSource("answer"))
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("first")
+        advanceUntilIdle()
+        vm.send("second")
+        advanceUntilIdle()
+        val users = vm.state.value.messages.filter { it.role == "USER" }
+        val first = users[0]
+        val second = users[1]
+
+        vm.startMessageEdit(first.id)
+        vm.updateMessageEdit("edited first")
+        vm.startMessageEdit(second.id)
+
+        assertEquals(first.id, vm.state.value.messageEdit?.messageId)
+        assertEquals(EditNavigation.EditAnother(second.id), vm.state.value.pendingEditNavigation)
+    }
+
+    @Test
+    fun freshViewModelDoesNotRestorePendingEditNavigation() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("target")
+        advanceUntilIdle()
+        val target = vm.state.value.messages.single { it.role == "USER" }
+        vm.startMessageEdit(target.id)
+        assertFalse(vm.requestEditNavigation(EditNavigation.NewChat))
+        assertEquals(EditNavigation.NewChat, vm.state.value.pendingEditNavigation)
+
+        val restarted = viewModel(chats, successfulSource("unused"), operations = operations)
+        advanceUntilIdle()
+
+        assertNull(restarted.state.value.messageEdit)
+        assertNull(restarted.state.value.pendingEditNavigation)
+    }
+
+    @Test
+    fun directConversationAndBranchNavigationAreGuardedWhileEditing() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("other") }
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("target")
+        advanceUntilIdle()
+        val target = vm.state.value.messages.single { it.role == "USER" }
+
+        vm.startMessageEdit(target.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+        val alternative = vm.state.value.messages.single { it.role == "USER" }
+
+        vm.startMessageEdit(alternative.id)
+        vm.openConversation("other")
+        assertEquals("conversation", vm.state.value.currentConversationId)
+        assertEquals(EditNavigation.Conversation("other"), vm.state.value.pendingEditNavigation)
+        vm.selectMessageAlternative(target.id)
+        assertEquals(EditNavigation.Branch(target.id), vm.state.value.pendingEditNavigation)
+        vm.cancelEditNavigation()
+        assertNull(vm.state.value.pendingEditNavigation)
+        assertEquals(alternative.id, vm.state.value.messageEdit!!.messageId)
+    }
+
+    @Test
+    fun editSubmissionUsesAlternativeLifecycleAndPreservesComposerState() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        vm.updateDraft("keep this")
+        val ticket = requireNotNull(vm.requestAttachmentPicker())
+        vm.importAttachments(ticket, listOf(Uri.EMPTY))
+        advanceUntilIdle()
+        val images = vm.state.value.pendingAttachments
+
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+
+        assertEquals(
+            AlternativeRequest.Edit(original.id, "alternative"),
+            operations.preparedAlternatives.single().request,
+        )
+        assertEquals("alternative", chats.messagesSnapshot("conversation").single { it.role == "USER" }.content)
+        assertNull(vm.state.value.messageEdit)
+        assertEquals("keep this", vm.state.value.draftText)
+        assertEquals(images, vm.state.value.pendingAttachments)
+
+        vm.selectMessageAlternative(original.id)
+        advanceUntilIdle()
+        assertEquals("original", vm.state.value.messages.single { it.role == "USER" }.content)
+        assertEquals("keep this", vm.state.value.draftText)
+        assertEquals(images, vm.state.value.pendingAttachments)
+    }
+
+    @Test
+    fun alternativePreparationFailureRetainsTheEditWithoutStartingAStream() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        var streamCalls = 0
+        val vm = viewModel(
+            chats,
+            StreamSource { _, _, _, _ ->
+                streamCalls++
+                successfulEvents("must not run")
+            },
+            operations = operations,
+        )
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        operations.prepareAlternativeFailure = IOException("preparation failure")
+
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("retain me")
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+
+        assertEquals(MessageEdit("conversation", original.id, "retain me"), vm.state.value.messageEdit)
+        assertTrue(chats.messagesSnapshot("conversation").any { it.id == original.id && it.content == "original" })
+        assertTrue(operations.preparedAlternatives.isEmpty())
+        assertEquals(1, streamCalls)
+    }
+
+    @Test
+    fun postCommitAlternativeFailureClearsEditAndLeavesOriginalBranchAvailable() = runTest(dispatcher) {
+        val chats = FakeChats()
+        var sends = 0
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(
+            chats,
+            StreamSource { _, _, _, _ ->
+                if (++sends == 1) successfulEvents("original answer")
+                else flow { throw IOException("network failure") }
+            },
+            operations = operations,
+        )
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+
+        assertNull(vm.state.value.messageEdit)
+        assertEquals(1, chats.createdAlternatives.size)
+        assertTrue(vm.state.value.messages.any { it.role == "USER" && it.content == "alternative" })
+        vm.selectMessageAlternative(original.id)
+        advanceUntilIdle()
+        assertEquals("original", vm.state.value.messages.single { it.role == "USER" }.content)
+    }
+
+    @Test
+    fun alternativeCancellationCompletesTheNonCancellableHandoffBeforeInterrupting() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        operations.prepareEntered = entered
+        operations.prepareRelease = release
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        runCurrent()
+        entered.await()
+        assertTrue(vm.state.value.messageEdit != null)
+
+        vm.cancel()
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertNull(vm.state.value.messageEdit)
+        assertEquals(1, chats.createdAlternatives.size)
+        assertFalse(vm.state.value.sending)
+    }
+
+    @Test
+    fun alternativeSubmissionSnapshotsPromptAndZdrBeforePreparationSuspends() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val prompts = FakeSystemPromptStore(stored = "alpha")
+        val settings = FakeSettings(zdr = true)
+        val operations = FakeAttachmentOperations(chats)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val usedZdr = mutableListOf<Boolean>()
+        val vm = viewModel(
+            chats,
+            StreamSource { _, _, _, zdr ->
+                usedZdr += zdr
+                successfulEvents("answer")
+            },
+            settings = settings,
+            operations = operations,
+            prompts = prompts,
+            catalogue = FakeCatalogue(
+                local = catalogueSnapshot(models = listOf(ChatModel.SOL, ChatModel.LUNA)),
+            ),
+        )
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.selectModel(ChatModel.LUNA)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        operations.prepareEntered = entered
+        operations.prepareRelease = release
+
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        runCurrent()
+        entered.await()
+
+        vm.selectModel(ChatModel.SOL)
+        settings.zdr = false
+        vm.saveSystemPrompt("beta")
+        runCurrent()
+        assertEquals("beta", vm.state.value.systemPrompt)
+
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("alpha", operations.preparedAlternatives.single().systemPrompt)
+        assertEquals(ChatModel.LUNA, operations.preparedAlternatives.single().model)
+        assertEquals(listOf(true, true), usedZdr)
+    }
+
+    @Test
+    fun staleAlternativeCallbackDoesNotSelectAfterTheObservedBranchChoiceChanges() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val original = vm.state.value.messages.single { it.role == "USER" }
+        vm.startMessageEdit(original.id)
+        vm.updateMessageEdit("alternative")
+        vm.submitMessageEdit()
+        advanceUntilIdle()
+
+        val choice = vm.state.value.messages.asSequence()
+            .flatMap { message -> sequenceOf(message.branchChoice, message.responseBranchChoice) }
+            .filterNotNull()
+            .first { original.id in it.messageIds && it.messageIds.getOrNull(it.selectedIndex) != original.id }
+        val mutableChoiceIds = choice.messageIds as MutableList<String>
+        vm.selectMessageAlternative(original.id)
+        mutableChoiceIds[1] = "stale-message"
+        runCurrent()
+
+        assertEquals(0, chats.selectAlternativeCalls)
+        assertTrue(vm.state.value.messages.any { message ->
+            message.branchChoice?.messageIds?.getOrNull(message.branchChoice.selectedIndex) == "stale-message"
+        })
+    }
+
+    @Test
+    fun assistantRetryUsesAlternativeLifecycleWithoutChangingComposerState() = runTest(dispatcher) {
+        val chats = FakeChats()
+        val operations = FakeAttachmentOperations(chats)
+        val vm = viewModel(chats, successfulSource("answer"), operations = operations)
+        configureKey(vm)
+        advanceUntilIdle()
+        vm.send("original")
+        advanceUntilIdle()
+        val assistant = vm.state.value.messages.single { it.role == "ASSISTANT" }
+        vm.updateDraft("ordinary draft")
+
+        vm.retryAssistant(assistant.id)
+        vm.retryAssistant(assistant.id)
+        advanceUntilIdle()
+
+        assertEquals(1, operations.preparedAlternatives.size)
+        assertEquals(AlternativeRequest.Retry(assistant.id), operations.preparedAlternatives.single().request)
+        assertEquals(1, chats.createdAlternatives.size)
+        assertEquals("ordinary draft", vm.state.value.draftText)
+        assertTrue(vm.state.value.messages.any { it.role == "ASSISTANT" && it.content == "answer" })
+    }
+
     private fun successfulSource(answer: String) = StreamSource { _, _, _, _ -> successfulEvents(answer) }
     private fun successfulEvents(answer: String) = flowOf(
         StreamEvent.Delta(answer), StreamEvent.Usage(TokenUsage(1, 0, 1)), StreamEvent.Done,
@@ -2334,6 +3018,7 @@ class AppViewModelTest {
         var initialiseEntered: CompletableDeferred<Unit>? = null
         var initialiseRelease: CompletableDeferred<Unit>? = null
         var prepareFailure: Exception? = null
+        var prepareAlternativeFailure: Exception? = null
         var importFailure: Exception? = null
         var discardFailure: Exception? = null
         var deleteFailure: Exception? = null
@@ -2342,11 +3027,14 @@ class AppViewModelTest {
         var importIgnoresCancellation = false
         var deleteEntered: CompletableDeferred<Unit>? = null
         var deleteRelease: CompletableDeferred<Unit>? = null
+        var discardEntered: CompletableDeferred<Unit>? = null
+        var discardRelease: CompletableDeferred<Unit>? = null
         var prepareEntered: CompletableDeferred<Unit>? = null
         var prepareRelease: CompletableDeferred<Unit>? = null
         val imported = mutableListOf<ImageAttachment>()
         val discarded = mutableListOf<ImageAttachment>()
         val prepared = mutableListOf<PreparedRequest>()
+        val preparedAlternatives = mutableListOf<PreparedAlternativeRequest>()
         val preparedContexts = mutableListOf<List<ApiMessage>>()
         val deleted = mutableListOf<String>()
         val events = mutableListOf<String>()
@@ -2388,6 +3076,8 @@ class AppViewModelTest {
             discardFailure?.let { throw it }
             discarded += images
             events += "discard"
+            discardEntered?.complete(Unit)
+            discardRelease?.await()
         }
 
         override suspend fun prepareTurn(
@@ -2456,12 +3146,51 @@ class AppViewModelTest {
             return PreparedAttachmentTurn(chats.retryFailedTurn(userMessageId, model, effective), messages)
         }
 
+        override suspend fun prepareAlternative(
+            conversationId: String,
+            request: AlternativeRequest,
+            model: ChatModel,
+            systemPrompt: String,
+        ): PreparedAttachmentTurn {
+            prepareAlternativeFailure?.let { throw it }
+            val source = chats.alternativeSource(conversationId, request.messageId)
+            val endpoint = when (request) {
+                is AlternativeRequest.Edit -> source.target.copy(content = request.text)
+                is AlternativeRequest.Retry -> source.target.replyToMessageId?.let { userId ->
+                    source.prefix.single { it.id == userId }
+                } ?: error("missing user ancestor")
+            }
+            val context = source.prefix.mapNotNull { message ->
+                when (message.role) {
+                    "USER" -> ApiMessage("user", message.content)
+                    "ASSISTANT" -> ApiMessage("assistant", message.content)
+                    else -> null
+                }.takeIf { message.content.isNotEmpty() }
+            }.toMutableList()
+            if (request is AlternativeRequest.Edit) context += ApiMessage("user", endpoint.content)
+            val effective = effectiveSystemPrompt(systemPrompt)
+            val messages = if (effective.isEmpty()) context
+                else listOf(ApiMessage("system", effective)) + context
+            val pending = chats.createAlternative(conversationId, request, model, effective, source.expectedPathIds)
+            preparedAlternatives += PreparedAlternativeRequest(request, model, effective)
+            prepareEntered?.complete(Unit)
+            prepareRelease?.await()
+            events += "prepare-return"
+            return PreparedAttachmentTurn(pending, messages)
+        }
+
         override suspend fun deleteFailedMessage(conversationId: String, userMessageId: String) = chats.deleteFailedTurn(userMessageId)
 
         data class PreparedRequest(
             val text: String,
             val model: ChatModel,
             val images: List<ImageAttachment>,
+        )
+
+        data class PreparedAlternativeRequest(
+            val request: AlternativeRequest,
+            val model: ChatModel,
+            val systemPrompt: String,
         )
     }
 
@@ -2487,10 +3216,114 @@ class AppViewModelTest {
         private var turnCount = 0
         private val deletedConversations = mutableSetOf<String>()
         private val messageOwners = mutableMapOf<String, String>()
+        private val alternativeRowsBySelection = mutableMapOf<String, List<Message>>()
+        private var alternativeCount = 0
+        val createdAlternatives = mutableListOf<AlternativeRequest>()
+        var selectAlternativeCalls = 0
+        var selectAlternativeEntered: CompletableDeferred<Unit>? = null
+        var selectAlternativeRelease: CompletableDeferred<Unit>? = null
 
         override fun observeConversations(): Flow<List<Conversation>> = conversations
         override fun observeMessages(conversationId: String): Flow<List<Message>> = messages(conversationId)
         override suspend fun messagesSnapshot(conversationId: String): List<Message> = messages(conversationId).value
+
+        override suspend fun alternativeSource(conversationId: String, messageId: String): AlternativeSource {
+            val rows = messages(conversationId).value
+            val index = rows.indexOfFirst { it.id == messageId }
+            check(index >= 0) { "message not found" }
+            return AlternativeSource(rows[index], rows.take(index), rows.map { it.id })
+        }
+
+        override suspend fun createAlternative(
+            conversationId: String,
+            request: AlternativeRequest,
+            model: ChatModel,
+            systemPrompt: String,
+            expectedPathIds: List<String>,
+        ): PendingTurn {
+            val rows = messages(conversationId).value
+            check(rows.map { it.id } == expectedPathIds) { "stale alternative" }
+            val targetIndex = rows.indexOfFirst { it.id == request.messageId }
+            check(targetIndex >= 0) { "message not found" }
+            val target = rows[targetIndex]
+            val choiceIds: List<String>
+            val oldRows: List<Message>
+            val newRows: List<Message>
+            val userId: String
+            val assistantId: String
+            when (request) {
+                is AlternativeRequest.Edit -> {
+                    check(target.role == "USER")
+                    userId = "alternative-user-${++alternativeCount}"
+                    assistantId = "alternative-assistant-$alternativeCount"
+                    choiceIds = mutableListOf(target.id, userId)
+                    val choice = com.commandcode.chat.data.database.BranchChoice(choiceIds, 0)
+                    oldRows = rows.map { message ->
+                        if (message.id == target.id) message.copy(branchChoice = choice) else message
+                    }
+                    val newChoice = choice.copy(selectedIndex = 1)
+                    val user = target.copy(
+                        id = userId,
+                        content = request.text,
+                        status = "COMPLETE",
+                        branchChoice = newChoice,
+                    )
+                    val assistant = Message(
+                        assistantId,
+                        conversationId,
+                        "ASSISTANT",
+                        "",
+                        model.apiId,
+                        target.createdAt + 1,
+                        "PENDING",
+                        replyToMessageId = userId,
+                    )
+                    newRows = rows.take(targetIndex) + user + assistant
+                }
+                is AlternativeRequest.Retry -> {
+                    check(target.role == "ASSISTANT")
+                    val user = rows.single { it.id == target.replyToMessageId }
+                    userId = user.id
+                    assistantId = "alternative-assistant-${++alternativeCount}"
+                    choiceIds = mutableListOf(target.id, assistantId)
+                    val choice = com.commandcode.chat.data.database.BranchChoice(choiceIds, 0)
+                    oldRows = rows.map { message ->
+                        if (message.id == user.id) message.copy(responseBranchChoice = choice) else message
+                    }
+                    val newChoice = choice.copy(selectedIndex = 1)
+                    val newUser = user.copy(responseBranchChoice = newChoice)
+                    val assistant = target.copy(
+                        id = assistantId,
+                        content = "",
+                        modelId = model.apiId,
+                        status = "PENDING",
+                        replyToMessageId = user.id,
+                    )
+                    newRows = rows.map { message ->
+                        when {
+                            message.id == user.id -> newUser
+                            message.id == target.id -> assistant
+                            else -> message
+                        }
+                    }
+                }
+            }
+            alternativeRowsBySelection[choiceIds[0]] = oldRows
+            alternativeRowsBySelection[choiceIds[1]] = newRows
+            messages(conversationId).value = newRows
+            messageOwners[assistantId] = conversationId
+            usageCompleteByRequest[assistantId] = false
+            createdAlternatives += request
+            return PendingTurn(conversationId, userId, assistantId)
+        }
+
+        override suspend fun selectAlternative(conversationId: String, messageId: String) {
+            selectAlternativeCalls += 1
+            selectAlternativeEntered?.complete(Unit)
+            selectAlternativeRelease?.await()
+            messages(conversationId).value = alternativeRowsBySelection[messageId]
+                ?: error("unknown alternative")
+        }
 
         override suspend fun beginTurn(
             conversationId: String?,
@@ -2510,7 +3343,7 @@ class AppViewModelTest {
             val existing = messages(id).value
             messages(id).value = existing +
                 Message(userId, id, "USER", text, null, turnCount * 2L, "COMPLETE", attachments) +
-                Message(assistantId, id, "ASSISTANT", "", model.apiId, turnCount * 2L + 1, "PENDING")
+                Message(assistantId, id, "ASSISTANT", "", model.apiId, turnCount * 2L + 1, "PENDING", replyToMessageId = userId)
             usageCompleteByRequest[assistantId] = false
             beginTurnCommitted?.complete(Unit)
             beginTurnRelease?.await()

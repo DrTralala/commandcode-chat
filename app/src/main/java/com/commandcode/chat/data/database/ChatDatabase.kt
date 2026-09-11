@@ -9,8 +9,17 @@ import com.commandcode.chat.data.security.DatabaseRecoveryRequired
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 
 @Database(
-    entities = [ConversationEntity::class, MessageEntity::class, UsageEventEntity::class, AttachmentEntity::class],
-    version = 3,
+    entities = [
+        ConversationEntity::class,
+        MessageEntity::class,
+        UsageEventEntity::class,
+        AttachmentEntity::class,
+        TimelineNodeEntity::class,
+        MessagePlacementEntity::class,
+        BranchSelectionEntity::class,
+        MessageAttachmentEntity::class,
+    ],
+    version = 4,
     exportSchema = true,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -18,6 +27,8 @@ abstract class ChatDatabase : RoomDatabase() {
     abstract fun messages(): MessageDao
     abstract fun usageEvents(): UsageEventDao
     abstract fun attachments(): AttachmentDao
+    abstract fun messageAttachments(): MessageAttachmentDao
+    abstract fun branches(): BranchDao
 
     companion object {
         fun open(context: Context, keyManager: DatabaseKeyManager): ChatDatabase =
@@ -34,7 +45,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     val factoryPassphrase = passphrase.copyOf()
                     val database = Room.databaseBuilder(context, ChatDatabase::class.java, databaseName)
                     .openHelperFactory(SupportOpenHelperFactory(factoryPassphrase))
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     database.openHelper.writableDatabase
                     database.reconcileUnfinishedTurnsForStartup()

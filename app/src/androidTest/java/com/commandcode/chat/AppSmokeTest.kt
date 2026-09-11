@@ -6,12 +6,15 @@ import android.net.Uri
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.setContent
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
@@ -126,15 +129,23 @@ class AppSmokeTest {
 
         compose.onNodeWithTag("nav_history").performClick()
         compose.onNodeWithTag("history_screen").assertIsDisplayed()
-        compose.onNodeWithText("GPT-5.6 Sol").assertIsDisplayed()
-        compose.onNodeWithText(retiredModelId).assertIsDisplayed()
-        compose.onNodeWithTag("delete_conversation_${retired.conversationId}").performClick()
+        compose.onNodeWithTag("conversation_row_${seeded.conversationId}").assertIsDisplayed()
+        compose.onNodeWithTag("conversation_row_${retired.conversationId}").assertIsDisplayed()
+        compose.onNodeWithTag("conversation_row_${seeded.conversationId}")
+            .assert(hasAnyDescendant(hasText("GPT-5.6 Sol")))
+        compose.onNodeWithTag("conversation_row_${retired.conversationId}")
+            .assert(hasAnyDescendant(hasText(retiredModelId)))
+        compose.onNodeWithTag("history_delete_mode").performClick()
+        compose.onNodeWithTag("select_conversation_${retired.conversationId}").performClick()
+        compose.onNodeWithTag("history_delete_selected").performClick()
         compose.onNodeWithTag("confirm_delete_conversation").performClick()
-        compose.onNodeWithTag("delete_conversation_${seeded.conversationId}").performClick()
-        compose.onNodeWithText("Delete conversation?").assertIsDisplayed()
+        compose.onNodeWithTag("history_delete_mode").performClick()
+        compose.onNodeWithTag("select_conversation_${seeded.conversationId}").performClick()
+        compose.onNodeWithTag("history_delete_selected").performClick()
+        compose.onNodeWithText("Delete 1 conversation?").assertIsDisplayed()
         compose.onNodeWithTag("confirm_delete_conversation").performClick()
         compose.waitUntil {
-            compose.onAllNodesWithText("delete me offline").fetchSemanticsNodes().isEmpty()
+            compose.onAllNodesWithTag("conversation_row_${seeded.conversationId}").fetchSemanticsNodes().isEmpty()
         }
         compose.onNodeWithTag("nav_budget").performClick()
         compose.onNodeWithText("Budget unavailable").assertIsDisplayed()

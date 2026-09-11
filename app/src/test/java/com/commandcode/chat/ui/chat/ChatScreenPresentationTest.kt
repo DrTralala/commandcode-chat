@@ -1,6 +1,7 @@
 package com.commandcode.chat.ui.chat
 
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import com.commandcode.chat.data.database.BranchChoice
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.domain.AttachmentFailure
@@ -10,6 +11,7 @@ import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.ui.AmoledAppColours
 import com.commandcode.chat.ui.AppUiState
+import com.commandcode.chat.ui.MessageEdit
 import com.commandcode.chat.ui.attachmentPickerMimeTypes
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -23,6 +25,72 @@ class ChatScreenPresentationTest {
     fun userAndAssistantMessagesUseOppositeSides() {
         assertEquals(MessageSide.END, messageSide("USER"))
         assertEquals(MessageSide.START, messageSide("ASSISTANT"))
+    }
+
+    @Test
+    fun messageMenusUseRoleSpecificOrderAndExcludeNotices() {
+        assertEquals(listOf("Edit message", "Copy"), messageMenuActions("USER"))
+        assertEquals(listOf("Copy", "Retry"), messageMenuActions("ASSISTANT"))
+        assertEquals(emptyList<String>(), messageMenuActions("SYSTEM_PROMPT_CHANGE"))
+    }
+
+    @Test
+    fun failedUsersKeepTheirNormalMenuAndIndependentRecoveryActions() {
+        val failed = Message(
+            id = "failed",
+            conversationId = "conversation",
+            role = "USER",
+            content = "retry me",
+            modelId = null,
+            createdAt = 1L,
+            status = MessageState.FAILED_ZDR,
+        )
+
+        val actions = messageActionAvailability(AppUiState(), failed)
+
+        assertTrue(actions.menuEnabled)
+        assertTrue(actions.editEnabled)
+        assertTrue(actions.failedActionsEnabled)
+        assertEquals(listOf("Edit message", "Copy"), messageMenuActions(failed.role))
+    }
+
+    @Test
+    fun emptyMessageTextDisablesOnlyTheCopyAction() {
+        assertTrue(messageMenuActionEnabled("Edit message", ""))
+        assertFalse(messageMenuActionEnabled("Copy", ""))
+        assertTrue(messageMenuActionEnabled("Copy", "message"))
+    }
+
+    @Test
+    fun ordinarySendIsBlockedWhileAMessageEditorIsOpen() {
+        assertFalse(
+            sendButtonEnabled(
+                AppUiState(
+                    draftText = "ordinary draft",
+                    systemPromptLoaded = true,
+                    messageEdit = MessageEdit("conversation", "message", "edited"),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun branchChoiceKeepsCreationOrderAndDisablesItsEndpoints() {
+        val choice = BranchChoice(listOf("a1", "a2", "a3"), 0)
+
+        assertEquals(listOf("a1", "a2", "a3"), choice.messageIds)
+        assertNull(choice.previousId)
+        assertEquals("a2", choice.nextId)
+        assertEquals("1/3", branchCountLabel(choice))
+        assertFalse(branchEndpointEnabled(choice, previous = true, actionsEnabled = true))
+        assertTrue(branchEndpointEnabled(choice, previous = false, actionsEnabled = true))
+
+        val middle = choice.copy(selectedIndex = 1)
+        val last = choice.copy(selectedIndex = 2)
+        assertTrue(branchEndpointEnabled(middle, previous = true, actionsEnabled = true))
+        assertTrue(branchEndpointEnabled(middle, previous = false, actionsEnabled = true))
+        assertTrue(branchEndpointEnabled(last, previous = true, actionsEnabled = true))
+        assertFalse(branchEndpointEnabled(last, previous = false, actionsEnabled = true))
     }
 
     @Test
@@ -102,7 +170,97 @@ class ChatScreenPresentationTest {
         assertFalse(sendButtonEnabled(AppUiState(draftText = "ready text", importingAttachments = true, systemPromptLoaded = true)))
         assertFalse(sendButtonEnabled(AppUiState(systemPromptLoaded = true, importingAttachments = true, pendingAttachments = listOf(image))))
         assertFalse(sendButtonEnabled(AppUiState(draftText = "ready text", sending = true, systemPromptLoaded = true)))
+        assertFalse(
+            sendButtonEnabled(
+                AppUiState(
+                    draftText = "ready text",
+                    messageMutationBusy = true,
+                    systemPromptLoaded = true,
+                ),
+            ),
+        )
         assertTrue(sendButtonEnabled(AppUiState(draftText = "ready text", systemPromptLoaded = true)))
+    }
+
+    @Test
+    fun messageActionsExposeBusyStateWithoutBlockingEditNavigationGuard() {
+        val user = Message(
+            id = "user",
+            conversationId = "conversation",
+            role = "USER",
+            content = "question",
+            modelId = null,
+            createdAt = 1L,
+            status = "COMPLETE",
+        )
+        val pendingAssistant = Message(
+            id = "assistant",
+            conversationId = "conversation",
+            role = "ASSISTANT",
+            content = "",
+            modelId = ChatModel.SOL.apiId,
+            createdAt = 2L,
+            status = "PENDING",
+        )
+        val editing = AppUiState(
+            messageEdit = MessageEdit("conversation", user.id, "changed"),
+        )
+
+        val userActions = messageActionAvailability(editing, user)
+        assertTrue(userActions.menuEnabled)
+        assertTrue(userActions.editEnabled)
+        assertTrue(userActions.branchEnabled)
+
+        val pendingActions = messageActionAvailability(editing, pendingAssistant)
+        assertTrue(pendingActions.menuEnabled)
+        assertFalse(pendingActions.retryEnabled)
+        assertTrue(pendingActions.branchEnabled)
+
+        val failedActions = messageActionAvailability(
+            editing,
+            user.copy(id = "failed", status = MessageState.FAILED_ZDR),
+        )
+        assertFalse(failedActions.failedActionsEnabled)
+
+        val completeAssistant = pendingAssistant.copy(content = "answer", status = "COMPLETE")
+        assertTrue(messageActionAvailability(AppUiState(), completeAssistant).retryEnabled)
+
+        val busyActions = messageActionAvailability(
+            editing.copy(messageMutationBusy = true),
+            user,
+        )
+        assertFalse(busyActions.menuEnabled)
+        assertFalse(busyActions.editEnabled)
+        assertFalse(busyActions.branchEnabled)
+    }
+
+    @Test
+    fun currentConversationDeletionFreezesActionsButUnrelatedDeletionDoesNot() {
+        val user = Message(
+            id = "user",
+            conversationId = "conversation",
+            role = "USER",
+            content = "question",
+            modelId = null,
+            createdAt = 1L,
+            status = "COMPLETE",
+        )
+
+        val currentDeletion = messageActionAvailability(
+            AppUiState(
+                currentConversationId = "conversation",
+                deletingConversationIds = setOf("conversation"),
+            ),
+            user,
+        )
+        assertFalse(currentDeletion.menuEnabled)
+        assertFalse(currentDeletion.editEnabled)
+        assertFalse(currentDeletion.branchEnabled)
+
+        val unrelatedDeletion = messageActionAvailability(AppUiState(), user)
+        assertTrue(unrelatedDeletion.menuEnabled)
+        assertTrue(unrelatedDeletion.editEnabled)
+        assertTrue(unrelatedDeletion.branchEnabled)
     }
 
     @Test

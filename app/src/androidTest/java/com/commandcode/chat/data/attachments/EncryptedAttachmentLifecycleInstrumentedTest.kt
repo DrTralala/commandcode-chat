@@ -486,6 +486,11 @@ class EncryptedAttachmentLifecycleInstrumentedTest {
             return delegate.countForConversation(conversationId)
         }
 
+        override fun deleteUnreferenced(ids: List<String>): Int {
+            failure?.let { throw it }
+            return delegate.deleteUnreferenced(ids)
+        }
+
         override fun insert(values: List<com.commandcode.chat.data.database.AttachmentEntity>) {
             failure?.let { throw it }
             delegate.insert(values)

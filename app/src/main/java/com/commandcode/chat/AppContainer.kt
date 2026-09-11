@@ -15,6 +15,8 @@ import com.commandcode.chat.data.database.ChatRepository
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
+import com.commandcode.chat.data.database.AlternativeRequest
+import com.commandcode.chat.data.database.AlternativeSource
 import com.commandcode.chat.data.security.DatabaseKeyManager
 import com.commandcode.chat.data.security.EncryptedBlobStore
 import com.commandcode.chat.data.security.EncryptedSystemPromptStore
@@ -65,6 +67,17 @@ interface ChatStore {
     suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean
     suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage? = null)
     suspend fun deleteConversation(id: String)
+    suspend fun alternativeSource(conversationId: String, messageId: String): AlternativeSource =
+        error("Message alternatives are not supported by this store")
+    suspend fun createAlternative(
+        conversationId: String,
+        request: AlternativeRequest,
+        model: ChatModel,
+        systemPrompt: String,
+        expectedPathIds: List<String>,
+    ): PendingTurn = error("Message alternatives are not supported by this store")
+    suspend fun selectAlternative(conversationId: String, messageId: String): Unit =
+        error("Message alternatives are not supported by this store")
     suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage? = null): Unit = error("Message recovery is not supported by this store")
     suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String = ""): PendingTurn = error("Message recovery is not supported by this store")
     suspend fun deleteFailedTurn(userMessageId: String): Unit = error("Message recovery is not supported by this store")
@@ -154,6 +167,17 @@ class AppContainer(
         override suspend fun interruptTurn(messageId: String, partialText: String, reason: String, usage: TokenUsage?) =
             chatRepository.interruptTurn(messageId, partialText, reason, usage)
         override suspend fun deleteConversation(id: String) = chatRepository.deleteConversation(id)
+        override suspend fun alternativeSource(conversationId: String, messageId: String) =
+            chatRepository.alternativeSource(conversationId, messageId)
+        override suspend fun createAlternative(
+            conversationId: String,
+            request: AlternativeRequest,
+            model: ChatModel,
+            systemPrompt: String,
+            expectedPathIds: List<String>,
+        ) = chatRepository.createAlternative(conversationId, request, model, systemPrompt, expectedPathIds)
+        override suspend fun selectAlternative(conversationId: String, messageId: String) =
+            chatRepository.selectAlternative(conversationId, messageId)
         override suspend fun failZdrTurn(assistantMessageId: String, usage: TokenUsage?) = chatRepository.failZdrTurn(assistantMessageId, usage)
         override suspend fun retryFailedTurn(userMessageId: String, model: ChatModel, systemPrompt: String) = chatRepository.retryFailedTurn(userMessageId, model, systemPrompt)
         override suspend fun deleteFailedTurn(userMessageId: String) = chatRepository.deleteFailedTurn(userMessageId)

@@ -1,6 +1,7 @@
 package com.commandcode.chat.ui
 
 import android.app.Activity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -18,12 +19,14 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -51,7 +54,6 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.view.WindowCompat
-import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -156,12 +158,36 @@ private fun AppContent(viewModel: AppViewModel) {
     var previouslyConfigured by rememberSaveable { mutableStateOf(state.keyConfigured) }
     LaunchedEffect(state.keyConfigured) {
         navigationTarget(previouslyConfigured, state.keyConfigured)?.let { destination ->
+            if (previouslyConfigured && !state.keyConfigured) {
+                viewModel.clearEphemeralEditForRecovery()
+            }
             navController.navigate(destination) {
                 if (!state.keyConfigured) popUpTo(navController.graph.startDestinationId) { inclusive = true }
                 launchSingleTop = true
             }
         }
         previouslyConfigured = state.keyConfigured
+    }
+    val currentRoute = currentEntry?.destination?.route
+    fun dispatchNavigation(target: EditNavigation) {
+        when (target) {
+            is EditNavigation.Tab -> navController.navigate(target.route) { launchSingleTop = true }
+            is EditNavigation.Conversation -> {
+                viewModel.openConversation(target.id)
+                navController.navigate(Route.CHAT) { launchSingleTop = true }
+            }
+            is EditNavigation.Branch -> viewModel.selectMessageAlternative(target.messageId)
+            is EditNavigation.EditAnother -> viewModel.startMessageEdit(target.messageId)
+            EditNavigation.NewChat -> viewModel.newChat()
+            EditNavigation.Back -> viewModel.cancelMessageEdit()
+        }
+    }
+    fun requestNavigation(target: EditNavigation) {
+        if (target is EditNavigation.Tab && target.route == currentRoute) return
+        if (viewModel.requestEditNavigation(target)) dispatchNavigation(target)
+    }
+    BackHandler(enabled = state.messageEdit != null) {
+        requestNavigation(EditNavigation.Back)
     }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.weight(1f)) {
@@ -173,11 +199,17 @@ private fun AppContent(viewModel: AppViewModel) {
                     ChatScreen(
                         state = state,
                         onSelectModel = viewModel::selectModel,
-                        onNewChat = viewModel::newChat,
+                        onNewChat = { requestNavigation(EditNavigation.NewChat) },
                         onSend = viewModel::send,
                         onCancel = viewModel::cancel,
                         onRetryMessage = viewModel::retryMessage,
                         onDeleteFailedMessage = viewModel::deleteFailedMessage,
+                        onRetryAssistant = viewModel::retryAssistant,
+                        onStartMessageEdit = { requestNavigation(EditNavigation.EditAnother(it)) },
+                        onMessageEditChange = viewModel::updateMessageEdit,
+                        onSubmitMessageEdit = viewModel::submitMessageEdit,
+                        onCancelMessageEdit = viewModel::cancelMessageEdit,
+                        onSelectAlternative = { requestNavigation(EditNavigation.Branch(it)) },
                         onDraftChange = viewModel::updateDraft,
                         onAttach = {
                             if (pendingPickerTicket == null) {
@@ -198,7 +230,7 @@ private fun AppContent(viewModel: AppViewModel) {
                         sort = state.historySort,
                         onSortChange = viewModel::setHistorySort,
                         modelDisplayName = { modelId -> modelDisplayName(state.models, modelId) },
-                        onOpen = { viewModel.openConversation(it); navController.navigate(Route.CHAT) },
+                        onOpen = { requestNavigation(EditNavigation.Conversation(it)) },
                         onDelete = viewModel::deleteConversation,
                         errorMessage = state.errorMessage,
                     )
@@ -219,16 +251,39 @@ private fun AppContent(viewModel: AppViewModel) {
             }
         }
         if (!chatKeyboardVisible) {
-            if (state.keyConfigured) BottomPanel(navController)
+            if (state.keyConfigured) {
+                BottomPanel(
+                    currentRoute = currentRoute,
+                    onNavigate = { route -> requestNavigation(EditNavigation.Tab(route)) },
+                )
+            }
             SecurityRail(state.zdr)
         }
+    }
+    state.pendingEditNavigation?.let {
+        AlertDialog(
+            onDismissRequest = viewModel::cancelEditNavigation,
+            text = { Text("Unsaved changes will be lost. Proceed?") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.confirmEditNavigation()?.let(::dispatchNavigation)
+                    },
+                    modifier = Modifier.testTag("discard_edit_yes"),
+                ) { Text("Yes") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = viewModel::cancelEditNavigation,
+                    modifier = Modifier.testTag("discard_edit_cancel"),
+                ) { Text("Cancel") }
+            },
+        )
     }
 }
 
 @Composable
-private fun BottomPanel(navController: NavHostController) {
-    val entry by navController.currentBackStackEntryAsState()
-    val current = entry?.destination?.route
+private fun BottomPanel(currentRoute: String?, onNavigate: (String) -> Unit) {
     NavigationBar(
         containerColor = MaterialTheme.colorScheme.surface,
         modifier = Modifier.testTag("bottom_navigation"),
@@ -240,8 +295,8 @@ private fun BottomPanel(navController: NavHostController) {
             Route.SETTINGS to "Settings",
         ).forEach { (route, label) ->
             NavigationBarItem(
-                selected = current == route,
-                onClick = { navController.navigate(route) { launchSingleTop = true } },
+                selected = currentRoute == route,
+                onClick = { onNavigate(route) },
                 icon = { Text(label.take(1), fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold) },
                 label = { Text(label) },
                 modifier = Modifier.testTag("nav_$route"),

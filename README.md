@@ -3,7 +3,7 @@
 # Command Code Chat
 
 [![CI](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml/badge.svg)](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml)
-[![Version](https://img.shields.io/badge/version-v2.3.1-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v2.3.1)
+[![Version](https://img.shields.io/badge/version-v3.0.0-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v3.0.0)
 [![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
 
@@ -42,7 +42,19 @@ The downloadable APK is **debug-signed**, not a production-signed Play Store bui
 - Requests the highest supported refresh rate at the current resolution; Android and device policies still control the delivered rate.
 - Uses AMOLED dark mode exclusively, with true-black backgrounds and surfaces, including startup and system bars. Existing theme preferences are ignored automatically.
 - Uses distinct, aligned message bubbles for user and assistant messages.
+- Long-presses past user messages to edit, copy, or select text, and assistant messages to copy, retry, or select text.
+- Keeps edits and retried responses as persistent alternatives within the same chat, with nested branch navigation using `<` and `>` controls.
+- Regenerates historical responses from their selected conversation point while applying the current model, system prompt, and ZDR setting; settings-change notices remain local to the new branch.
+- Supports native in-bubble substring selection and copying without opening a separate text window.
 - Keeps chat, history, budget, and security settings in one native Jetpack Compose app.
+
+### Message editing and response branches
+
+- Editing a past user message creates a new user-message alternative and generates a fresh response. The original message and its continuation remain available.
+- Retrying an assistant message regenerates only that historical response point. It does not copy the old continuation into the new branch.
+- Branch selectors show the selected alternative and total count, such as `2/4`; selections and nested continuations persist when the chat is reopened.
+- Editing is inline and retains the original message's image attachments. Navigating away prompts before discarding the memory-only edit draft.
+- Conversation usage totals include every attempt, while the context percentage follows the currently selected branch.
 
 ### Context-window usage
 

@@ -30,10 +30,16 @@ data class ConversationTokenUsage(
     val hasUnmeasuredAttempt: Boolean = false,
 ) {
     companion object {
-        fun aggregate(events: List<ReportedUsage>): ConversationTokenUsage {
+        fun aggregate(
+            events: List<ReportedUsage>,
+            contextRequestIds: Set<String>? = null,
+        ): ConversationTokenUsage {
             if (events.isEmpty()) return ConversationTokenUsage()
             val ordered = events.sortedWith(compareBy({ it.timestamp }, { it.id }))
-            val measured = ordered.lastOrNull {
+            val contextEvents = ordered.filter {
+                contextRequestIds == null || contextRequestIds.contains(it.requestId)
+            }
+            val measured = contextEvents.lastOrNull {
                 it.complete && addCounts(it.inputTokens, it.outputTokens) != null
             }
             val input = sumCounts(events.map { it.inputTokens })
@@ -52,7 +58,7 @@ data class ConversationTokenUsage(
                         requireNotNull(addCounts(it.inputTokens, it.outputTokens)))
                 },
                 accountingIncomplete = events.any { !it.complete } || processed == null || cached == null,
-                hasUnmeasuredAttempt = measured?.id != ordered.last().id,
+                hasUnmeasuredAttempt = contextEvents.isNotEmpty() && measured?.id != contextEvents.last().id,
             )
         }
 

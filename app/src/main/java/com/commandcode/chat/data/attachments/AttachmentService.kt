@@ -6,6 +6,8 @@ import android.net.Uri
 import com.commandcode.chat.ChatStore
 import com.commandcode.chat.data.commandcode.ApiImage
 import com.commandcode.chat.data.commandcode.ApiMessage
+import com.commandcode.chat.data.database.AlternativeRequest
+import com.commandcode.chat.data.database.AlternativeSource
 import com.commandcode.chat.data.database.AttachmentDao
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
@@ -52,6 +54,13 @@ interface AttachmentOperations {
         images: List<ImageAttachment>,
         systemPrompt: String = "",
     ): PreparedAttachmentTurn
+    suspend fun prepareAlternative(
+        conversationId: String,
+        request: AlternativeRequest,
+        model: ChatModel,
+        systemPrompt: String = "",
+    ): PreparedAttachmentTurn =
+        error("Message alternatives are not supported by this attachment service")
     suspend fun deleteConversation(id: String)
     suspend fun preview(id: String, maxEdge: Int): Bitmap
     suspend fun prepareRetry(
@@ -90,7 +99,7 @@ class AttachmentService(
             lifecycleMutex.withLock {
                 ensureInitialisedLocked()
                 val failures = withContext(NonCancellable) {
-                    retryImportCleanupLocked()
+                    retryPendingCleanupLocked()
                 }
                 if (failures.isNotEmpty()) throw cleanupFailure(failures.first())
             }
@@ -199,6 +208,79 @@ class AttachmentService(
         }
     }
 
+    override suspend fun prepareAlternative(
+        conversationId: String,
+        request: AlternativeRequest,
+        model: ChatModel,
+        systemPrompt: String,
+    ): PreparedAttachmentTurn = withContext(ioDispatcher) {
+        lifecycleMutex.withLock {
+            ensureInitialisedLocked()
+            val source = chatStore.alternativeSource(conversationId, request.messageId)
+            check(source.target.id == request.messageId) { "Alternative source target does not match the request" }
+            check(source.target.conversationId == conversationId) { "Alternative target belongs to another conversation" }
+            check(source.prefix.all { it.conversationId == conversationId }) {
+                "Alternative history crosses conversation boundaries"
+            }
+
+            val endpoint = when (request) {
+                is AlternativeRequest.Edit -> {
+                    check(source.target.role == USER_ROLE) { "Edit targets must be user messages" }
+                    source.target.copy(content = request.text)
+                }
+
+                is AlternativeRequest.Retry -> {
+                    val replyTo = source.target.replyToMessageId
+                        ?: error("Assistant target has no unambiguous user ancestor")
+                    source.prefix.single { it.id == replyTo }
+                }
+            }
+            check(endpoint.conversationId == conversationId) {
+                "Alternative endpoint belongs to another conversation"
+            }
+            check(endpoint.role == USER_ROLE) { "Alternative endpoint must be a user message" }
+            if (request is AlternativeRequest.Edit) {
+                require(request.text.isNotBlank() || endpoint.attachments.isNotEmpty()) {
+                    "A turn needs text or at least one image"
+                }
+            }
+
+            val history = source.prefix.takeWhile { it.id != endpoint.id }.requestHistory()
+            val databaseIds = attachmentDao.listIds().toSet()
+            committedIds = databaseIds
+            val conversationAttachmentIds = attachmentDao.listForConversation(conversationId)
+                .map { it.id }
+                .toSet()
+            val requestImages = validateHistory(
+                history + endpoint,
+                databaseIds,
+                conversationAttachmentIds,
+                model,
+            )
+            requestImages.distinctBy { it.id }
+                .forEach { authenticate(it, AttachmentFailure.INCOMPATIBLE_HISTORY) }
+
+            val effective = effectiveSystemPrompt(systemPrompt)
+            val context = prependSystemMessage(
+                buildContext(history, endpoint.content, endpoint.attachments),
+                effective,
+            )
+            val recheckedSource = chatStore.alternativeSource(conversationId, request.messageId)
+            check(recheckedSource == source) { "Alternative source changed during preparation" }
+            validateSourceLinks(source, chatStore.messagesSnapshot(conversationId))
+            val pending = chatStore.createAlternative(
+                conversationId,
+                request,
+                model,
+                effective,
+                source.expectedPathIds,
+            )
+            // Nothing fallible happens after createAlternative succeeds. The returned
+            // value and context only transfer ownership to the caller.
+            PreparedAttachmentTurn(pending, context)
+        }
+    }
+
     override suspend fun deleteConversation(id: String) {
         withContext(ioDispatcher) {
             lifecycleMutex.withLock {
@@ -206,14 +288,17 @@ class AttachmentService(
                 val capturedIds = linkedSetOf<String>()
                 capturedIds += attachmentDao.listForConversation(id).map { it.id }
                 capturedIds += cleanupByConversation[id].orEmpty()
+                rememberCleanupCandidates(id, capturedIds)
 
                 // The database is authoritative. Do not touch any file unless this
                 // operation has returned successfully.
                 chatStore.deleteConversation(id)
-                committedIds = committedIds - capturedIds
+                val survivingIds = attachmentDao.listIds().toSet()
+                committedIds = survivingIds
+                val removableIds = capturedIds - survivingIds
 
                 val cleanup = withContext(NonCancellable) {
-                    removeCapturedFiles(capturedIds)
+                    removeCapturedFiles(removableIds)
                 }
                 if (cleanup.failures.isEmpty()) {
                     cleanupByConversation.remove(id)
@@ -266,11 +351,18 @@ class AttachmentService(
                 val user = chatStore.messagesSnapshot(conversationId).single { it.id == userMessageId }
                 check(user.role == USER_ROLE && user.status == MessageState.FAILED_ZDR)
                 val ids = user.attachments.map { it.id }.toSet()
+                rememberCleanupCandidates(conversationId, ids)
                 chatStore.deleteFailedTurn(userMessageId)
-                committedIds = committedIds - ids
-                val cleanup = withContext(NonCancellable) { removeCapturedFiles(ids) }
+                val survivingIds = attachmentDao.listIds().toSet()
+                val removableIds = ids - survivingIds
+                committedIds = survivingIds
+                val cleanup = withContext(NonCancellable) { removeCapturedFiles(removableIds) }
+                cleanupByConversation[conversationId]?.removeAll(ids)
                 if (cleanup.failures.isNotEmpty()) {
                     cleanupByConversation.getOrPut(conversationId) { mutableSetOf() }.addAll(cleanup.failures.keys)
+                }
+                if (cleanupByConversation[conversationId]?.isEmpty() == true) {
+                    cleanupByConversation.remove(conversationId)
                 }
                 currentCoroutineContext().ensureActive()
                 if (cleanup.failures.isNotEmpty()) throw cleanupFailure(cleanup.failures.values.first(), databaseDeleted = true)
@@ -370,12 +462,37 @@ class AttachmentService(
         if (importClaims[claim.id] === claim) importClaims.remove(claim.id)
     }
 
-    private fun retryImportCleanupLocked(): List<Throwable> {
+    private fun retryPendingCleanupLocked(): List<Throwable> {
         val failures = mutableListOf<Throwable>()
+        if (importClaims.values.any { it.cleanupRequested } || cleanupByConversation.isNotEmpty()) {
+            val databaseIds = try {
+                attachmentDao.listIds().toSet()
+            } catch (error: Exception) {
+                failures += error
+                return failures
+            }
+            committedIds = databaseIds
+        }
         importClaims.values.filter { it.cleanupRequested }.toList().forEach { claim ->
             tryCleanupImportLocked(claim)?.let { failures += it }
         }
+        cleanupByConversation.entries.toList().forEach { (conversationId, ids) ->
+            val removableIds = ids - committedIds
+            val cleanup = removeCapturedFiles(removableIds)
+            if (cleanup.failures.isEmpty()) {
+                cleanupByConversation.remove(conversationId)
+            } else {
+                cleanupByConversation[conversationId] = cleanup.failures.keys.toMutableSet()
+                failures += cleanup.failures.values
+            }
+        }
         return failures
+    }
+
+    private fun rememberCleanupCandidates(conversationId: String, ids: Collection<String>) {
+        if (ids.isNotEmpty()) {
+            cleanupByConversation.getOrPut(conversationId) { linkedSetOf() }.addAll(ids)
+        }
     }
 
     private fun tryCleanupImportLocked(claim: ImportClaim): Throwable? {
@@ -436,6 +553,18 @@ class AttachmentService(
             validateImage(image, model, AttachmentFailure.INCOMPATIBLE_HISTORY)
         }
         return historicalImages
+    }
+
+    private fun validateSourceLinks(source: AlternativeSource, currentMessages: List<Message>) {
+        val currentById = currentMessages.associateBy { it.id }
+        (source.prefix + source.target).forEach { message ->
+            val current = currentById[message.id]
+            check(
+                current != null &&
+                    current.conversationId == message.conversationId &&
+                    current.attachments == message.attachments,
+            ) { "Alternative source attachment links changed during preparation" }
+        }
     }
 
     private fun validateImage(

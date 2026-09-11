@@ -9,22 +9,26 @@ import androidx.room.Query
 
     @Query(
         """
-        SELECT a.* FROM attachments a
-        JOIN messages m ON m.id = a.messageId
-        WHERE m.conversationId = :conversationId
-        ORDER BY m.createdAt ASC, m.id ASC, a.position ASC, a.id ASC
+        SELECT * FROM attachments
+        WHERE conversationId = :conversationId
+        ORDER BY rowid ASC
         """,
     )
     fun listForConversation(conversationId: String): List<AttachmentEntity>
 
     @Query(
         """
-        SELECT COUNT(*) FROM attachments a
-        JOIN messages m ON m.id = a.messageId
-        WHERE m.conversationId = :conversationId
+        SELECT COUNT(*) FROM attachments
+        WHERE conversationId = :conversationId
         """,
     )
     fun countForConversation(conversationId: String): Int
+
+    @Query(
+        "DELETE FROM attachments " +
+            "WHERE id IN (:ids) AND id NOT IN (SELECT attachmentId FROM message_attachments)",
+    )
+    fun deleteUnreferenced(ids: List<String>): Int
 
     @Insert fun insert(values: List<AttachmentEntity>)
 }

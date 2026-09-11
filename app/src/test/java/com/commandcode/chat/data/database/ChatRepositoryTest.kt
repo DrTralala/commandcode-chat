@@ -136,6 +136,23 @@ class ChatRepositoryTest {
     }
 
     @Test
+    fun failedDeletionPrunesPhysicalAttachmentsAfterRemovingTheirLinks() = runTest {
+        val (repository, database) = testRepository()
+        val failed = repository.beginTurn(
+            null,
+            "failed",
+            ChatModel.SOL,
+            listOf(image("failed-attachment")),
+        )
+        repository.failZdrTurn(failed.assistantMessageId)
+
+        repository.deleteFailedTurn(failed.userMessageId)
+
+        assertTrue(database.messageAttachments().listForMessage(failed.userMessageId).isEmpty())
+        assertTrue(database.attachments().listIds().isEmpty())
+    }
+
+    @Test
     fun nonemptyOrCompleteAssistantCannotBecomeZdrFailure() = runTest {
         val (repository, database) = testRepository()
         val turn = repository.beginTurn(null, "hello", ChatModel.SOL)
@@ -320,6 +337,32 @@ class ChatRepositoryTest {
         assertTrue(database.messages().find(turn.userMessageId) == null)
         assertTrue(database.messages().find(turn.assistantMessageId) == null)
         assertTrue(database.usageEvents().observeForConversation(turn.conversationId).first().isEmpty())
+    }
+
+    @Test
+    fun rootOnlyConversationCanBeObservedAndDeletedWithoutSelfForeignKeyFailures() = runTest {
+        val (repository, database) = testRepository()
+        database.conversations().insert(ConversationEntity("root-only", "Root only", ChatModel.SOL.apiId, 1, 1))
+
+        assertTrue(repository.observeMessages("root-only").first().isEmpty())
+        assertEquals(1, database.branches().listNodes("root-only").size)
+
+        repository.deleteConversation("root-only")
+
+        assertTrue(database.branches().listNodes("root-only").isEmpty())
+        assertTrue(database.branches().listPlacements("root-only").isEmpty())
+        assertTrue(database.branches().listSelections("root-only").isEmpty())
+        assertTrue(database.conversations().find("root-only") == null)
+    }
+
+    @Test
+    fun observedGraphRejectsAnUnplacedMessageInsteadOfSilentlyOmittingIt() = runTest {
+        val (repository, database) = testRepository()
+        database.conversations().insert(ConversationEntity("orphan", "Orphan", ChatModel.SOL.apiId, 1, 1))
+        repository.messagesSnapshot("orphan")
+        database.messages().insert(MessageEntity("orphan-message", "orphan", "USER", "orphan", null, 2, "COMPLETE"))
+
+        assertTrue(runCatching { repository.observeMessages("orphan").first() }.isFailure)
     }
 
     @Test
@@ -661,7 +704,7 @@ class ChatRepositoryTest {
 
     @Test
     fun retriedAttemptAppendsChangedPromptNoticeWithoutMovingUserOrReplacementPositions() = runTest {
-        val (repository, _) = testRepository()
+        val (repository, database) = testRepository()
         val first = repository.beginTurn(null, "failed", ChatModel.SOL, systemPrompt = "alpha")
         repository.failZdrTurn(first.assistantMessageId)
         val later = repository.beginTurn(first.conversationId, "later", ChatModel.SOL, systemPrompt = "alpha")
@@ -687,7 +730,13 @@ class ChatRepositoryTest {
             listOf(first.userMessageId, retry.assistantMessageId, later.userMessageId, later.assistantMessageId),
             conversationalOrder,
         )
-        assertEquals(MessageState.SYSTEM_PROMPT_CHANGE, rows.last().role)
+        val retryPlacements = database.branches().listPlacementsForNode(retry.assistantMessageId)
+        val roleByMessageId = database.messages().listForConversation(first.conversationId).associate { it.id to it.role }
+        assertEquals(
+            listOf(MessageState.MODEL_CHANGE, MessageState.SYSTEM_PROMPT_CHANGE, "ASSISTANT"),
+            retryPlacements.map { requireNotNull(roleByMessageId[it.messageId]) },
+        )
+        assertEquals(listOf(-2, -1, 0), retryPlacements.map { it.position })
 
         // A failed retry retried again with the same prompt must not duplicate its notice.
         repository.failZdrTurn(retry.assistantMessageId)

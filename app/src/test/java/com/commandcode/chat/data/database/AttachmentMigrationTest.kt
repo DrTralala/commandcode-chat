@@ -16,11 +16,11 @@ import org.robolectric.annotation.Config
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Real non-destructive v1 -> v2 migration coverage. A v1 database is built by
+ * Real non-destructive v1 -> v4 migration coverage. A v1 database is built by
  * executing the exact v1 schema SQL through the framework SQLite helper, seeded
  * with conversation/message/usage fixture values and closed. Opening it through
- * Room with [MIGRATION_1_2] must preserve every v1 value and add the attachments
- * table, its unique index and its foreign key.
+ * Room with all migrations must preserve every v1 value and create the v4
+ * conversation-owned attachment table and link schema.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = android.app.Application::class)
@@ -46,7 +46,7 @@ class AttachmentMigrationTest {
                 db.version = 2
             }
             fun open() = Room.databaseBuilder(context, ChatDatabase::class.java, name)
-                .addMigrations(MIGRATION_2_3).allowMainThreadQueries().build().also { databases += it }
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4).allowMainThreadQueries().build().also { databases += it }
             val migrated = open()
             assertEquals("message-user", migrated.messages().find("message-assistant")!!.replyToMessageId)
             val repository = ChatRepository(migrated)
@@ -75,7 +75,7 @@ class AttachmentMigrationTest {
             val v1 = buildV1Database(context, name)
 
             val migrated = Room.databaseBuilder(context, ChatDatabase::class.java, name)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .allowMainThreadQueries()
                 .build()
             databases += migrated
@@ -126,29 +126,26 @@ class AttachmentMigrationTest {
             assertEquals(listOf("attachments"), tables)
 
             val indexSql = migrated.openHelper.writableDatabase.query(
-                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'index_attachments_messageId_position'",
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'index_attachments_conversationId'",
                 emptyArray(),
             ).use { cursor ->
                 if (cursor.moveToFirst()) cursor.getString(0) else null
             }
             assertNotNull(indexSql)
-            assertTrue(indexSql!!.contains("UNIQUE"))
-            assertTrue(indexSql.contains("messageId"))
-            assertTrue(indexSql.contains("position"))
+            assertTrue(indexSql!!.contains("conversationId"))
 
-            // FK enforcement works: an attachment must reference an existing message.
+            // FK enforcement works: an attachment must reference an existing conversation.
             migrated.attachments().insert(
                 listOf(
                     AttachmentEntity(
                         id = "attachment-1",
-                        messageId = "message-user",
+                        conversationId = "conversation-a",
                         displayName = "Image.png",
                         mimeType = "image/png",
                         originalBytes = 100L,
                         encryptedBytes = 133L,
                         width = 2,
                         height = 2,
-                        position = 0,
                     ),
                 ),
             )
@@ -159,19 +156,30 @@ class AttachmentMigrationTest {
                     listOf(
                         AttachmentEntity(
                             id = "attachment-2",
-                            messageId = "missing-message",
+                            conversationId = "missing-conversation",
                             displayName = "Image.png",
                             mimeType = "image/png",
                             originalBytes = 1L,
                             encryptedBytes = 1L,
                             width = 1,
                             height = 1,
-                            position = 1,
                         ),
                     ),
                 )
             }
             assertTrue(invalidRejected.isFailure)
+
+            // Link rows retain the old message relationship and still enforce
+            // their message FK independently of physical ownership.
+            migrated.messageAttachments().insert(
+                listOf(MessageAttachmentEntity("message-user", "attachment-1", 0)),
+            )
+            val invalidLinkRejected = runCatching {
+                migrated.messageAttachments().insert(
+                    listOf(MessageAttachmentEntity("missing-message", "attachment-1", 1)),
+                )
+            }
+            assertTrue(invalidLinkRejected.isFailure)
         } finally {
             context.deleteDatabase(name)
         }

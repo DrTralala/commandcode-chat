@@ -14,6 +14,7 @@ import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeException
 import com.commandcode.chat.data.commandcode.StreamEvent
 import com.commandcode.chat.data.attachments.AttachmentOperations
+import com.commandcode.chat.data.database.AlternativeRequest
 import com.commandcode.chat.data.database.Conversation
 import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
@@ -35,6 +36,7 @@ import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.AttachmentSupport
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
+import com.commandcode.chat.domain.MessageState
 import com.commandcode.chat.domain.TokenUsage
 import com.commandcode.chat.ui.chat.PickerTicket
 import com.commandcode.chat.ui.history.HistorySort
@@ -83,6 +85,8 @@ data class AppUiState(
     val selectedModel: ChatModel = ChatModel.SOL,
     val conversations: List<Conversation> = emptyList(),
     val currentConversationId: String? = null,
+    /** Immutable snapshot of conversations whose deletion jobs have not settled. */
+    val deletingConversationIds: Set<String> = emptySet(),
     val messages: List<Message> = emptyList(),
     val tokenUsage: ConversationTokenUsage = ConversationTokenUsage(),
     val contextWindows: ContextWindowCatalogue = ContextWindowCatalogue(),
@@ -90,6 +94,8 @@ data class AppUiState(
     val activeAssistantMessageId: String? = null,
     val streamingText: String = "",
     val sending: Boolean = false,
+    /** True while a non-streaming message mutation owns the message selection. */
+    val messageMutationBusy: Boolean = false,
     val errorMessage: String? = null,
     val budget: BudgetUiState = BudgetUiState(),
     val draftText: String = "",
@@ -102,7 +108,13 @@ data class AppUiState(
     val systemPromptSaving: Boolean = false,
     val systemPromptFeedback: SystemPromptFeedback? = null,
     val systemPromptCommit: Int = 0,
+    val messageEdit: MessageEdit? = null,
+    val pendingEditNavigation: EditNavigation? = null,
 ) {
+    /** True when the currently shown conversation is in the deletion snapshot. */
+    val deletingCurrentConversation: Boolean
+        get() = currentConversationId?.let { it in deletingConversationIds } == true
+
     val contextUsage: ContextUsagePresentation get() = contextUsagePresentation(this)
 
     val visibleMessages: List<Message>
@@ -119,6 +131,10 @@ data class AppUiState(
 
     val visibleThinking: Boolean
         get() = sending && streamingText.isEmpty() && currentConversationId == activeConversationId
+
+    /** Observable busy state shared by message actions and the ordinary composer. */
+    val messageActionsBusy: Boolean
+        get() = sending || messageMutationBusy || importingAttachments || deletingCurrentConversation
 }
 
 class AppViewModel(
@@ -377,6 +393,144 @@ class AppViewModel(
         mutableState.value = current.copy(draftText = text)
     }
 
+    fun startMessageEdit(messageId: String) {
+        val current = mutableState.value
+        if (current.loading || selectionIsFrozen(includeEdit = false)) return
+        val existing = current.messageEdit
+        if (existing?.messageId == messageId) return
+        if (existing != null) {
+            if (current.editableMessage(messageId) != null) {
+                requestEditNavigation(EditNavigation.EditAnother(messageId))
+            }
+            return
+        }
+        val conversationId = current.currentConversationId ?: return
+        val target = current.editableMessage(messageId) ?: return
+        mutableState.value = current.copy(
+            messageEdit = MessageEdit(conversationId, target.id, target.content),
+            pendingEditNavigation = null,
+        )
+    }
+
+    fun updateMessageEdit(text: String) {
+        val current = mutableState.value
+        val edit = current.messageEdit ?: return
+        if (current.loading || selectionIsFrozen(includeEdit = false)) return
+        mutableState.value = current.copy(messageEdit = edit.copy(text = text))
+    }
+
+    fun cancelMessageEdit() {
+        val current = mutableState.value
+        if (current.messageEdit == null || selectionIsFrozen(includeEdit = false)) return
+        mutableState.value = current.copy(messageEdit = null, pendingEditNavigation = null)
+        applyPendingModelsIfIdle()
+    }
+
+    /**
+     * Drops only in-memory edit navigation state when recovery has taken over.
+     * Unlike the explicit editor cancel path, this must not wait for an in-flight
+     * submission or mutation to settle before clearing stale UI state.
+     */
+    fun clearEphemeralEditForRecovery() {
+        val current = mutableState.value
+        if (current.messageEdit == null && current.pendingEditNavigation == null) return
+        mutableState.value = current.copy(messageEdit = null, pendingEditNavigation = null)
+        applyPendingModelsIfIdle()
+    }
+
+    fun submitMessageEdit() {
+        val current = mutableState.value
+        val edit = current.messageEdit ?: return
+        if (current.loading || selectionIsFrozen(includeEdit = false)) return
+        val target = current.editableMessage(edit.messageId)?.takeIf {
+            it.conversationId == edit.conversationId && it.conversationId == current.currentConversationId
+        } ?: return
+        sendOrRetry(
+            SendAction.Alternative(AlternativeRequest.Edit(target.id, edit.text)),
+        )
+    }
+
+    fun requestEditNavigation(target: EditNavigation): Boolean {
+        val current = mutableState.value
+        if (isNoOpNavigation(target)) {
+            if (current.pendingEditNavigation != null) {
+                mutableState.value = current.copy(pendingEditNavigation = null)
+            }
+            return true
+        }
+        if (current.messageEdit == null) {
+            if (current.pendingEditNavigation != null) {
+                mutableState.value = current.copy(pendingEditNavigation = null)
+            }
+            return true
+        }
+        mutableState.value = current.copy(pendingEditNavigation = target)
+        return false
+    }
+
+    fun confirmEditNavigation(): EditNavigation? {
+        val current = mutableState.value
+        val target = current.pendingEditNavigation ?: return null
+        mutableState.value = current.copy(
+            messageEdit = null,
+            pendingEditNavigation = null,
+        )
+        applyPendingModelsIfIdle()
+        return target
+    }
+
+    fun cancelEditNavigation() {
+        val current = mutableState.value
+        if (current.pendingEditNavigation != null) {
+            mutableState.value = current.copy(pendingEditNavigation = null)
+        }
+    }
+
+    private fun isNoOpNavigation(target: EditNavigation): Boolean {
+        val current = mutableState.value
+        return when (target) {
+            is EditNavigation.Tab -> false
+            is EditNavigation.Conversation -> current.currentConversationId == target.id
+            is EditNavigation.Branch -> isSelectedAlternative(target.messageId)
+            is EditNavigation.EditAnother -> current.messageEdit?.messageId == target.messageId
+            EditNavigation.NewChat -> current.currentConversationId == null && current.messageEdit == null
+            EditNavigation.Back -> false
+        }
+    }
+
+    private fun AppUiState.editableMessage(messageId: String): Message? {
+        val conversationId = currentConversationId ?: return null
+        return messages.firstOrNull {
+                it.id == messageId &&
+                it.conversationId == conversationId &&
+                it.role == USER_ROLE &&
+                it.status !in NONTERMINAL_MESSAGE_STATUSES
+        }
+    }
+
+    private fun isSelectedAlternative(messageId: String): Boolean =
+        mutableState.value.messages.asSequence()
+            .flatMap { message -> sequenceOf(message.branchChoice, message.responseBranchChoice) }
+            .filterNotNull()
+            .any { choice -> choice.messageIds.getOrNull(choice.selectedIndex) == messageId }
+
+    private fun AppUiState.hasAlternative(messageId: String, expectedIds: List<String>): Boolean =
+        messages.asSequence()
+            .flatMap { message -> sequenceOf(message.branchChoice, message.responseBranchChoice) }
+            .filterNotNull()
+            .any { choice -> choice.messageIds == expectedIds && messageId in choice.messageIds }
+
+    private fun clearCommittedMessageEdit(request: AlternativeRequest.Edit, conversationId: String) {
+        val current = mutableState.value
+        val edit = current.messageEdit
+        if (edit?.conversationId == conversationId && edit.messageId == request.messageId) {
+            mutableState.value = current.copy(
+                messageEdit = null,
+                pendingEditNavigation = null,
+            )
+        }
+    }
+
     fun requestAttachmentPicker(): PickerTicket? {
         val current = mutableState.value
         if (!attachmentActionsReady || current.loading || selectionIsFrozen()) {
@@ -511,6 +665,8 @@ class AppViewModel(
             dismissResolvedModelAttachmentError()
             return
         }
+        if (messageMutationJob != null || mutableState.value.messageMutationBusy) return
+        mutableState.value = mutableState.value.copy(messageMutationBusy = true)
         messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             try {
                 chats.changeConversationModel(conversationId, currentModel)
@@ -524,8 +680,7 @@ class AppViewModel(
                     errorMessage = "Model could not be changed. Try again.",
                 ).withBlockingPromptBanner()
             } finally {
-                messageMutationJob = null
-                applyPendingModelsIfIdle()
+                completeMessageMutation(currentCoroutineContext()[Job])
             }
         }
         messageMutationJob?.start()
@@ -580,6 +735,7 @@ class AppViewModel(
     }
 
     fun openConversation(id: String) {
+        if (!requestEditNavigation(EditNavigation.Conversation(id))) return
         if (messageMutationJob != null) return
         if (mutableState.value.currentConversationId == id) return
         if (isCurrentConversationDeleting() || id in deletingConversationIds) return
@@ -587,6 +743,7 @@ class AppViewModel(
     }
 
     fun newChat() {
+        if (!requestEditNavigation(EditNavigation.NewChat)) return
         if (messageMutationJob != null) return
         if (isSendBusy() || isCurrentConversationDeleting()) return
         invalidateAttachmentImport()
@@ -762,18 +919,25 @@ class AppViewModel(
         return draftGeneration
     }
 
-    private fun isSendBusy(): Boolean = mutableState.value.sending || sendJob?.isActive == true
+    private fun isSendBusy(): Boolean = mutableState.value.sending || sendJob != null
 
     private fun isConversationDeleting(id: String?): Boolean = id != null && id in deletingConversationIds
 
     private fun isCurrentConversationDeleting(): Boolean =
         isConversationDeleting(mutableState.value.currentConversationId)
 
-    private fun selectionIsFrozen(): Boolean =
-        messageMutationJob != null || isSendBusy() ||
+    private fun publishDeletingConversationIds() {
+        mutableState.value = mutableState.value.copy(
+            deletingConversationIds = deletingConversationIds.toSet(),
+        )
+    }
+
+    private fun selectionIsFrozen(includeEdit: Boolean = true): Boolean =
+        mutableState.value.messageMutationBusy || messageMutationJob != null || isSendBusy() ||
             mutableState.value.importingAttachments ||
             attachmentImportJob != null ||
-            isCurrentConversationDeleting()
+            isCurrentConversationDeleting() ||
+            (includeEdit && mutableState.value.messageEdit != null)
 
     private fun publishAttachmentFailure(failure: AttachmentFailure) {
         mutableState.value = mutableState.value.copy(
@@ -783,7 +947,7 @@ class AppViewModel(
     }
 
     fun deleteConversation(id: String) {
-        if (messageMutationJob != null) return
+        if (messageMutationJob != null || mutableState.value.messageEdit != null) return
         if (id in deletingConversationIds) return
         val snapshot = mutableState.value
         val ownsCurrentDraft = snapshot.currentConversationId == id
@@ -796,6 +960,7 @@ class AppViewModel(
         }
         val importJobToJoin = if (attachmentImportConversationId == id) attachmentImportJob else null
         deletingConversationIds += id
+        publishDeletingConversationIds()
         if (ownsCurrentDraft) {
             // Reserve the draft and invalidate every picker ticket before the
             // first suspension. The deletion job owns this snapshot until the
@@ -856,16 +1021,17 @@ class AppViewModel(
                 ).withBlockingPromptBanner()
             } finally {
                 deletingConversationIds -= id
+                publishDeletingConversationIds()
                 applyPendingModelsIfIdle()
             }
         }
     }
 
-    fun send(text: String) = sendOrRetry(text, null)
+    fun send(text: String) = sendOrRetry(SendAction.Normal(text))
 
-    private fun sendOrRetry(text: String, retryUserId: String?) {
-        val prompt = text.trim()
+    private fun sendOrRetry(action: SendAction) {
         val snapshot = mutableState.value
+        if (snapshot.messageEdit != null && action !is SendAction.Alternative) return
         if (!snapshot.systemPromptLoaded) {
             // Never drop an enabled send/retry silently: the only on-screen reason
             // is the unavailable-prompt banner, so make sure it is visible.
@@ -874,39 +1040,48 @@ class AppViewModel(
             }
             return
         }
-        if ((retryUserId == null && prompt.isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
-            selectionIsFrozen() ||
+        val normalText = (action as? SendAction.Normal)?.text
+        if ((normalText != null && normalText.trim().isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
+            selectionIsFrozen(includeEdit = action !is SendAction.Alternative) ||
             !snapshot.keyConfigured
         ) return
-        if (retryUserId == null && snapshot.draftText != text) {
-            mutableState.value = snapshot.copy(draftText = text)
+        if (normalText != null && snapshot.draftText != normalText) {
+            mutableState.value = snapshot.copy(draftText = normalText)
         }
         val selectedModel = snapshot.selectedModel
         val zdr = snapshot.zdr
         // Capture the system prompt alongside model/ZDR so a concurrent Settings
         // change cannot alter this in-flight request.
         val systemPrompt = snapshot.systemPrompt
-        val requestedConversationId = snapshot.currentConversationId
-        val snapshotImages = if (retryUserId == null) snapshot.pendingAttachments.toList() else emptyList()
+        val conversationId = snapshot.currentConversationId
+        if (action !is SendAction.Normal && conversationId == null) return
+        val snapshotImages = if (action is SendAction.Normal) snapshot.pendingAttachments.toList() else emptyList()
         val snapshotGeneration = draftGeneration
-        sendTargetConversationId = requestedConversationId
+        val capturedAction = action
+        sendTargetConversationId = conversationId
         val handoff = CompletableDeferred<String?>()
         sendHandoff = handoff
-        sendJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+        val job = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             var turn: ActiveTurn? = null
             var apiKey: CharArray? = null
             try {
                 mutableState.value = mutableState.value.copy(sending = true, streamingText = "", errorMessage = null)
                 val registered = withContext(NonCancellable) {
-                    val prepared = if (retryUserId != null) attachmentOperations.prepareRetry(
-                        requireNotNull(requestedConversationId), retryUserId, selectedModel, systemPrompt,
-                    ) else attachmentOperations.prepareTurn(
-                        requestedConversationId,
-                        prompt,
-                        selectedModel,
-                        snapshotImages,
-                        systemPrompt,
-                    )
+                    val prepared = when (val action = capturedAction) {
+                        is SendAction.Normal -> attachmentOperations.prepareTurn(
+                            conversationId,
+                            action.text.trim(),
+                            selectedModel,
+                            snapshotImages,
+                            systemPrompt,
+                        )
+                        is SendAction.FailedRetry -> attachmentOperations.prepareRetry(
+                            requireNotNull(conversationId), action.userMessageId, selectedModel, systemPrompt,
+                        )
+                        is SendAction.Alternative -> attachmentOperations.prepareAlternative(
+                            requireNotNull(conversationId), action.request, selectedModel, systemPrompt,
+                        )
+                    }
                     val active = ActiveTurn(
                         pending = prepared.pending,
                         draftGeneration = snapshotGeneration,
@@ -921,19 +1096,24 @@ class AppViewModel(
                         )
                         handoff.complete(prepared.pending.conversationId)
                     }
-                    if (retryUserId == null && draftGeneration == snapshotGeneration) {
+                    if (capturedAction is SendAction.Normal && draftGeneration == snapshotGeneration) {
                         mutableState.value = mutableState.value.copy(
                             draftText = "",
                             pendingAttachments = emptyList(),
                         )
+                    }
+                    if (capturedAction is SendAction.Alternative &&
+                        capturedAction.request is AlternativeRequest.Edit
+                    ) {
+                        clearCommittedMessageEdit(capturedAction.request, requireNotNull(conversationId))
                     }
                     RegisteredTurn(active, prepared.messages)
                 }
                 currentCoroutineContext().ensureActive()
                 val registeredTurn = registered.turn
                 val pending = registeredTurn.pending
-                if (requestedConversationId != pending.conversationId &&
-                    mutableState.value.currentConversationId == requestedConversationId
+                if (conversationId != pending.conversationId &&
+                    mutableState.value.currentConversationId == conversationId
                 ) {
                     showConversation(pending.conversationId, invalidateDraft = false)
                 }
@@ -978,16 +1158,23 @@ class AppViewModel(
                 }
             } finally {
                 apiKey?.fill('\u0000')
-                handoff.complete(null)
-                if (sendHandoff === handoff) sendHandoff = null
-                sendTargetConversationId = null
-                if (sendJob === currentCoroutineContext()[Job]) {
-                    sendJob = null
-                    applyPendingModelsIfIdle()
-                }
+                clearSendHandle(currentCoroutineContext()[Job], handoff)
             }
         }
-        sendJob?.start()
+        sendJob = job
+        job.invokeOnCompletion { clearSendHandle(job, handoff) }
+        job.start()
+    }
+
+    private fun clearSendHandle(job: Job?, handoff: CompletableDeferred<String?>) {
+        if (job == null || sendJob !== job) return
+        sendJob = null
+        handoff.complete(null)
+        if (sendHandoff === handoff) {
+            sendHandoff = null
+            sendTargetConversationId = null
+        }
+        applyPendingModelsIfIdle()
     }
 
     fun cancel() {
@@ -996,9 +1183,64 @@ class AppViewModel(
 
     fun retryMessage(userMessageId: String) {
         val user = mutableState.value.messages.firstOrNull {
-            it.id == userMessageId && it.role == "USER" && it.status == com.commandcode.chat.domain.MessageState.FAILED_ZDR
+            it.id == userMessageId && it.role == USER_ROLE && it.status == MessageState.FAILED_ZDR
         } ?: return
-        sendOrRetry(user.content, user.id)
+        sendOrRetry(SendAction.FailedRetry(user.id))
+    }
+
+    fun retryAssistant(messageId: String) {
+        val snapshot = mutableState.value
+        if (selectionIsFrozen()) return
+        val conversationId = snapshot.currentConversationId ?: return
+        val target = snapshot.messages.firstOrNull {
+            it.id == messageId &&
+                it.conversationId == conversationId &&
+                it.role == ASSISTANT_ROLE &&
+                it.status != MessageState.FAILED_ZDR &&
+                it.status !in NONTERMINAL_MESSAGE_STATUSES
+        } ?: return
+        if (target.replyToMessageId == null) return
+        sendOrRetry(SendAction.Alternative(AlternativeRequest.Retry(target.id)))
+    }
+
+    fun selectMessageAlternative(messageId: String) {
+        val snapshot = mutableState.value
+        val choice = snapshot.messages.asSequence()
+            .flatMap { message -> sequenceOf(message.branchChoice, message.responseBranchChoice) }
+            .filterNotNull()
+            .firstOrNull { messageId in it.messageIds }
+            ?: return
+        if (choice.messageIds.getOrNull(choice.selectedIndex) == messageId) {
+            requestEditNavigation(EditNavigation.Branch(messageId))
+            return
+        }
+        if (!requestEditNavigation(EditNavigation.Branch(messageId))) return
+        if (selectionIsFrozen()) return
+        val conversationId = snapshot.currentConversationId ?: return
+        val expectedChoiceIds = choice.messageIds.toList()
+        if (messageMutationJob != null || mutableState.value.messageMutationBusy) return
+        mutableState.value = mutableState.value.copy(messageMutationBusy = true)
+        messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            try {
+                val current = mutableState.value
+                if (current.currentConversationId != conversationId ||
+                    !current.hasAlternative(messageId, expectedChoiceIds)
+                ) return@launch
+                chats.selectAlternative(conversationId, messageId)
+                if (mutableState.value.currentConversationId != conversationId) return@launch
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (mutableState.value.currentConversationId == conversationId) {
+                    mutableState.value = mutableState.value.copy(
+                        errorMessage = "Alternative could not be selected. Try again.",
+                    ).withBlockingPromptBanner()
+                }
+            } finally {
+                completeMessageMutation(currentCoroutineContext()[Job])
+            }
+        }
+        messageMutationJob?.start()
     }
 
     fun deleteFailedMessage(userMessageId: String) {
@@ -1006,6 +1248,8 @@ class AppViewModel(
         val snapshot = mutableState.value
         val conversationId = snapshot.currentConversationId ?: return
         if (snapshot.messages.none { it.id == userMessageId && it.role == "USER" && it.status == com.commandcode.chat.domain.MessageState.FAILED_ZDR }) return
+        if (messageMutationJob != null || mutableState.value.messageMutationBusy) return
+        mutableState.value = mutableState.value.copy(messageMutationBusy = true)
         messageMutationJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             try {
                 attachmentOperations.deleteFailedMessage(conversationId, userMessageId)
@@ -1019,8 +1263,7 @@ class AppViewModel(
                     errorMessage = "Message could not be deleted. Try again.",
                 ).withBlockingPromptBanner()
             } finally {
-                messageMutationJob = null
-                applyPendingModelsIfIdle()
+                completeMessageMutation(currentCoroutineContext()[Job])
             }
         }
         messageMutationJob?.start()
@@ -1115,6 +1358,13 @@ class AppViewModel(
         }
     }
 
+    private fun completeMessageMutation(job: Job?) {
+        if (job == null || messageMutationJob !== job) return
+        messageMutationJob = null
+        mutableState.value = mutableState.value.copy(messageMutationBusy = false)
+        applyPendingModelsIfIdle()
+    }
+
     private fun publishModels(models: List<ChatModel>) {
         val selected = models.firstOrNull {
             it.apiId == mutableState.value.selectedModel.apiId
@@ -1193,6 +1443,12 @@ class AppViewModel(
         val messages: List<ApiMessage>,
     )
 
+    private sealed interface SendAction {
+        data class Normal(val text: String) : SendAction
+        data class FailedRetry(val userMessageId: String) : SendAction
+        data class Alternative(val request: AlternativeRequest) : SendAction
+    }
+
     private enum class StreamPhase { COLLECTING, DONE }
     private enum class TurnFailureKind { EARLY_EOF, FRAME_ERROR, COMMIT_REJECTED }
     private class TurnFailure(val kind: TurnFailureKind) : IOException()
@@ -1206,6 +1462,9 @@ class AppViewModel(
         private const val PREPARE_FAILURE_MESSAGE = "The request could not be completed. Try again."
         private const val ATTACHMENT_CLEANUP_WARNING =
             "Conversation deleted, but encrypted attachment cleanup could not be completed."
+        private const val USER_ROLE = "USER"
+        private const val ASSISTANT_ROLE = "ASSISTANT"
+        private val NONTERMINAL_MESSAGE_STATUSES = setOf("PENDING", "STREAMING")
 
         fun factory(container: AppContainer): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

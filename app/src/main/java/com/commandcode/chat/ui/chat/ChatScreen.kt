@@ -8,7 +8,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -30,9 +29,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedIconButton
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -88,10 +85,39 @@ internal fun chatHeading(state: AppUiState): String {
 }
 
 internal fun sendButtonEnabled(state: AppUiState): Boolean =
-    !state.sending &&
-        !state.importingAttachments &&
+    !state.messageActionsBusy &&
+        state.messageEdit == null &&
         state.systemPromptLoaded &&
         (state.draftText.isNotBlank() || state.pendingAttachments.isNotEmpty())
+
+internal data class MessageActionAvailability(
+    val menuEnabled: Boolean,
+    val editEnabled: Boolean,
+    val retryEnabled: Boolean,
+    val failedActionsEnabled: Boolean,
+    val branchEnabled: Boolean,
+)
+
+internal fun messageActionAvailability(state: AppUiState, message: Message): MessageActionAvailability {
+    val mutationIdle = !state.messageActionsBusy
+    val editing = state.messageEdit != null
+    val terminal = message.status !in setOf("PENDING", "STREAMING")
+    val editable = message.role == "USER" && terminal
+    val assistantRetryable = message.role == "ASSISTANT" &&
+        message.status != MessageState.FAILED_ZDR && terminal
+    val failed = message.role == "USER" && message.status == MessageState.FAILED_ZDR
+    return MessageActionAvailability(
+        menuEnabled = mutationIdle,
+        // Keep this enabled for another editable message while an editor is open:
+        // AppRoot uses the callback to raise the discard-navigation guard.
+        editEnabled = mutationIdle && editable,
+        retryEnabled = mutationIdle && !editing && assistantRetryable,
+        failedActionsEnabled = mutationIdle && !editing && failed,
+        // Branch clicks also need to reach AppRoot while editing so the same
+        // discard-navigation guard can be shown before selecting a sibling.
+        branchEnabled = mutationIdle,
+    )
+}
 
 /** Sentence-capitalisation is an IME hint only; the draft text is never rewritten. */
 internal val composerKeyboardOptions: KeyboardOptions =
@@ -192,8 +218,15 @@ fun ChatScreen(
     loadAttachmentPreview: suspend (String, Int) -> Bitmap,
     onRetryMessage: (String) -> Unit = {},
     onDeleteFailedMessage: (String) -> Unit = {},
+    onRetryAssistant: (String) -> Unit = {},
+    onStartMessageEdit: (String) -> Unit = {},
+    onMessageEditChange: (String) -> Unit = {},
+    onSubmitMessageEdit: () -> Unit = {},
+    onCancelMessageEdit: () -> Unit = {},
+    onSelectAlternative: (String) -> Unit = {},
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    val selectionOwner = rememberMessageSelectionOwner()
     val activeId = state.activeAssistantMessageId.takeIf { state.sending && state.currentConversationId == state.activeConversationId }
     val conversationCreatedAt = state.currentConversationId?.let { id ->
         state.conversations.firstOrNull { it.id == id }?.createdAt
@@ -217,6 +250,9 @@ fun ChatScreen(
     LaunchedEffect(state.currentConversationId, state.visibleMessages.size, state.visibleStreamingText, state.visibleThinking) {
         if (followResponse) messages.scrollToItem(timeline.indexOfFirst { it.id == activeId }.coerceAtLeast(0))
     }
+    LaunchedEffect(state.currentConversationId) {
+        selectionOwner.clear()
+    }
     BoxWithConstraints(Modifier.fillMaxSize()) {
     val supportHeight = (maxHeight * 0.4f).coerceAtMost(240.dp)
     val composerLines = if (maxHeight < 320.dp) 2 else 4
@@ -236,8 +272,11 @@ fun ChatScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box {
                     OutlinedIconButton(
-                        onClick = { menuOpen = true },
-                        enabled = !state.sending && !state.importingAttachments,
+                        onClick = {
+                            selectionOwner.clear()
+                            menuOpen = true
+                        },
+                        enabled = !state.messageActionsBusy && state.messageEdit == null,
                         modifier = Modifier
                             .size(48.dp)
                             .testTag("model_selector")
@@ -259,7 +298,11 @@ fun ChatScreen(
                         state.models.forEach { model ->
                             DropdownMenuItem(
                                 text = { Text(model.displayName) },
-                                onClick = { onSelectModel(model); menuOpen = false },
+                                onClick = {
+                                    selectionOwner.clear()
+                                    onSelectModel(model)
+                                    menuOpen = false
+                                },
                                 modifier = Modifier
                                     .testTag(modelOptionTestTag(model.apiId))
                                     .semantics { contentDescription = "Use ${model.displayName}" },
@@ -269,9 +312,10 @@ fun ChatScreen(
                 }
                 OutlinedIconButton(
                     onClick = {
+                        selectionOwner.clear()
                         onNewChat()
                     },
-                    enabled = !state.sending,
+                    enabled = !state.messageActionsBusy,
                     modifier = Modifier
                         .size(48.dp)
                         .testTag("new_chat")
@@ -302,20 +346,40 @@ fun ChatScreen(
                     )
                 } else if (message.id == activeId) {
                     if (state.visibleThinking) ThinkingIndicator() else state.visibleStreamingText?.let { liveText ->
-                    MessageRow(
-                        message = message.copy(content = liveText, status = "STREAMING"),
-                        loadAttachmentPreview = loadAttachmentPreview,
-                        modifier = Modifier.testTag("active_assistant_response"),
+                     MessageRow(
+                         message = message.copy(content = liveText, status = "STREAMING"),
+                         loadAttachmentPreview = loadAttachmentPreview,
+                         selectionOwner = selectionOwner,
+                         modifier = Modifier.testTag("active_assistant_response"),
                     )
                     }
                 } else {
+                    val actionAvailability = messageActionAvailability(state, message)
                     MessageRow(
-                        message = message,
-                        loadAttachmentPreview = loadAttachmentPreview,
-                        modifier = Modifier.testTag("message_${message.id}"),
-                        actionsEnabled = !state.sending && !state.importingAttachments,
-                        onRetry = { onRetryMessage(message.id) },
+                         message = message,
+                         loadAttachmentPreview = loadAttachmentPreview,
+                         selectionOwner = selectionOwner,
+                         modifier = Modifier.testTag("message_${message.id}"),
+                        actionsEnabled = actionAvailability.menuEnabled,
+                        editorEnabled = !state.messageActionsBusy,
+                        editEnabled = actionAvailability.editEnabled,
+                        retryEnabled = actionAvailability.retryEnabled,
+                        failedActionsEnabled = actionAvailability.failedActionsEnabled,
+                        branchActionsEnabled = actionAvailability.branchEnabled,
+                        messageEdit = state.messageEdit,
+                        onEditChange = onMessageEditChange,
+                        onStartEdit = { onStartMessageEdit(message.id) },
+                        onSubmitEdit = onSubmitMessageEdit,
+                        onCancelEdit = onCancelMessageEdit,
+                        onRetry = {
+                            if (message.status == MessageState.FAILED_ZDR) {
+                                onRetryMessage(message.id)
+                            } else {
+                                onRetryAssistant(message.id)
+                            }
+                        },
                         onDelete = { onDeleteFailedMessage(message.id) },
+                        onSelectAlternative = onSelectAlternative,
                     )
                 }
             }
@@ -337,7 +401,12 @@ fun ChatScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 state.attachmentError?.let { failure ->
-                    item(key = "attachment_error") { AttachmentErrorBox(failure, onDismissAttachmentError) }
+                    item(key = "attachment_error") {
+                        AttachmentErrorBox(failure) {
+                            selectionOwner.clear()
+                            onDismissAttachmentError()
+                        }
+                    }
                 }
                 state.errorMessage?.let { errorMessage ->
                     val typedMessage = state.attachmentError?.let { attachmentErrorCopy(it).primary }
@@ -348,14 +417,17 @@ fun ChatScreen(
                 items(state.pendingAttachments, key = ImageAttachment::id) { image ->
                     PendingAttachmentRow(
                         image = image,
-                        enabled = !state.sending && !state.importingAttachments,
-                        onRemove = onRemoveAttachment,
+                        enabled = !state.messageActionsBusy && state.messageEdit == null,
+                        onRemove = {
+                            selectionOwner.clear()
+                            onRemoveAttachment(it)
+                        },
                         loadAttachmentPreview = loadAttachmentPreview,
                     )
                 }
             }
         }
-        val composerEnabled = !state.sending && !state.importingAttachments
+        val composerEnabled = !state.messageActionsBusy && state.messageEdit == null
         val composerShape = MaterialTheme.shapes.extraSmall
         val composerOutline = if (composerEnabled) MaterialTheme.colorScheme.outline
             else MaterialTheme.colorScheme.outlineVariant
@@ -369,7 +441,10 @@ fun ChatScreen(
         ) {
             BasicTextField(
                 value = state.draftText,
-                onValueChange = onDraftChange,
+                onValueChange = {
+                    selectionOwner.clear()
+                    onDraftChange(it)
+                },
                 modifier = Modifier.fillMaxWidth().testTag("message_composer"),
                 enabled = composerEnabled,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(
@@ -401,7 +476,10 @@ fun ChatScreen(
                 ComposerModelName(state.selectedModel.displayName, Modifier.weight(1f))
                 ContextUsageIndicator(state.contextUsage)
                 IconButton(
-                    onClick = onAttach,
+                    onClick = {
+                        selectionOwner.clear()
+                        onAttach()
+                    },
                     enabled = composerEnabled,
                     modifier = Modifier
                         .size(48.dp)
@@ -415,7 +493,10 @@ fun ChatScreen(
                 }
                 if (state.sending) {
                     IconButton(
-                        onClick = onCancel,
+                        onClick = {
+                            selectionOwner.clear()
+                            onCancel()
+                        },
                         modifier = Modifier
                             .size(48.dp)
                             .testTag("cancel_send")
@@ -428,7 +509,10 @@ fun ChatScreen(
                     }
                 } else {
                     IconButton(
-                        onClick = { onSend(state.draftText) },
+                        onClick = {
+                            selectionOwner.clear()
+                            onSend(state.draftText)
+                        },
                         enabled = sendButtonEnabled(state),
                         modifier = Modifier
                             .size(48.dp)
@@ -480,132 +564,3 @@ private fun ThinkingIndicator() {
         Text("Thinking", modifier = Modifier.padding(start = 8.dp))
     }
 }
-
-@Composable
-private fun MessageRow(
-    message: Message,
-    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
-    modifier: Modifier = Modifier,
-    actionsEnabled: Boolean = false,
-    onRetry: () -> Unit = {},
-    onDelete: () -> Unit = {},
-) {
-    val isUser = messageSide(message.role) == MessageSide.END
-    val failed = isUser && message.status == MessageState.FAILED_ZDR
-    var actionsOpen by remember(message.id, failed, actionsEnabled) { mutableStateOf(false) }
-    val colours = MaterialTheme.colorScheme
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
-    ) {
-        Surface(
-            color = messageContainerColour(message.role, colours),
-            contentColor = messageContentColour(message.role, colours),
-            tonalElevation = if (isUser) 1.dp else 3.dp,
-            modifier = modifier
-                .fillMaxWidth(if (failed) 0.8f else 0.86f)
-                .then(if (failed) Modifier.combinedClickable(
-                    enabled = actionsEnabled,
-                    onClick = {},
-                    onLongClickLabel = "Message actions",
-                    onLongClick = { actionsOpen = true },
-                ) else Modifier)
-                .semantics { contentDescription = if (isUser) "User message" else "Assistant message" },
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (message.content.isNotEmpty()) Text(message.content)
-                message.attachments.forEach { image ->
-                    SavedAttachmentRow(image, loadAttachmentPreview)
-                }
-            }
-        }
-        if (failed) {
-            Box {
-                IconButton(
-                    onClick = { actionsOpen = true }, enabled = actionsEnabled,
-                    modifier = Modifier.testTag("failed_message_${message.id}"),
-                ) {
-                    Icon(painterResource(R.drawable.ic_message_failed),
-                        "Message not sent. No ZDR-capable provider is available. Message actions",
-                        tint = Color(0xFFEF4444))
-                }
-                DropdownMenu(expanded = actionsOpen, onDismissRequest = { actionsOpen = false }) {
-                    DropdownMenuItem(text = { Text("Retry") }, onClick = { actionsOpen = false; onRetry() })
-                    DropdownMenuItem(text = { Text("Delete") }, onClick = { actionsOpen = false; onDelete() })
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun PendingAttachmentRow(
-    image: ImageAttachment,
-    enabled: Boolean,
-    onRemove: (String) -> Unit,
-    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("pending_attachment_${image.id}"),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        AttachmentPreview(
-            image = image,
-            maxEdge = THUMBNAIL_MAX_EDGE,
-            load = loadAttachmentPreview,
-            modifier = Modifier.size(56.dp),
-        )
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = safeAttachmentDisplayName(image.displayName),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(formatStorageBytes(image.originalBytes), style = MaterialTheme.typography.labelSmall)
-        }
-        OutlinedButton(
-            onClick = { onRemove(image.id) },
-            enabled = enabled,
-            modifier = Modifier
-                .testTag("remove_attachment_${image.id}")
-                .semantics { contentDescription = "Remove ${safeAttachmentDisplayName(image.displayName)}" },
-        ) { Text("Remove") }
-    }
-}
-
-@Composable
-private fun SavedAttachmentRow(
-    image: ImageAttachment,
-    loadAttachmentPreview: suspend (String, Int) -> Bitmap,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("message_attachment_${image.id}"),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        AttachmentPreview(
-            image = image,
-            maxEdge = THUMBNAIL_MAX_EDGE,
-            load = loadAttachmentPreview,
-            modifier = Modifier.size(56.dp),
-        )
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = safeAttachmentDisplayName(image.displayName),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(formatStorageBytes(image.originalBytes), style = MaterialTheme.typography.labelSmall)
-        }
-    }
-}
-
-private const val THUMBNAIL_MAX_EDGE = 256
