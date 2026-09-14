@@ -29,7 +29,6 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -271,7 +270,7 @@ fun ChatScreen(
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box {
-                    OutlinedIconButton(
+                    IconButton(
                         onClick = {
                             selectionOwner.clear()
                             menuOpen = true
@@ -310,7 +309,7 @@ fun ChatScreen(
                         }
                     }
                 }
-                OutlinedIconButton(
+                IconButton(
                     onClick = {
                         selectionOwner.clear()
                         onNewChat()
