@@ -109,51 +109,53 @@ fun SettingsScreen(
                     .semantics { contentDescription = "Zero data retention (ZDR)" },
             )
         }
-        Column {
-            Text("System prompt")
-            OutlinedTextField(
-                value = promptDraft,
-                onValueChange = { promptDraft = it },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 120.dp)
-                    .testTag("system_prompt_field"),
-                label = { Text("System instructions") },
-                enabled = !state.systemPromptSaving,
-                minLines = 5,
-                maxLines = 12,
-            )
-            state.systemPromptFeedback?.let { feedback ->
-                Text(
-                    systemPromptFeedbackText(feedback),
-                    color = if (feedback == SystemPromptFeedback.SAVED ||
-                        feedback == SystemPromptFeedback.CLEARED
-                    ) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.error
-                    },
+        if (state.keyConfigured) {
+            Column {
+                Text("System prompt")
+                OutlinedTextField(
+                    value = promptDraft,
+                    onValueChange = { promptDraft = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 120.dp)
+                        .testTag("system_prompt_field"),
+                    label = { Text("System instructions") },
+                    enabled = !state.systemPromptSaving,
+                    minLines = 5,
+                    maxLines = 12,
                 )
-            }
-            Row(
-                modifier = Modifier
-                    .padding(top = SYSTEM_PROMPT_ACTION_ROW_TOP_PADDING),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Button(
-                    onClick = { onSaveSystemPrompt(promptDraft) },
-                    enabled = !state.systemPromptSaving && !state.loading,
+                state.systemPromptFeedback?.let { feedback ->
+                    Text(
+                        systemPromptFeedbackText(feedback),
+                        color = if (feedback == SystemPromptFeedback.SAVED ||
+                            feedback == SystemPromptFeedback.CLEARED
+                        ) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                    )
+                }
+                Row(
                     modifier = Modifier
-                        .weight(1f)
-                        .testTag("save_system_prompt"),
-                ) { Text("Save") }
-                OutlinedButton(
-                    onClick = onClearSystemPrompt,
-                    enabled = !state.systemPromptSaving && !state.loading,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("clear_system_prompt"),
-                ) { Text("Clear") }
+                        .padding(top = SYSTEM_PROMPT_ACTION_ROW_TOP_PADDING),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = { onSaveSystemPrompt(promptDraft) },
+                        enabled = !state.systemPromptSaving && !state.loading,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("save_system_prompt"),
+                    ) { Text("Save") }
+                    OutlinedButton(
+                        onClick = onClearSystemPrompt,
+                        enabled = !state.systemPromptSaving && !state.loading,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("clear_system_prompt"),
+                    ) { Text("Clear") }
+                }
             }
         }
         // The load-failure reason is already shown as feedback under the System
