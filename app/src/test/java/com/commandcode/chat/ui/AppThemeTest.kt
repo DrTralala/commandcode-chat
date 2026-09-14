@@ -9,6 +9,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 @RunWith(RobolectricTestRunner::class)
@@ -40,5 +41,28 @@ class AppThemeTest {
     fun zdrStatusUsesGreenForOnAndRedForOff() {
         assertEquals(Color(0xFF71D6AE), zdrStatusColour(true))
         assertEquals(Color(0xFFFF6B6B), zdrStatusColour(false))
+    }
+
+    @Test
+    fun appTypographyUsesTheBundledNunitoFamilyForEveryMaterialStyle() {
+        val styles = listOf(
+            AppTypography.displayLarge,
+            AppTypography.displayMedium,
+            AppTypography.displaySmall,
+            AppTypography.headlineLarge,
+            AppTypography.headlineMedium,
+            AppTypography.headlineSmall,
+            AppTypography.titleLarge,
+            AppTypography.titleMedium,
+            AppTypography.titleSmall,
+            AppTypography.bodyLarge,
+            AppTypography.bodyMedium,
+            AppTypography.bodySmall,
+            AppTypography.labelLarge,
+            AppTypography.labelMedium,
+            AppTypography.labelSmall,
+        )
+
+        assertTrue(styles.all { it.fontFamily == NunitoFontFamily })
     }
 }

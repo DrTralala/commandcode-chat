@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -29,6 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -111,18 +113,22 @@ fun AppRoot(viewModel: AppViewModel?, startupRecovery: Boolean = false) {
             isAppearanceLightNavigationBars = false
         }
     }
-    MaterialTheme(colorScheme = colours) {
-        Surface(modifier = Modifier.fillMaxSize()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))
-                    .testTag("app_inset_content"),
-            ) {
-                when {
-                    startupRecovery -> RecoveryScreen("Encrypted local data cannot be opened on this device.")
-                    viewModel == null -> RecoveryScreen("Application security could not be initialised.")
-                    else -> AppContent(viewModel)
+    MaterialTheme(colorScheme = colours, typography = AppTypography) {
+        CompositionLocalProvider(
+            LocalTextStyle provides LocalTextStyle.current.copy(fontFamily = NunitoFontFamily),
+        ) {
+            Surface(modifier = Modifier.fillMaxSize()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))
+                        .testTag("app_inset_content"),
+                ) {
+                    when {
+                        startupRecovery -> RecoveryScreen("Encrypted local data cannot be opened on this device.")
+                        viewModel == null -> RecoveryScreen("Application security could not be initialised.")
+                        else -> AppContent(viewModel)
+                    }
                 }
             }
         }
