@@ -3,6 +3,8 @@ package com.commandcode.chat.ui.chat
 import android.graphics.Bitmap
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,6 +37,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChangedIgnoreConsumed
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -96,6 +102,45 @@ internal class MessageSelectionOwner {
 
     fun clear(key: MessageSelectionKey? = null) {
         if (key == null || activeKey == key) activeKey = null
+    }
+}
+
+internal fun Modifier.dismissSelectionOnTapAway(
+    enabled: Boolean,
+    onDismiss: () -> Unit,
+): Modifier = if (!enabled) {
+    this
+} else {
+    pointerInput(enabled, onDismiss) {
+        awaitEachGesture {
+            val down = awaitFirstDown(
+                requireUnconsumed = false,
+                pass = PointerEventPass.Final,
+            )
+            var moved = false
+            var consumed = down.isConsumed
+            var multiPointer = false
+
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Final)
+                if (event.changes.any { it.id != down.id }) {
+                    multiPointer = true
+                }
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                consumed = consumed || change.isConsumed
+                if (change.positionChangedIgnoreConsumed() &&
+                    (change.position - down.position).getDistance() > viewConfiguration.touchSlop
+                ) {
+                    moved = true
+                }
+                if (change.changedToUpIgnoreConsumed()) {
+                    if (!moved && !consumed && !multiPointer) {
+                        onDismiss()
+                    }
+                    break
+                }
+            }
+        }
     }
 }
 
@@ -193,7 +238,7 @@ internal fun MessageRow(
                             if (isConversationalMessage(message) && actionsEnabled && !selectingText) {
                                 Modifier.combinedClickable(
                                     enabled = true,
-                                    onClick = {},
+                                    onClick = { selectionOwner.clear() },
                                     onLongClickLabel = "Message actions",
                                         onLongClick = {
                                             selectionOwner.clear()

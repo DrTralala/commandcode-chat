@@ -329,7 +329,15 @@ fun ChatScreen(
             }
         }
         LazyColumn(
-            modifier = Modifier.weight(1f).fillMaxWidth().testTag("chat_messages").nestedScroll(responseScroll),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .testTag("chat_messages")
+                .nestedScroll(responseScroll)
+                .dismissSelectionOnTapAway(
+                    enabled = selectionOwner.activeKey != null,
+                    onDismiss = { selectionOwner.clear() },
+                ),
             state = messages,
             reverseLayout = true,
             verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Top),
