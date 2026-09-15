@@ -78,6 +78,27 @@ class SelectionDismissalTest {
     }
 
     @Test
+    fun unconsumedBackgroundLongPressDoesNotInvokeTapAwayDismissal() {
+        var dismissals = 0
+        compose.setContent {
+            Box(
+                modifier = Modifier
+                    .size(240.dp)
+                    .testTag("dismissal_host")
+                    .dismissSelectionOnTapAway(true) { dismissals += 1 },
+            )
+        }
+
+        compose.onNodeWithTag("dismissal_host").performTouchInput {
+            down(Offset(16f, 16f))
+            advanceEventTime(viewConfiguration.longPressTimeoutMillis + 1L)
+            up()
+        }
+
+        compose.runOnIdle { assertEquals(0, dismissals) }
+    }
+
+    @Test
     fun blankBackgroundTapClearsSelectedMessageText() {
         compose.setContent {
             MaterialTheme {

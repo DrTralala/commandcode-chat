@@ -120,6 +120,7 @@ internal fun Modifier.dismissSelectionOnTapAway(
             var moved = false
             var consumed = down.isConsumed
             var multiPointer = false
+            var longPress = false
 
             while (true) {
                 val event = awaitPointerEvent(PointerEventPass.Final)
@@ -128,13 +129,16 @@ internal fun Modifier.dismissSelectionOnTapAway(
                 }
                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
                 consumed = consumed || change.isConsumed
+                if (change.uptimeMillis - down.uptimeMillis >= viewConfiguration.longPressTimeoutMillis) {
+                    longPress = true
+                }
                 if (change.positionChangedIgnoreConsumed() &&
                     (change.position - down.position).getDistance() > viewConfiguration.touchSlop
                 ) {
                     moved = true
                 }
                 if (change.changedToUpIgnoreConsumed()) {
-                    if (!moved && !consumed && !multiPointer) {
+                    if (!moved && !consumed && !multiPointer && !longPress) {
                         onDismiss()
                     }
                     break
