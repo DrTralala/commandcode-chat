@@ -3,7 +3,7 @@
 # Command Code Chat
 
 [![CI](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml/badge.svg)](https://github.com/DrTralala/commandcode-chat/actions/workflows/validate.yml)
-[![Version](https://img.shields.io/badge/version-v3.0.0-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v3.0.0)
+[![Version](https://img.shields.io/badge/version-v3.0.1-blue)](https://github.com/DrTralala/commandcode-chat/releases/tag/v3.0.1)
 [![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Android](https://img.shields.io/badge/Android-11%2B-3DDC84?logo=android&logoColor=white)
 
