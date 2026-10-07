@@ -13,7 +13,7 @@ An Android chat client for Command Code with a bundled GOAT model catalogue and 
 
 </div>
 
-## Requirements
+## Prerequisites
 
 - Android 11 or newer (API 30+)
 - A Command Code API key
@@ -21,37 +21,30 @@ An Android chat client for Command Code with a bundled GOAT model catalogue and 
 
 ## Quick start
 
-1. Download `CommandCodeChat.apk` from the link above.
-2. Allow installation from your browser or file manager when Android prompts.
-3. Open the app, go to **Settings**, and save your Command Code API key.
-4. Select a model and start a chat.
+The downloadable APK is a **debug-signed** convenience build, not a production-signed Play Store build, and it does not provide production release-key identity guarantees. Its signing key may differ between releases, so Android may require the previous build to be uninstalled before an update; uninstalling removes local app data. Review the source and build it yourself when that assurance matters.
 
-The downloadable APK is **debug-signed**, not a production-signed Play Store build. Its signing key may differ between releases, so Android may require the previous build to be uninstalled before an update; uninstalling removes local app data.
+1. Download `CommandCodeChat.apk` from the link above.
+2. Install it, allowing installation from your browser or file manager if Android prompts.
+3. Open the app. If no API key is saved, it opens **Settings**.
+4. Enter your Command Code API key and tap **Encrypt and save key**.
+5. In **Chat**, choose a model, enter a message, and send it.
+
+A streamed assistant reply confirms that the chat request succeeded.
 
 ## Features
 
-- Streams chat responses directly from Command Code.
-- Shows an animated Thinking indicator while waiting for response text, with automatic scrolling that pauses when you scroll back.
-- Bundles a pinned, validated GOAT model catalogue in the APK.
-- Shows plan-aware credit usage, including rolling windows when the account provides them, with safe stale-data fallback.
-- Stores conversations and usage history in an encrypted local database.
-- Shows estimated context-window usage as a right-aligned percentage before the composer's attachment and send controls.
-- Enables zero data retention (ZDR) by default and can fail rather than use a non-ZDR provider.
-- Marks ZDR-routing failures with a red exclamation; long-press or tap it to Retry with current model/ZDR settings or Delete the failed message.
-- Persists local model-change notices without sending them to the provider.
-- Requests the highest supported refresh rate at the current resolution; Android and device policies still control the delivered rate.
-- Uses AMOLED dark mode exclusively, with true-black backgrounds and surfaces, including startup and system bars. Existing theme preferences are ignored automatically.
-- Uses distinct, aligned message bubbles for user and assistant messages.
-- Long-presses past user messages to edit, copy, or select text, and assistant messages to copy, retry, or select text.
-- Keeps edits and retried responses as persistent alternatives within the same chat, with nested branch navigation using `<` and `>` controls.
-- Regenerates historical responses from their selected conversation point while applying the current model, system prompt, and ZDR setting; settings-change notices remain local to the new branch.
-- Supports native in-bubble substring selection and copying without opening a separate text window.
-- Keeps chat, history, budget, and security settings in one native Jetpack Compose app.
+- **Streaming chat:** Responses stream directly from Command Code, with an animated Thinking indicator and automatic scrolling that pauses when you scroll back.
+- **Persistent conversation branches:** Edits and retries keep alternatives and nested continuations in the same chat instead of replacing earlier work. See [message editing and response branches](#message-editing-and-response-branches).
+- **Model and usage information:** Model selection uses the bundled GOAT catalogue; the Budget view shows plan-aware credit usage, while the Chat composer shows estimated context-window usage. See [context-window usage](#context-window-usage).
+- **Image attachments:** Supported image types are available for models with documented support, and app-owned copies are encrypted on this device. See [image attachments](#image-attachments).
+- **Privacy controls:** The API key, chat history, and usage data are encrypted locally. ZDR is enabled by default; the app can fail rather than route to a non-ZDR provider, and ZDR-routing failures can be retried or deleted.
+- **Native Android interface:** Chat, history, budget, and settings use Jetpack Compose and an AMOLED dark theme with true-black surfaces; existing theme preferences are ignored. Messages use distinct, aligned bubbles: long-press user messages to edit, copy, or select text, and assistant messages to copy, retry, or select text. Selection and copying work inside bubbles. Model-change notices stay local, and the app requests the highest refresh rate supported at the current resolution (Android and device policies control the delivered rate).
 
 ### Message editing and response branches
 
 - Editing a past user message creates a new user-message alternative and generates a fresh response. The original message and its continuation remain available.
 - Retrying an assistant message regenerates only that historical response point. It does not copy the old continuation into the new branch.
+- Regenerating a historical response applies the current model, system prompt, and ZDR setting; model-change notices remain local to the new branch.
 - Branch selectors show the selected alternative and total count, such as `2/4`; selections and nested continuations persist when the chat is reopened.
 - Editing is inline and retains the original message's image attachments. Navigating away prompts before discarding the memory-only edit draft.
 - Conversation usage totals include every attempt, while the context percentage follows the currently selected branch.
@@ -89,6 +82,8 @@ The app reads credits and optional subscription metadata directly from Command C
 
 The optional Ktor `:server` module is a reference implementation for catalogue and quota routes. It is not part of the Android chat, quota, or model-selection request path and never receives Android chat prompts or responses.
 
+The reference server exposes `GET /v1/goat/models` for its bundled catalogue and `GET /v1/goat/quota`, which requires a Command Code bearer API key.
+
 ## Privacy and security
 
 - The API key is encrypted at rest using an Android Keystore-backed key.
@@ -97,9 +92,8 @@ The optional Ktor `:server` module is a reference implementation for catalogue a
 - Android backup and device-transfer rules exclude app files, databases, and preferences.
 - Cleartext traffic is disabled.
 - ZDR adds the Command Code ZDR request header; upstream providers and Command Code still process request content according to their own policies.
+- A failed ZDR route is marked with a red exclamation; tap or long-press it to retry with the current model/ZDR settings or delete the failed message.
 - Credits and subscription metadata use alpha upstream APIs and may change. Invalid credit responses are rejected rather than trusted; unavailable plan metadata falls back to generic usage wording.
-
-The downloadable APK is a convenience debug build. Debug signing does not provide the release-key identity guarantees of a production-signed distribution. Review the source and build it yourself when that assurance matters.
 
 ## Build from source
 
