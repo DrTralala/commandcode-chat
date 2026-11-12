@@ -9,6 +9,7 @@ import com.commandcode.chat.SettingsStore
 import com.commandcode.chat.StreamSource
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeException
+import com.commandcode.chat.data.commandcode.CompletionNotice
 import com.commandcode.chat.data.commandcode.StreamEvent
 import com.commandcode.chat.data.attachments.AttachmentOperations
 import com.commandcode.chat.data.attachments.PreparedAttachmentTurn
@@ -20,6 +21,7 @@ import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
 import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.security.effectiveSystemPrompt
+import com.commandcode.chat.data.service.CatalogueOrigin
 import com.commandcode.chat.data.service.ModelCatalogueSnapshot
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.QuotaSnapshot
@@ -248,6 +250,132 @@ class AppViewModelTest {
     }
 
     @Test
+    fun completionNoticeIsShownOnlyAfterSuccessfulTurnCommit() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            completionEntered = CompletableDeferred()
+            completionRelease = CompletableDeferred()
+        }
+        val usage = TokenUsage(10, 0, 5)
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(
+            StreamEvent.Delta("answer"),
+            StreamEvent.Usage(usage),
+            StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT),
+            StreamEvent.Done,
+        ) })
+        configureKey(viewModel)
+
+        viewModel.send("hello")
+        runCurrent()
+        chats.completionEntered!!.await()
+
+        assertTrue(viewModel.state.value.sending)
+        assertNull(viewModel.state.value.errorMessage)
+
+        chats.completionRelease!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("answer", chats.completedText)
+        assertEquals(usage, chats.completedUsage)
+        assertEquals("Response reached the output limit.", viewModel.state.value.errorMessage)
+        assertFalse(viewModel.state.value.sending)
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
+    fun eachCompletionNoticeMapsToSanitisedFeedbackAfterDone() = runTest(dispatcher) {
+        val cases = listOf(
+            CompletionNotice.OUTPUT_LIMIT to "Response reached the output limit.",
+            CompletionNotice.CONTEXT_LIMIT to "Response reached the model context limit.",
+            CompletionNotice.REFUSAL to "The model declined this request.",
+        )
+
+        cases.forEach { (notice, feedback) ->
+            val chats = FakeChats()
+            val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(
+                StreamEvent.Delta("saved answer"),
+                StreamEvent.Notice(notice),
+                StreamEvent.Done,
+            ) })
+            configureKey(viewModel)
+
+            viewModel.send("hello")
+            advanceUntilIdle()
+
+            assertEquals(feedback, viewModel.state.value.errorMessage)
+            assertEquals("saved answer", chats.completedText)
+            assertNull(chats.interruptedText)
+            assertTrue(chats.usageCompleteByRequest.values.single())
+            viewModel.viewModelScope.cancel()
+        }
+    }
+
+    @Test
+    fun rejectedTurnCommitDoesNotPublishItsCompletionNotice() = runTest(dispatcher) {
+        val chats = FakeChats().apply { completionAccepted = false }
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(
+            StreamEvent.Delta("answer"),
+            StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT),
+            StreamEvent.Done,
+        ) })
+        configureKey(viewModel)
+
+        viewModel.send("hello")
+        advanceUntilIdle()
+
+        assertNull(chats.completedText)
+        assertEquals("answer", chats.interruptedText)
+        assertFalse(chats.usageCompleteByRequest.values.single())
+        assertEquals("Response could not be finalised. Partial response saved. Try again.", viewModel.state.value.errorMessage)
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
+    fun noticeBeforeCancellationErrorOrEofNeverCompletesUsageOrAppearsAsFeedback() = runTest(dispatcher) {
+        val usage = TokenUsage(8, 2, 3)
+        val sources = listOf(
+            "cancel" to StreamSource { _, _, _, _ -> flow {
+                emit(StreamEvent.Delta("partial"))
+                emit(StreamEvent.Usage(usage))
+                emit(StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT))
+                awaitCancellation()
+            } },
+            "error" to StreamSource { _, _, _, _ -> flowOf(
+                StreamEvent.Delta("partial"),
+                StreamEvent.Usage(usage),
+                StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT),
+                StreamEvent.Error("provider", "private detail"),
+            ) },
+            "eof" to StreamSource { _, _, _, _ -> flowOf(
+                StreamEvent.Delta("partial"),
+                StreamEvent.Usage(usage),
+                StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT),
+            ) },
+        )
+
+        sources.forEach { (outcome, source) ->
+            val chats = FakeChats()
+            val viewModel = viewModel(chats, source)
+            configureKey(viewModel)
+            viewModel.send("hello")
+            runCurrent()
+
+            if (outcome == "cancel") {
+                assertTrue(viewModel.state.value.sending)
+                assertNull(viewModel.state.value.errorMessage)
+                viewModel.cancel()
+            }
+            advanceUntilIdle()
+
+            assertNull("$outcome must not complete", chats.completedText)
+            assertEquals("partial", chats.interruptedText)
+            assertEquals(usage, chats.interruptedUsage)
+            assertFalse(chats.usageCompleteByRequest.values.single())
+            assertTrue(viewModel.state.value.errorMessage != "Response reached the output limit.")
+            viewModel.viewModelScope.cancel()
+        }
+    }
+
+    @Test
     fun eofWithoutDoneInterruptsPartial() = runTest(dispatcher) {
         val chats = FakeChats()
         val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(
@@ -268,6 +396,7 @@ class AppViewModelTest {
         val chats = FakeChats()
         val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(
             StreamEvent.Delta("kept"), StreamEvent.Done,
+            StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT),
             StreamEvent.Error("ignored-code", "ignored detail"),
             StreamEvent.Usage(TokenUsage(1, 0, 1)), StreamEvent.Delta("ignored"),
         ) })
@@ -279,6 +408,7 @@ class AppViewModelTest {
         assertEquals("kept", chats.completedText)
         assertNull(chats.completedUsage)
         assertNull(chats.interruptedText)
+        assertNull(viewModel.state.value.errorMessage)
     }
 
     @Test
@@ -679,6 +809,27 @@ class AppViewModelTest {
         assertEquals(catalogue.local.models, viewModel.state.value.models)
         assertEquals(1, catalogue.refreshCalls)
         assertNull(viewModel.state.value.errorMessage)
+        assertNull(viewModel.state.value.modelsError)
+    }
+
+    @Test
+    fun localCatalogueWithoutSolUsesItsFirstModelAsTheInitialSelection() = runTest(dispatcher) {
+        val first = model("first-local")
+        val second = model("second-local")
+        val local = catalogueSnapshot(
+            version = "cached",
+            models = listOf(first, second),
+            origin = CatalogueOrigin.CACHED,
+        )
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
+
+        advanceUntilIdle()
+
+        assertEquals(listOf(first, second), viewModel.state.value.models)
+        assertEquals(first, viewModel.state.value.selectedModel)
+        assertTrue(viewModel.state.value.selectedModelAvailable)
+        assertEquals(CatalogueOrigin.CACHED, viewModel.state.value.modelCatalogueOrigin)
     }
 
     @Test
@@ -686,19 +837,22 @@ class AppViewModelTest {
         val remote = listOf(ChatModel.SOL, model("remote"))
         val catalogue = FakeCatalogue(
             local = catalogueSnapshot(models = listOf(ChatModel.SOL, model("local"))),
-            remote = catalogueSnapshot(version = "remote", models = remote),
+            remote = catalogueSnapshot(version = "remote", models = remote, origin = CatalogueOrigin.LIVE),
         )
 
         val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
         advanceUntilIdle()
 
         assertEquals(remote, viewModel.state.value.models)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
     }
 
     @Test
     fun remoteCatalogueFailureRetainsLocalModels() = runTest(dispatcher) {
         val local = listOf(ChatModel.SOL, model("local"))
-        val catalogue = FakeCatalogue(local = catalogueSnapshot(models = local)).apply {
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = local, origin = CatalogueOrigin.CACHED),
+        ).apply {
             refreshFailure = IllegalStateException("secret catalogue detail")
         }
 
@@ -707,6 +861,9 @@ class AppViewModelTest {
 
         assertEquals(local, viewModel.state.value.models)
         assertNull(viewModel.state.value.errorMessage)
+        assertEquals("Models could not be refreshed. Try again.", viewModel.state.value.modelsError)
+        assertFalse(viewModel.state.value.modelsError!!.contains("secret catalogue detail"))
+        assertEquals(CatalogueOrigin.CACHED, viewModel.state.value.modelCatalogueOrigin)
     }
 
     @Test
@@ -737,7 +894,7 @@ class AppViewModelTest {
     }
 
     @Test
-    fun removedSelectedModelFallsBackToSol() = runTest(dispatcher) {
+    fun removedSelectedModelRetainsItsIdentityAndBecomesUnavailable() = runTest(dispatcher) {
         val removed = model("removed")
         val remoteRelease = CompletableDeferred<ModelCatalogueSnapshot>()
         val catalogue = FakeCatalogue(
@@ -747,10 +904,15 @@ class AppViewModelTest {
         runCurrent()
         viewModel.selectModel(removed)
 
-        remoteRelease.complete(catalogueSnapshot(version = "remote", models = listOf(ChatModel.SOL)))
+        remoteRelease.complete(catalogueSnapshot(
+            version = "remote", models = listOf(ChatModel.SOL), origin = CatalogueOrigin.LIVE,
+        ))
         advanceUntilIdle()
 
-        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertEquals(removed, viewModel.state.value.selectedModel)
+        assertFalse(viewModel.state.value.selectedModelAvailable)
+        assertEquals(listOf(ChatModel.SOL), viewModel.state.value.models)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
     }
 
     @Test
@@ -765,25 +927,479 @@ class AppViewModelTest {
         runCurrent()
         viewModel.selectModel(selected)
 
-        remoteRelease.complete(catalogueSnapshot(version = "remote", models = listOf(ChatModel.SOL, refreshed)))
+        remoteRelease.complete(catalogueSnapshot(
+            version = "remote", models = listOf(ChatModel.SOL, refreshed), origin = CatalogueOrigin.LIVE,
+        ))
         advanceUntilIdle()
 
         assertEquals(refreshed, viewModel.state.value.selectedModel)
+        assertTrue(viewModel.state.value.selectedModelAvailable)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
     }
 
     @Test
-    fun solLessRemoteCatalogueCannotPublishASelectionOutsideTheActiveModels() = runTest(dispatcher) {
+    fun solLessRemoteCatalogueIsPublishedWithoutChangingTheSelectedId() = runTest(dispatcher) {
         val local = listOf(ChatModel.SOL, model("local"))
+        val remote = listOf(model("remote"))
         val catalogue = FakeCatalogue(
             local = catalogueSnapshot(models = local),
-            remote = catalogueSnapshot(version = "invalid", models = listOf(model("remote"))),
+            remote = catalogueSnapshot(version = "remote", models = remote, origin = CatalogueOrigin.LIVE),
         )
 
         val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
         advanceUntilIdle()
 
-        assertEquals(local, viewModel.state.value.models)
-        assertTrue(viewModel.state.value.selectedModel in viewModel.state.value.models)
+        assertEquals(remote, viewModel.state.value.models)
+        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertFalse(viewModel.state.value.selectedModelAvailable)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun duplicateModelRefreshRequestsShareOneInFlightFetch() = runTest(dispatcher) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<ModelCatalogueSnapshot>()
+        val catalogue = FakeCatalogue().apply {
+            refreshBlock = {
+                entered.complete(Unit)
+                release.await()
+            }
+        }
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
+
+        runCurrent()
+        entered.await()
+        assertTrue(viewModel.state.value.modelsRefreshing)
+
+        viewModel.refreshModels()
+        viewModel.refreshModels()
+        runCurrent()
+        assertEquals(1, catalogue.refreshCalls)
+
+        release.complete(catalogueSnapshot(
+            version = "live", models = catalogue.local.models, origin = CatalogueOrigin.LIVE,
+        ))
+        advanceUntilIdle()
+
+        assertFalse(viewModel.state.value.modelsRefreshing)
+        assertNull(viewModel.state.value.modelsError)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun activeSendKeepsItsCapturedModelAndProtocolUntilTheQueuedSnapshotPublishes() = runTest(dispatcher) {
+        val original = ChatModel("selected", "Original", ApiFamily.OPENAI_CHAT)
+        val refreshed = ChatModel("selected", "Refreshed", ApiFamily.ANTHROPIC_MESSAGES)
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, original))
+        val remote = catalogueSnapshot(version = "live", models = listOf(ChatModel.SOL, refreshed), origin = CatalogueOrigin.LIVE)
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val requests = mutableListOf<ChatModel>()
+        val viewModel = viewModel(FakeChats(), StreamSource { _, model, _, _ ->
+            requests += model
+            flow {
+                emit(StreamEvent.Delta("partial"))
+                awaitCancellation()
+            }
+        }, catalogue = catalogue)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        catalogue.remote = remote
+        viewModel.selectModel(original)
+        viewModel.send("in flight")
+        runCurrent()
+        assertTrue(viewModel.state.value.sending)
+
+        viewModel.refreshModels()
+        runCurrent()
+
+        assertEquals(listOf(original), requests)
+        assertEquals(local.models, viewModel.state.value.models)
+        assertEquals(original, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.BUNDLED, viewModel.state.value.modelCatalogueOrigin)
+
+        viewModel.cancel()
+        advanceUntilIdle()
+
+        assertEquals(remote.models, viewModel.state.value.models)
+        assertEquals(refreshed, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun activeRetryFreezesCatalogueMetadataUntilTheRetrySettles() = runTest(dispatcher) {
+        val original = ChatModel("selected", "Original", ApiFamily.OPENAI_CHAT)
+        val refreshed = ChatModel("selected", "Refreshed", ApiFamily.ANTHROPIC_MESSAGES)
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, original))
+        val remote = catalogueSnapshot(version = "live", models = listOf(ChatModel.SOL, refreshed), origin = CatalogueOrigin.LIVE)
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val requests = mutableListOf<ChatModel>()
+        val viewModel = viewModel(FakeChats(), StreamSource { _, model, _, _ ->
+            requests += model
+            if (requests.size == 1) successfulEvents("first answer") else flow {
+                emit(StreamEvent.Delta("retry partial"))
+                awaitCancellation()
+            }
+        }, catalogue = catalogue)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        catalogue.remote = remote
+        viewModel.selectModel(original)
+        viewModel.send("first turn")
+        advanceUntilIdle()
+        val assistant = viewModel.state.value.messages.single { it.role == "ASSISTANT" }
+
+        viewModel.retryAssistant(assistant.id)
+        runCurrent()
+        assertTrue(viewModel.state.value.sending)
+
+        viewModel.refreshModels()
+        runCurrent()
+
+        assertEquals(listOf(original, original), requests)
+        assertEquals(local.models, viewModel.state.value.models)
+        assertEquals(original, viewModel.state.value.selectedModel)
+
+        viewModel.cancel()
+        advanceUntilIdle()
+
+        assertEquals(refreshed, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun refreshWaitsForMessageEditAndPublishesUpdatedMetadataAfterCancel() = runTest(dispatcher) {
+        val old = ChatModel("selected", "Old name", ApiFamily.OPENAI_CHAT)
+        val updated = ChatModel("selected", "New name", ApiFamily.ANTHROPIC_MESSAGES)
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, old))
+        val remote = catalogueSnapshot(version = "live", models = listOf(ChatModel.SOL, updated), origin = CatalogueOrigin.LIVE)
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val viewModel = viewModel(FakeChats(), successfulSource("answer"), catalogue = catalogue)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        catalogue.remote = remote
+        viewModel.send("message to edit")
+        advanceUntilIdle()
+        val user = viewModel.state.value.messages.single { it.role == "USER" }
+        viewModel.selectModel(old)
+        advanceUntilIdle()
+        viewModel.startMessageEdit(user.id)
+        viewModel.updateMessageEdit("keep editing")
+
+        viewModel.refreshModels()
+        advanceUntilIdle()
+
+        assertEquals(local.models, viewModel.state.value.models)
+        assertEquals(old, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.BUNDLED, viewModel.state.value.modelCatalogueOrigin)
+        assertEquals("keep editing", viewModel.state.value.messageEdit?.text)
+        assertFalse(viewModel.state.value.modelsRefreshing)
+
+        viewModel.cancelMessageEdit()
+        advanceUntilIdle()
+
+        assertEquals(remote.models, viewModel.state.value.models)
+        assertEquals(updated, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun refreshWaitsForMessageMutationAndPublishesTheWholeSnapshot() = runTest(dispatcher) {
+        val old = ChatModel("selected", "Old name", ApiFamily.OPENAI_CHAT)
+        val target = ChatModel("target", "Target", ApiFamily.OPENAI_CHAT)
+        val updated = ChatModel("selected", "Updated name", ApiFamily.ANTHROPIC_MESSAGES)
+        val updatedTarget = target.copy(displayName = "Updated target")
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, old, target))
+        val remote = catalogueSnapshot(
+            version = "live",
+            models = listOf(ChatModel.SOL, updated, updatedTarget),
+            origin = CatalogueOrigin.LIVE,
+        )
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val chats = FakeChats().apply {
+            addConversation("conversation", defaultModelId = old.apiId)
+            modelChangeEntered = entered
+            modelChangeRelease = release
+        }
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val viewModel = viewModel(chats, successfulSource("unused"), catalogue = catalogue)
+        advanceUntilIdle()
+        catalogue.remote = remote
+        viewModel.openConversation("conversation")
+        advanceUntilIdle()
+
+        viewModel.selectModel(target)
+        runCurrent()
+        entered.await()
+        viewModel.refreshModels()
+        runCurrent()
+
+        assertTrue(viewModel.state.value.messageMutationBusy)
+        assertEquals(local.models, viewModel.state.value.models)
+        assertEquals(old, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.BUNDLED, viewModel.state.value.modelCatalogueOrigin)
+
+        release.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(remote.models, viewModel.state.value.models)
+        assertEquals(updatedTarget, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun queuedSuccessfulRefreshSurvivesALaterFailedRefresh() = runTest(dispatcher) {
+        val old = ChatModel("selected", "Old name", ApiFamily.OPENAI_CHAT)
+        val updated = ChatModel("selected", "New name", ApiFamily.OPENAI_CHAT)
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, old))
+        val successful = catalogueSnapshot(
+            version = "live", models = listOf(ChatModel.SOL, updated), origin = CatalogueOrigin.LIVE,
+        )
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val viewModel = viewModel(FakeChats(), successfulSource("answer"), catalogue = catalogue)
+        configureKey(viewModel)
+        advanceUntilIdle()
+        catalogue.remote = successful
+        viewModel.selectModel(old)
+        viewModel.send("message to edit")
+        advanceUntilIdle()
+        val user = viewModel.state.value.messages.single { it.role == "USER" }
+        viewModel.startMessageEdit(user.id)
+
+        viewModel.refreshModels()
+        advanceUntilIdle()
+        catalogue.refreshFailure = IllegalStateException("private service detail")
+        viewModel.refreshModels()
+        advanceUntilIdle()
+
+        assertEquals(local.models, viewModel.state.value.models)
+        assertEquals(CatalogueOrigin.BUNDLED, viewModel.state.value.modelCatalogueOrigin)
+        assertEquals("Models could not be refreshed. Try again.", viewModel.state.value.modelsError)
+
+        viewModel.cancelMessageEdit()
+        advanceUntilIdle()
+
+        assertEquals(successful.models, viewModel.state.value.models)
+        assertEquals(updated, viewModel.state.value.selectedModel)
+        assertEquals(CatalogueOrigin.LIVE, viewModel.state.value.modelCatalogueOrigin)
+    }
+
+    @Test
+    fun reopeningConversationWithRemovedDefaultUsesAnUnavailablePlaceholder() = runTest(dispatcher) {
+        val chats = FakeChats().apply { addConversation("retired", defaultModelId = "retired/model") }
+        val viewModel = viewModel(chats, successfulSource("unused"))
+        advanceUntilIdle()
+
+        viewModel.openConversation("retired")
+
+        assertEquals("retired/model", viewModel.state.value.selectedModel.apiId)
+        assertEquals("retired/model", viewModel.state.value.selectedModel.displayName)
+        assertEquals(ApiFamily.OPENAI_CHAT, viewModel.state.value.selectedModel.apiFamily)
+        assertFalse(viewModel.state.value.selectedModelAvailable)
+    }
+
+    @Test
+    fun unavailableSelectionBlocksNormalSendRetriesAndEditBeforePreparation() = runTest(dispatcher) {
+        val retired = model("retired")
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, retired))
+        val remote = catalogueSnapshot(
+            version = "live", models = listOf(ChatModel.SOL), origin = CatalogueOrigin.LIVE,
+        )
+        val catalogue = FakeCatalogue(local = local, remote = local)
+        val chats = FakeChats()
+        var streamCalls = 0
+        val operations = FakeAttachmentOperations(chats)
+        val viewModel = viewModel(
+            chats,
+            StreamSource { _, _, _, _ ->
+                streamCalls += 1
+                if (streamCalls == 2) flow { throw CommandCodeException.ZdrUnavailable() }
+                else successfulEvents("answer $streamCalls")
+            },
+            catalogue = catalogue,
+            operations = operations,
+        )
+        configureKey(viewModel)
+        advanceUntilIdle()
+        viewModel.selectModel(retired)
+        viewModel.send("first turn")
+        advanceUntilIdle()
+        viewModel.send("failed turn")
+        advanceUntilIdle()
+        val completeUser = viewModel.state.value.messages.first { it.role == "USER" && it.content == "first turn" }
+        val completeAssistant = viewModel.state.value.messages.first { it.role == "ASSISTANT" && it.status == "COMPLETE" }
+        val failedUser = viewModel.state.value.messages.first { it.role == "USER" && it.content == "failed turn" }
+        assertEquals(MessageState.FAILED_ZDR, failedUser.status)
+        val prepared = operations.prepared.size
+        val alternatives = operations.preparedAlternatives.size
+        val turns = chats.beginTurnCalls
+        catalogue.remote = remote
+
+        viewModel.refreshModels()
+        advanceUntilIdle()
+        assertEquals(retired, viewModel.state.value.selectedModel)
+        assertFalse(viewModel.state.value.selectedModelAvailable)
+        viewModel.updateDraft("Keep this draft")
+
+        viewModel.send("do not replace the draft")
+        advanceUntilIdle()
+        assertEquals("Keep this draft", viewModel.state.value.draftText)
+        assertEquals("Selected model is no longer available. Choose another model.", viewModel.state.value.errorMessage)
+        assertEquals(prepared, operations.prepared.size)
+        assertEquals(turns, chats.beginTurnCalls)
+        assertEquals(2, streamCalls)
+
+        viewModel.retryMessage(failedUser.id)
+        viewModel.retryAssistant(completeAssistant.id)
+        viewModel.startMessageEdit(completeUser.id)
+        viewModel.updateMessageEdit("edited but still local")
+        viewModel.submitMessageEdit()
+        advanceUntilIdle()
+
+        assertEquals(prepared, operations.prepared.size)
+        assertEquals(alternatives, operations.preparedAlternatives.size)
+        assertEquals(turns, chats.beginTurnCalls)
+        assertEquals(2, streamCalls)
+        assertEquals("edited but still local", viewModel.state.value.messageEdit?.text)
+        assertEquals("Selected model is no longer available. Choose another model.", viewModel.state.value.errorMessage)
+    }
+
+    @Test
+    fun selectingAvailableModelClearsOnlyTheUnavailableSelectionError() = runTest(dispatcher) {
+        val retired = model("retired")
+        val available = model("available")
+        val local = catalogueSnapshot(models = listOf(ChatModel.SOL, retired, available))
+        val remote = catalogueSnapshot(
+            version = "live", models = listOf(ChatModel.SOL, available), origin = CatalogueOrigin.LIVE,
+        )
+        val remoteRelease = CompletableDeferred<ModelCatalogueSnapshot>()
+        val catalogue = FakeCatalogue(local = local, remote = local).apply {
+            refreshBlock = { remoteRelease.await() }
+        }
+        val viewModel = viewModel(
+            FakeChats(),
+            StreamSource { _, _, _, _ -> flow { throw CommandCodeException.ZdrUnavailable() } },
+            catalogue = catalogue,
+        )
+        configureKey(viewModel)
+        runCurrent()
+        viewModel.selectModel(retired)
+        remoteRelease.complete(remote)
+        advanceUntilIdle()
+
+        viewModel.send("blocked by retirement")
+        advanceUntilIdle()
+        assertEquals("Selected model is no longer available. Choose another model.", viewModel.state.value.errorMessage)
+
+        viewModel.selectModel(available)
+        assertNull(viewModel.state.value.errorMessage)
+
+        viewModel.send("unrelated transport failure")
+        advanceUntilIdle()
+        assertEquals("No ZDR-capable provider is available", viewModel.state.value.errorMessage)
+
+        viewModel.selectModel(ChatModel.SOL)
+        assertEquals("No ZDR-capable provider is available", viewModel.state.value.errorMessage)
+    }
+
+    @Test
+    fun newlyDiscoveredModelOutsideImageAllowListRemainsTextOnly() = runTest(dispatcher) {
+        val discovered = ChatModel("new/messages-model", "New Messages model", ApiFamily.ANTHROPIC_MESSAGES)
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(ChatModel.SOL)),
+            remote = catalogueSnapshot(
+                version = "live", models = listOf(ChatModel.SOL, discovered), origin = CatalogueOrigin.LIVE,
+            ),
+        )
+        val viewModel = viewModel(FakeChats(), successfulSource("unused"), catalogue = catalogue)
+        advanceUntilIdle()
+
+        viewModel.selectModel(discovered)
+
+        assertEquals(discovered, viewModel.state.value.selectedModel)
+        assertNull(viewModel.requestAttachmentPicker())
+        assertEquals(AttachmentFailure.UNVERIFIED_MODEL, viewModel.state.value.attachmentError)
+    }
+
+    @Test
+    fun liveCapacityOverridesExactBundledIdForTheMeasuredModelAfterSelectionChanges() = runTest(dispatcher) {
+        val chats = FakeChats().apply {
+            addConversation("conversation")
+            usage("conversation").value = ConversationTokenUsage.aggregate(listOf(
+                ReportedUsage("measured", "reply", ChatModel.SOL.apiId, 1L, 500L, 0L, 0L, true),
+            ))
+        }
+        val localSol = ChatModel.SOL
+        val remoteSol = ChatModel.SOL.copy(contextWindowTokens = 2_000L)
+        val alias = model("gpt-5.6-sol-alias")
+        val catalogue = FakeCatalogue(
+            local = catalogueSnapshot(models = listOf(localSol, ChatModel.LUNA, alias)),
+            remote = catalogueSnapshot(
+                version = "live", models = listOf(remoteSol, ChatModel.LUNA, alias), origin = CatalogueOrigin.LIVE,
+            ),
+        )
+        val bundled = ContextWindowCatalogue(mapOf(ChatModel.SOL.apiId to 1_000L))
+        val viewModel = viewModel(
+            chats,
+            successfulSource("unused"),
+            catalogue = catalogue,
+            contextWindows = bundled,
+        )
+        advanceUntilIdle()
+        viewModel.openConversation("conversation")
+        advanceUntilIdle()
+        viewModel.selectModel(ChatModel.LUNA)
+        advanceUntilIdle()
+
+        assertEquals(ChatModel.SOL.apiId, viewModel.state.value.tokenUsage.measurement?.modelId)
+        assertEquals(ChatModel.LUNA.apiId, viewModel.state.value.selectedModel.apiId)
+        assertEquals(2_000L, viewModel.state.value.contextWindows.limitFor(ChatModel.SOL.apiId))
+        assertNull(viewModel.state.value.contextWindows.limitFor(alias.apiId))
+        assertEquals("25%", viewModel.state.value.contextUsage.label)
+
+        val retiredSnapshot = catalogueSnapshot(
+            version = "retired", models = listOf(ChatModel.LUNA), origin = CatalogueOrigin.LIVE,
+        )
+        catalogue.remote = retiredSnapshot
+        viewModel.refreshModels()
+        advanceUntilIdle()
+
+        assertEquals(listOf(ChatModel.LUNA), viewModel.state.value.models)
+        assertEquals(2_000L, viewModel.state.value.contextWindows.limitFor(ChatModel.SOL.apiId))
+        assertEquals(ChatModel.SOL.apiId, viewModel.state.value.tokenUsage.measurement?.modelId)
+        assertEquals("25%", viewModel.state.value.contextUsage.label)
+    }
+
+    @Test
+    fun reopenedConversationUsesPersistedMetadataForRetiredMeasuredModelWithoutSelectableChoice() = runTest(dispatcher) {
+        val retired = ChatModel("vendor/retired-measured", "Retired measured model", ApiFamily.OPENAI_CHAT, 2_000L)
+        val current = model("current")
+        val chats = FakeChats().apply {
+            addConversation("conversation")
+            usage("conversation").value = ConversationTokenUsage.aggregate(listOf(
+                ReportedUsage("measured", "reply", retired.apiId, 1L, 500L, 0L, 0L, true),
+            ))
+        }
+        val currentCatalogue = catalogueSnapshot(models = listOf(ChatModel.SOL, current))
+        val catalogue = FakeCatalogue(local = currentCatalogue, remote = currentCatalogue).apply {
+            knownContextWindowMetadata = mapOf(retired.apiId to 2_000L, current.apiId to 4_000L)
+        }
+        val viewModel = viewModel(
+            chats,
+            successfulSource("unused"),
+            catalogue = catalogue,
+            contextWindows = ContextWindowCatalogue(mapOf(ChatModel.SOL.apiId to 1_000L)),
+        )
+        advanceUntilIdle()
+
+        viewModel.openConversation("conversation")
+        advanceUntilIdle()
+
+        assertEquals(listOf(ChatModel.SOL, current), viewModel.state.value.models)
+        assertEquals(2_000L, viewModel.state.value.contextWindows.limitFor(retired.apiId))
+        assertEquals("25%", viewModel.state.value.contextUsage.label)
+        assertNull(viewModel.state.value.contextWindows.limitFor(current.apiId))
+        assertNull(viewModel.state.value.contextWindows.limitFor("vendor/unknown"))
     }
 
     @Test
@@ -1658,7 +2274,8 @@ class AppViewModelTest {
         importRelease.complete(Unit)
         advanceUntilIdle()
 
-        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertEquals(ChatModel.LUNA, viewModel.state.value.selectedModel)
+        assertFalse(viewModel.state.value.selectedModelAvailable)
         assertFalse(viewModel.state.value.importingAttachments)
         assertEquals(1, viewModel.state.value.pendingAttachments.size)
     }
@@ -1715,7 +2332,8 @@ class AppViewModelTest {
         prepareRelease.complete(Unit)
         advanceUntilIdle()
 
-        assertEquals(ChatModel.SOL, viewModel.state.value.selectedModel)
+        assertEquals(ChatModel.LUNA, viewModel.state.value.selectedModel)
+        assertFalse(viewModel.state.value.selectedModelAvailable)
         assertEquals("", viewModel.state.value.draftText)
         assertTrue(viewModel.state.value.pendingAttachments.isEmpty())
     }
@@ -2863,6 +3481,9 @@ class AppViewModelTest {
         apiKeyCopier: (CharArray) -> CharArray = { it.copyOf() },
         operations: FakeAttachmentOperations = FakeAttachmentOperations(chats),
         prompts: SystemPromptStore = FakeSystemPromptStore(),
+        contextWindows: ContextWindowCatalogue = ContextWindowCatalogue(
+            mapOf(ChatModel.SOL.apiId to 1_000L, "model-1" to 2_000L),
+        ),
     ) = AppViewModel(
         secrets = keys,
         settings = settings,
@@ -2874,7 +3495,7 @@ class AppViewModelTest {
         elapsedMillis = elapsedMillis,
         apiKeyCopier = apiKeyCopier,
         systemPromptStore = prompts,
-        contextWindowLoader = { ContextWindowCatalogue(mapOf(ChatModel.SOL.apiId to 1000L, "model-1" to 2000L)) },
+        contextWindowLoader = { contextWindows },
     )
 
     private class FakeCatalogue(
@@ -2886,6 +3507,9 @@ class AppViewModelTest {
         var refreshFailure: Exception? = null
         var loadCalls = 0
         var refreshCalls = 0
+        var knownContextWindowMetadata: Map<String, Long> = emptyMap()
+
+        override suspend fun loadKnownContextWindowMetadata(): Map<String, Long> = knownContextWindowMetadata
 
         override suspend fun loadLocal(): ModelCatalogueSnapshot {
             loadCalls += 1
@@ -2942,7 +3566,8 @@ class AppViewModelTest {
         fun catalogueSnapshot(
             version: String = "local",
             models: List<ChatModel>,
-        ) = ModelCatalogueSnapshot(1, version, 1L, models)
+            origin: CatalogueOrigin = CatalogueOrigin.BUNDLED,
+        ) = ModelCatalogueSnapshot(1, version, 1L, models, origin)
 
         fun quotaSnapshot(plan: String) = QuotaSnapshot(
             fetchedAt = Instant.parse("2026-08-30T12:00:00Z"),
@@ -3204,12 +3829,15 @@ class AppViewModelTest {
         val lifecycleEvents = mutableListOf<String>()
         var completedText: String? = null
         var completedUsage: TokenUsage? = null
+        var completionAccepted = true
         var interruptedText: String? = null
         var interruptedUsage: TokenUsage? = null
         var completionEntered: CompletableDeferred<Unit>? = null
         var completionRelease: CompletableDeferred<Unit>? = null
         var beginTurnCommitted: CompletableDeferred<Unit>? = null
         var beginTurnRelease: CompletableDeferred<Unit>? = null
+        var modelChangeEntered: CompletableDeferred<Unit>? = null
+        var modelChangeRelease: CompletableDeferred<Unit>? = null
         val usageCompleteByRequest = mutableMapOf<String, Boolean>()
         val deleteFailures = mutableSetOf<String>()
         var beginTurnCalls = 0
@@ -3357,6 +3985,7 @@ class AppViewModelTest {
         }
 
         override suspend fun completeTurn(messageId: String, text: String, usage: TokenUsage?): Boolean {
+            if (!completionAccepted) return false
             completedText = text
             completedUsage = usage
             updateAssistant(messageId, text, "COMPLETE")
@@ -3412,13 +4041,15 @@ class AppViewModelTest {
         override suspend fun changeConversationModel(conversationId: String, model: ChatModel) {
             val conversation = conversations.value.single { it.id == conversationId }
             if (conversation.defaultModelId == model.apiId) return
+            modelChangeEntered?.complete(Unit)
+            modelChangeRelease?.await()
             conversations.value = conversations.value.map { if (it.id == conversationId) it.copy(defaultModelId = model.apiId) else it }
             val rows = messages(conversationId)
             if (rows.value.isNotEmpty()) rows.value += Message("model-event-${rows.value.size}", conversationId, "MODEL_CHANGE", model.displayName, model.apiId, rows.value.size + 1L, "COMPLETE")
         }
 
-        fun addConversation(id: String) {
-            conversations.value = conversations.value + Conversation(id, id, ChatModel.SOL.apiId, 1, 1)
+        fun addConversation(id: String, defaultModelId: String = ChatModel.SOL.apiId) {
+            conversations.value = conversations.value + Conversation(id, id, defaultModelId, 1, 1)
             messages(id)
         }
 

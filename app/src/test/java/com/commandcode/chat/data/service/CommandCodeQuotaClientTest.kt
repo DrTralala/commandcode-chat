@@ -5,6 +5,7 @@ import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Clock
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -90,6 +91,43 @@ class CommandCodeQuotaClientTest {
         )
         assertEquals(9.5, quota.purchasedCredits, 0.0)
         assertEquals(0.0, quota.freeCredits, 0.0)
+    }
+
+    @Test
+    fun subscriptionRenewalUsesTheSameInstantAsTheQuotaSnapshot() = runBlocking {
+        val now = Instant.parse("2026-11-04T00:00:00Z")
+        val clock = object : Clock() {
+            var instantCalls = 0
+
+            override fun instant(): Instant {
+                instantCalls++
+                return now
+            }
+
+            override fun getZone(): ZoneId = ZoneOffset.UTC
+
+            override fun withZone(zone: ZoneId): Clock = this
+        }
+        val subscription =
+            """{"success":true,"data":{"planId":"individual-goat","status":"active","cancelAtPeriodEnd":false,"currentPeriodEnd":"2026-12-01T00:00:00Z"}}"""
+
+        val quota = clientFor(CURRENT_CREDITS_JSON, subscription, clock = clock).fetchQuota(KEY)
+
+        assertEquals(now, quota.fetchedAt)
+        assertEquals(Instant.parse("2026-12-01T00:00:00Z"), quota.monthlyRenewsAt)
+        assertEquals(1, clock.instantCalls)
+    }
+
+    @Test
+    fun malformedOptionalRenewalKeepsTheSubscriptionPlan() = runBlocking {
+        val subscription =
+            """{"data":{"planId":"individual-goat","status":"active","cancelAtPeriodEnd":false,"currentPeriodEnd":"not-a-date"}}"""
+
+        val quota = clientFor(CURRENT_CREDITS_JSON, subscription).fetchQuota(KEY)
+
+        assertEquals("individual-goat", quota.planId)
+        assertNull(quota.monthlyRenewsAt)
+        assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
     }
 
     @Test
@@ -445,6 +483,7 @@ class CommandCodeQuotaClientTest {
         body: String,
         subscriptionBody: String = SUBSCRIPTION_JSON,
         subscriptionCode: Int = 200,
+        clock: Clock = FIXED_CLOCK,
     ): CommandCodeQuotaClient = CommandCodeQuotaClient(
         routedCallFactory(
             mapOf(
@@ -458,7 +497,7 @@ class CommandCodeQuotaClientTest {
             ),
             mutableListOf(),
         ),
-        FIXED_CLOCK,
+        clock,
     )
 
     private fun assertBadResponse(body: String, message: String = "") {

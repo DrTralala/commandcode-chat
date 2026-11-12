@@ -63,8 +63,8 @@ android {
         applicationId = "com.commandcode.chat"
         minSdk = 30
         targetSdk = 35
-        versionCode = 9
-        versionName = "3.0.1"
+        versionCode = 10
+        versionName = "3.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

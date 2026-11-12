@@ -80,10 +80,32 @@ class BudgetScreenComposeTest {
         compose.waitForIdle()
 
         compose.onNodeWithText("Command Code usage").assertIsDisplayed()
-        compose.onNodeWithText("Monthly credits remaining: 42").assertIsDisplayed()
+        compose.onNodeWithText("Monthly").assertIsDisplayed()
+        compose.onNodeWithText("Monthly usage unavailable").assertIsDisplayed()
+        assertNoBalanceLabels()
         compose.onAllNodesWithTag("budget_monthly_progress").assertCountEquals(0)
         compose.onAllNodesWithTag("budget_five_hour_progress").assertCountEquals(0)
         compose.onAllNodesWithTag("budget_weekly_progress").assertCountEquals(0)
+    }
+
+    @Test
+    fun expiredMonthlyRenewalIsNotPresented() {
+        compose.setContent {
+            MaterialTheme {
+                BudgetScreen(
+                    budget = BudgetUiState(
+                        snapshot = testSnapshot(
+                            monthlyRenewsAt = Instant.parse("2000-09-03T21:50:00Z"),
+                        ),
+                        freshness = BudgetFreshness.LIVE,
+                    ),
+                    onRefresh = {},
+                )
+            }
+        }
+        compose.waitForIdle()
+
+        compose.onAllNodesWithText("Renews", substring = true).assertCountEquals(0)
     }
 
     @Test
@@ -171,9 +193,17 @@ class BudgetScreenComposeTest {
         compose.onNodeWithText("GOAT usage").fetchSemanticsNode()
         compose.onNodeWithText(freshness).fetchSemanticsNode()
         compose.onAllNodesWithText("Limited:", substring = true).assertCountEquals(0)
-        compose.onNodeWithText("42 / 70 credits remaining").fetchSemanticsNode()
+        compose.onNodeWithText("Monthly").fetchSemanticsNode()
+        compose.onNodeWithText("28 / 70 credits used").fetchSemanticsNode()
+        compose.onNodeWithText("Plan-based allowance").fetchSemanticsNode()
+        val renewal = requireNotNull(snapshot.monthlyRenewsAt)
+        compose.onNodeWithText("Renews ${formatQuotaResetTimestamp(renewal)}").fetchSemanticsNode()
+        compose.onAllNodesWithText(
+            "Resets: ${formatQuotaResetTimestamp(renewal)}",
+        ).assertCountEquals(0)
         compose.onNodeWithTag("budget_monthly_progress").fetchSemanticsNode()
-        assertProgress("budget_monthly_progress", 0.4f)
+        assertProgress("budget_monthly_progress", 28f / 70f)
+        assertNoBalanceLabels()
         compose.onNodeWithText("Five-hour: 3.2 / 14 credits used").fetchSemanticsNode()
         compose.onNodeWithTag("budget_five_hour_progress").fetchSemanticsNode()
         assertProgress("budget_five_hour_progress", 3.2f / 14f)
@@ -184,13 +214,20 @@ class BudgetScreenComposeTest {
         assertProgress("budget_weekly_progress", 0.08f)
         compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(weekly.resetAt)}")
             .fetchSemanticsNode()
-        compose.onNodeWithText("Purchased credits: 12.5").fetchSemanticsNode()
-        compose.onNodeWithText("Free credits: 4").fetchSemanticsNode()
         val fiveHourBounds = compose.onNodeWithTag("budget_five_hour_progress").fetchSemanticsNode().boundsInRoot
         val weeklyBounds = compose.onNodeWithTag("budget_weekly_progress").fetchSemanticsNode().boundsInRoot
         val monthlyBounds = compose.onNodeWithTag("budget_monthly_progress").fetchSemanticsNode().boundsInRoot
         assertTrue("fiveHour=$fiveHourBounds weekly=$weeklyBounds", fiveHourBounds.bottom < weeklyBounds.top)
         assertTrue("weekly=$weeklyBounds monthly=$monthlyBounds", weeklyBounds.bottom < monthlyBounds.top)
+    }
+
+    private fun assertNoBalanceLabels() {
+        compose.onAllNodesWithText("remaining", substring = true, ignoreCase = true)
+            .assertCountEquals(0)
+        compose.onAllNodesWithText("Purchased credits", substring = true, ignoreCase = true)
+            .assertCountEquals(0)
+        compose.onAllNodesWithText("Free credits", substring = true, ignoreCase = true)
+            .assertCountEquals(0)
     }
 
     private fun assertProgress(tag: String, expected: Float) {
@@ -214,6 +251,7 @@ class BudgetScreenComposeTest {
             cap = 100.0,
             resetAt = Instant.parse("2026-09-06T12:00:00Z"),
         ),
+        monthlyRenewsAt: Instant? = Instant.parse("2099-09-03T21:50:00Z"),
     ) = QuotaSnapshot(
         fetchedAt = Instant.parse("2026-08-30T12:00:00Z"),
         planId = planId,
@@ -223,5 +261,6 @@ class BudgetScreenComposeTest {
         weekly = weekly,
         purchasedCredits = 12.5,
         freeCredits = 4.0,
+        monthlyRenewsAt = monthlyRenewsAt,
     )
 }

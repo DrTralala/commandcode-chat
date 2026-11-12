@@ -19,6 +19,7 @@ import com.commandcode.chat.data.database.Message
 import com.commandcode.chat.data.database.PendingTurn
 import com.commandcode.chat.domain.AttachmentException
 import com.commandcode.chat.domain.AttachmentFailure
+import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.TokenUsage
@@ -928,6 +929,28 @@ class AttachmentServiceTest {
         assertAttachmentFailure(AttachmentFailure.UNVERIFIED_MODEL, failure)
         assertEquals(0, files.readCount)
         assertEquals(beginCallsBeforeRetry, chats.beginCalls)
+    }
+
+    @Test
+    fun messagesModelCannotSendExistingImageHistoryAndDoesNotDropItsAttachment() = runTest {
+        val service = service()
+        val image = importPng(service)
+        val first = service.prepareTurn(null, "first", ChatModel.SOL, listOf(image))
+        val messagesModel = ChatModel("new/messages-model", "New Messages model", ApiFamily.ANTHROPIC_MESSAGES)
+        chats.changeConversationModel(first.pending.conversationId, messagesModel)
+        val beginCallsBeforeRetry = chats.beginCalls
+
+        val failure = captureFailure {
+            service.prepareTurn(first.pending.conversationId, "second", messagesModel, emptyList())
+        }
+
+        assertAttachmentFailure(AttachmentFailure.UNVERIFIED_MODEL, failure)
+        assertEquals(beginCallsBeforeRetry, chats.beginCalls)
+        assertTrue(files.stored.containsKey(image.id))
+        assertEquals(
+            listOf(image.id),
+            chats.messagesSnapshot(first.pending.conversationId).flatMap { it.attachments }.map(ImageAttachment::id),
+        )
     }
 
     @Test

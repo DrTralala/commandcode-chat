@@ -75,6 +75,37 @@ class ChatScreenPresentationTest {
     }
 
     @Test
+    fun removedSelectionCannotSend() {
+        val state = AppUiState(
+            models = listOf(ChatModel.LUNA),
+            selectedModel = ChatModel.SOL,
+            draftText = "Keep this draft",
+            systemPromptLoaded = true,
+        )
+
+        assertFalse(state.selectedModelAvailable)
+        assertFalse(sendButtonEnabled(state))
+    }
+
+    @Test
+    fun unavailableSelectionBlocksRetryButKeepsEditAndBranchActionsAvailable() {
+        val state = AppUiState(models = listOf(ChatModel.LUNA), selectedModel = ChatModel.SOL)
+        val user = Message("user", "conversation", "USER", "question", null, 1L, "COMPLETE")
+        val assistant = Message("assistant", "conversation", "ASSISTANT", "answer", ChatModel.SOL.apiId, 2L, "COMPLETE")
+        val failed = user.copy(id = "failed", status = MessageState.FAILED_ZDR)
+
+        val userActions = messageActionAvailability(state, user)
+        val assistantActions = messageActionAvailability(state, assistant)
+        val failedActions = messageActionAvailability(state, failed)
+
+        assertTrue(userActions.editEnabled)
+        assertTrue(userActions.branchEnabled)
+        assertFalse(assistantActions.retryEnabled)
+        assertFalse(failedActions.failedRetryEnabled)
+        assertTrue(failedActions.failedActionsEnabled)
+    }
+
+    @Test
     fun branchChoiceKeepsCreationOrderAndDisablesItsEndpoints() {
         val choice = BranchChoice(listOf("a1", "a2", "a3"), 0)
 

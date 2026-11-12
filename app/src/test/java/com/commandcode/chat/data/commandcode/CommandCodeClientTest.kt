@@ -1,6 +1,8 @@
 package com.commandcode.chat.data.commandcode
 
+import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
+import com.commandcode.chat.domain.TokenUsage
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -38,6 +40,43 @@ import org.junit.Test
 import org.json.JSONObject
 
 class CommandCodeClientTest {
+    private val messagesModel = ChatModel("claude-test", "Claude test", ApiFamily.ANTHROPIC_MESSAGES)
+
+    @Test fun `Messages request uses fixed endpoint headers and protocol body`() {
+        val request = CommandCodeClient.requestForTesting(
+            apiKey = charArrayOf('k'),
+            model = messagesModel,
+            messages = listOf(ApiMessage("system", "be precise"), ApiMessage("user", "hello")),
+            zdr = true,
+        )
+        val json = JSONObject(Buffer().also { request.body!!.writeTo(it) }.readUtf8())
+
+        assertEquals("https://api.commandcode.ai/provider/v1/messages", request.url.toString())
+        assertEquals("Bearer k", request.header("Authorization"))
+        assertEquals("1", request.header("x-cmd-zdr"))
+        assertEquals("2026-10-21", request.header("anthropic-version"))
+        assertEquals("claude-test", json.getString("model"))
+        assertEquals(4096, json.getInt("max_tokens"))
+        assertEquals("be precise", json.getString("system"))
+        assertTrue(json.getBoolean("stream"))
+        assertEquals(1, json.getJSONArray("messages").length())
+        assertEquals("user", json.getJSONArray("messages").getJSONObject(0).getString("role"))
+        assertEquals("hello", json.getJSONArray("messages").getJSONObject(0).getString("content"))
+    }
+
+    @Test fun `Messages request keeps authentication and version while omitting disabled zdr`() {
+        val request = CommandCodeClient.requestForTesting(
+            apiKey = charArrayOf('s', 'e', 'c', 'r', 'e', 't'),
+            model = messagesModel,
+            messages = listOf(ApiMessage("user", "hello")),
+            zdr = false,
+        )
+
+        assertEquals("Bearer secret", request.header("Authorization"))
+        assertEquals(null, request.header("x-cmd-zdr"))
+        assertEquals("2026-10-21", request.header("anthropic-version"))
+    }
+
     @Test fun `default zdr and production request are sent through shared path`() = runBlocking {
         val factory = RecordingCallFactory()
         val events = async(start = CoroutineStart.UNDISPATCHED) {
@@ -52,6 +91,7 @@ class CommandCodeClientTest {
 
         assertEquals("https://api.commandcode.ai/provider/v1/chat/completions", call.request().url.toString())
         assertEquals("1", call.request().header("x-cmd-zdr"))
+        assertEquals(null, call.request().header("anthropic-version"))
         val requestBody = Buffer().also { call.request().body?.writeTo(it) }.readUtf8()
         assertTrue(requestBody.contains("gpt-5.6-luna"))
         assertEquals(listOf(StreamEvent.Done), events.await())
@@ -71,6 +111,209 @@ class CommandCodeClientTest {
 
         assertFalse(call.request().headers.names().contains("x-cmd-zdr"))
         assertEquals(listOf(StreamEvent.Done), events.await())
+    }
+
+    @Test fun `Messages stream uses its injected endpoint and parser through terminal notice`() = runBlocking {
+        val factory = RecordingCallFactory()
+        val client = CommandCodeClient(
+            callFactory = factory,
+            messagesEndpoint = "https://messages.test/v1/messages",
+        )
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeout(2_000) {
+                client.stream(
+                    charArrayOf('k'), messagesModel,
+                    listOf(ApiMessage("user", "hello")),
+                ).toList()
+            }
+        }
+        val call = factory.awaitCall()
+        val body = CloseTrackingResponseBody(messagesFrame("max_tokens"))
+        call.respond(response(call.request(), 200, body))
+
+        assertEquals("https://messages.test/v1/messages", call.request().url.toString())
+        assertEquals("Bearer k", call.request().header("Authorization"))
+        assertEquals("1", call.request().header("x-cmd-zdr"))
+        assertEquals("2026-10-21", call.request().header("anthropic-version"))
+        assertEquals(
+            listOf(
+                StreamEvent.Usage(TokenUsage(1, 0, 0)),
+                StreamEvent.Delta("answer"),
+                StreamEvent.Usage(TokenUsage(1, 0, 1)),
+                StreamEvent.Notice(CompletionNotice.OUTPUT_LIMIT),
+                StreamEvent.Done,
+            ),
+            events.await(),
+        )
+        assertEquals(1, call.cancelCount)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test fun `Messages end-turn stop emits Done without a completion notice`() = runBlocking {
+        val factory = RecordingCallFactory()
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeout(2_000) {
+                CommandCodeClient(
+                    callFactory = factory,
+                    messagesEndpoint = "https://messages.test/v1/messages",
+                ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).toList()
+            }
+        }
+        val call = factory.awaitCall()
+        val body = CloseTrackingResponseBody(messagesFrame("end_turn"))
+        call.respond(response(call.request(), 200, body))
+
+        assertEquals(
+            listOf(
+                StreamEvent.Usage(TokenUsage(1, 0, 0)),
+                StreamEvent.Delta("answer"),
+                StreamEvent.Usage(TokenUsage(1, 0, 1)),
+                StreamEvent.Done,
+            ),
+            events.await(),
+        )
+        assertEquals(1, call.cancelCount)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test fun `Messages stream error stops reading and closes the response once`() = runBlocking {
+        val errorFrame = "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"private detail\"}}\n\n"
+        val body = BlockingAfterContentResponseBody(errorFrame)
+        val factory = RecordingCallFactory { body.releaseRead() }
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching {
+                withTimeout(2_000) {
+                    CommandCodeClient(
+                        callFactory = factory,
+                        messagesEndpoint = "https://messages.test/v1/messages",
+                    ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).toList()
+                }
+            }
+        }
+        val call = factory.awaitCall()
+        call.respond(response(call.request(), 200, body))
+
+        assertEquals(listOf(StreamEvent.Error("PROVIDER_ERROR", "Provider returned an error")), events.await().getOrThrow())
+        assertFalse(body.readPastContent)
+        assertEquals(1, call.cancelCount)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test fun `Messages EOF without message stop has no Done and closes the response once`() = runBlocking {
+        val factory = RecordingCallFactory()
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeout(2_000) {
+                CommandCodeClient(
+                    callFactory = factory,
+                    messagesEndpoint = "https://messages.test/v1/messages",
+                ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).toList()
+            }
+        }
+        val call = factory.awaitCall()
+        val body = CloseTrackingResponseBody(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n",
+        )
+        call.respond(response(call.request(), 200, body))
+
+        assertEquals(listOf(StreamEvent.Usage(TokenUsage(1, 0, 0))), events.await())
+        assertEquals(1, call.cancelCount)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test
+    fun messagesTransportRejectsOversizedUnterminatedLineBeforeReadingItFully() = runBlocking {
+        val body = RepeatedBytesResponseBody(totalBytes = 1_048_576L)
+        val factory = RecordingCallFactory()
+        val events = async(start = CoroutineStart.UNDISPATCHED) {
+            withTimeout(2_000) {
+                CommandCodeClient(
+                    callFactory = factory,
+                    messagesEndpoint = "https://messages.test/v1/messages",
+                ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).toList()
+            }
+        }
+        val call = factory.awaitCall()
+        call.respond(response(call.request(), 200, body))
+
+        assertEquals(
+            listOf(StreamEvent.Error("MALFORMED_FRAME", "Malformed Messages stream")),
+            events.await(),
+        )
+        assertTrue("read ${body.bytesRead} bytes", body.bytesRead <= 262_144L + 16_384L)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test fun `Messages HTTP failures map safely and close each response once`() = runBlocking {
+        val cases = listOf(
+            Triple(401, "safe", CommandCodeException.Unauthorized::class.java),
+            Triple(403, "safe", CommandCodeException.Forbidden::class.java),
+            Triple(429, "safe", CommandCodeException.RateLimited::class.java),
+            Triple(500, "safe", CommandCodeException.ServerFailure::class.java),
+            Triple(422, "cmd_zdr_no_providers", CommandCodeException.ZdrUnavailable::class.java),
+        )
+
+        cases.forEach { (code, content, expectedType) ->
+            val factory = RecordingCallFactory()
+            val result = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching {
+                    withTimeout(2_000) {
+                        CommandCodeClient(
+                            callFactory = factory,
+                            messagesEndpoint = "https://messages.test/v1/messages",
+                        ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).toList()
+                    }
+                }
+            }
+            val call = factory.awaitCall()
+            val body = CloseTrackingResponseBody(content)
+            call.respond(response(call.request(), code, body))
+
+            assertEquals("HTTP $code", expectedType, result.await().exceptionOrNull()?.javaClass)
+            assertEquals("HTTP $code", 1, call.cancelCount)
+            assertEquals("HTTP $code", 1, body.closeCount)
+        }
+    }
+
+    @Test fun `Messages cancellation before response callback closes a late response once`() = runBlocking {
+        val factory = RecordingCallFactory()
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            CommandCodeClient(
+                callFactory = factory,
+                messagesEndpoint = "https://messages.test/v1/messages",
+            ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).collect { }
+        }
+        val call = factory.awaitCall()
+
+        withTimeout(2_000) { job.cancelAndJoin() }
+        val body = CloseTrackingResponseBody(messagesFrame("end_turn"))
+        call.respond(response(call.request(), 200, body))
+        assertTrue(body.awaitClosed())
+
+        assertEquals(1, call.cancelCount)
+        assertEquals(1, body.closeCount)
+    }
+
+    @Test fun `Messages cancellation after response callback closes the active response once`() = runBlocking {
+        val body = BlockingTrackingResponseBody()
+        val factory = RecordingCallFactory { body.releaseRead() }
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            CommandCodeClient(
+                callFactory = factory,
+                messagesEndpoint = "https://messages.test/v1/messages",
+            ).stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello"))).collect { }
+        }
+        val call = factory.awaitCall()
+        val responseDelivery = launch(Dispatchers.Default) {
+            call.respond(response(call.request(), 200, body))
+        }
+        assertTrue(body.awaitReadStarted())
+
+        withTimeout(2_000) { job.cancelAndJoin() }
+        withTimeout(2_000) { responseDelivery.join() }
+
+        assertEquals(1, call.cancelCount)
+        assertTrue(body.closed)
+        assertEquals(1, body.closeCount)
     }
 
     @Test fun `many events are retained`() = runBlocking {
@@ -418,6 +661,35 @@ class CommandCodeClientTest {
         }
     }
 
+    private class RepeatedBytesResponseBody(
+        private val totalBytes: Long,
+    ) : ResponseBody() {
+        @Volatile var bytesRead = 0L
+            private set
+        @Volatile var closeCount = 0
+            private set
+        private val responseSource = object : Source {
+            override fun read(sink: Buffer, byteCount: Long): Long {
+                if (bytesRead == totalBytes) return -1
+                val count = minOf(byteCount, totalBytes - bytesRead)
+                sink.write(ByteArray(count.toInt()) { 'x'.code.toByte() })
+                bytesRead += count
+                return count
+            }
+
+            override fun timeout(): Timeout = Timeout.NONE
+            override fun close() = Unit
+        }.buffer()
+
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = -1L
+        override fun source(): BufferedSource = responseSource
+        override fun close() {
+            closeCount++
+            super.close()
+        }
+    }
+
     private fun response(request: Request, code: Int, body: ResponseBody): Response =
         Response.Builder()
             .request(request)
@@ -426,5 +698,52 @@ class CommandCodeClientTest {
             .message("scripted")
             .body(body)
             .build()
+
+    private fun messagesFrame(stopReason: String): String =
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n" +
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n" +
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"$stopReason\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+            "data: {\"type\":\"message_stop\"}\n\n"
+
+    private class BlockingAfterContentResponseBody(content: String) : ResponseBody() {
+        private val bytes = content.toByteArray()
+        private var offset = 0
+        private val readRelease = CountDownLatch(1)
+        @Volatile var readPastContent = false
+            private set
+        @Volatile var closeCount = 0
+            private set
+        private val responseSource = object : Source {
+            override fun read(sink: Buffer, byteCount: Long): Long {
+                if (offset < bytes.size) {
+                    val count = minOf(byteCount.toInt(), bytes.size - offset)
+                    sink.write(bytes, offset, count)
+                    offset += count
+                    return count.toLong()
+                }
+                readPastContent = true
+                try {
+                    readRelease.await()
+                } catch (e: InterruptedException) {
+                    throw IOException("interrupted scripted read", e)
+                }
+                return -1
+            }
+
+            override fun timeout(): Timeout = Timeout.NONE
+            override fun close() = Unit
+        }.buffer()
+
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = bytes.size.toLong()
+        override fun source(): BufferedSource = responseSource
+        override fun close() {
+            closeCount++
+            readRelease.countDown()
+            super.close()
+        }
+
+        fun releaseRead() = readRelease.countDown()
+    }
 
 }

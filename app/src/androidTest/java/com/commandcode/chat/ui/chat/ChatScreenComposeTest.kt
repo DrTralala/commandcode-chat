@@ -22,6 +22,7 @@ import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.assertHasNoClickAction
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -45,7 +46,9 @@ import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.MessageState
+import com.commandcode.chat.data.service.CatalogueOrigin
 import com.commandcode.chat.ui.AppUiState
+import com.commandcode.chat.ui.MessageEdit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -439,6 +442,80 @@ class ChatScreenComposeTest {
         compose.onNodeWithTag(modelOptionTestTag(ChatModel.LUNA.apiId)).performClick()
 
         assertEquals(ChatModel.LUNA, selected)
+    }
+
+    @Test
+    fun modelMenuShowsProvenanceAndManualRefreshAction() {
+        var refreshCalls = 0
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(modelCatalogueOrigin = CatalogueOrigin.LIVE),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("unused") },
+                    onRefreshModels = { refreshCalls += 1 },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("model_selector").performClick()
+        compose.onNodeWithTag("model_catalogue_status").assertTextEquals("Live models")
+        compose.onNodeWithTag("model_refresh").assertIsDisplayed().assertIsEnabled().performClick()
+
+        assertEquals(1, refreshCalls)
+    }
+
+    @Test
+    fun refreshingUnavailableModelShowsStatusKeepsDraftEditableAndBlocksSending() {
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(
+                        models = listOf(ChatModel.LUNA),
+                        selectedModel = ChatModel.SOL,
+                        draftText = "Keep this draft",
+                        modelsRefreshing = true,
+                        modelsError = "Models could not be refreshed. Try again.",
+                    ),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("unused") },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("message_composer").assertIsEnabled()
+        compose.onNodeWithTag("send_message").assertIsNotEnabled()
+        compose.onNodeWithTag("model_unavailable").assertIsDisplayed()
+        compose.onNodeWithTag("model_selector").performClick()
+        compose.onNodeWithTag("model_catalogue_status").assertTextEquals("Bundled models")
+        compose.onNodeWithTag("model_refresh").assertIsNotEnabled()
+        compose.onNodeWithText("Refreshing models…").assertIsDisplayed()
+        compose.onNodeWithText("Models could not be refreshed. Try again.").assertIsDisplayed()
+    }
+
+    @Test
+    fun unavailableSelectionKeepsEditTextEditableButDisablesEditSubmission() {
+        val user = Message("message", "conversation", "USER", "Original", null, 1L, "COMPLETE")
+        compose.setContent {
+            MaterialTheme {
+                ChatScreen(
+                    state = state().copy(
+                        models = listOf(ChatModel.LUNA),
+                        selectedModel = ChatModel.SOL,
+                        messages = listOf(user),
+                        messageEdit = MessageEdit("conversation", user.id, "Keep editing"),
+                    ),
+                    onSelectModel = {}, onNewChat = {}, onSend = {}, onCancel = {},
+                    onDraftChange = {}, onAttach = {}, onRemoveAttachment = {},
+                    onDismissAttachmentError = {}, loadAttachmentPreview = { _, _ -> error("unused") },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("message_editor_message").assertIsEnabled()
+        compose.onNodeWithTag("message_edit_save_message").assertIsNotEnabled()
     }
 
     @Test

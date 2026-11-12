@@ -13,11 +13,29 @@ data class ModelCatalogueSnapshot(
     val catalogueVersion: String,
     val generatedAt: Long,
     val models: List<ChatModel>,
+    val origin: CatalogueOrigin = CatalogueOrigin.BUNDLED,
 )
+
+enum class CatalogueOrigin { BUNDLED, CACHED, LIVE }
 
 interface ModelCatalogueSource {
     suspend fun loadLocal(): ModelCatalogueSnapshot
     suspend fun refresh(): ModelCatalogueSnapshot
+
+    /** Known context limits for retired IDs; this metadata is not part of selectable catalogue entries. */
+    suspend fun loadKnownContextWindowMetadata(): Map<String, Long> = emptyMap()
+}
+
+fun interface ModelCatalogueApi {
+    suspend fun fetchCatalogue(): ModelCatalogueSnapshot
+}
+
+interface ModelCatalogueStore {
+    fun loadCatalogue(): ModelCatalogueSnapshot?
+    fun saveCatalogue(snapshot: ModelCatalogueSnapshot)
+
+    /** Historical context metadata is persisted separately and never adds models to the selectable snapshot. */
+    fun loadKnownContextWindowMetadata(): Map<String, Long> = emptyMap()
 }
 
 data class RemainingQuota(val remaining: Double, val cap: Double?)
@@ -33,6 +51,7 @@ data class QuotaSnapshot(
     val weekly: UsedQuota?,
     val purchasedCredits: Double,
     val freeCredits: Double,
+    val monthlyRenewsAt: Instant? = null,
 )
 
 internal const val UNREPORTED_PLAN_ID: String = "unreported"
@@ -54,13 +73,16 @@ interface QuotaSource {
 }
 
 internal object ModelCatalogueCodec {
-    const val SUPPORTED_SCHEMA_VERSION = 1
-    const val MAX_MODELS = 100
-    const val MAX_CATALOGUE_BYTES = 131_072
-    const val SUPPORTED_API_FAMILY = "openai-chat"
+    const val SUPPORTED_SCHEMA_VERSION = 2
+    const val MAX_MODELS = 1_000
+    const val MAX_CATALOGUE_BYTES = 2_097_152
+
+    private const val LEGACY_SCHEMA_VERSION = 1
+    private const val MAX_MODEL_ID_CHARACTERS = 256
+    private const val MAX_MODEL_DISPLAY_NAME_CHARACTERS = 200
 
     fun validate(snapshot: ModelCatalogueSnapshot): ModelCatalogueSnapshot {
-        require(snapshot.schemaVersion == SUPPORTED_SCHEMA_VERSION) {
+        require(snapshot.schemaVersion in LEGACY_SCHEMA_VERSION..SUPPORTED_SCHEMA_VERSION) {
             "Unsupported model catalogue schema"
         }
         require(snapshot.catalogueVersion.isNotBlank()) {
@@ -72,20 +94,33 @@ internal object ModelCatalogueCodec {
         require(snapshot.models.size <= MAX_MODELS) {
             "Model catalogue exceeds the maximum model count"
         }
+        require(snapshot.models.isNotEmpty()) {
+            "Model catalogue must contain at least one model"
+        }
 
         val ids = HashSet<String>(snapshot.models.size)
         snapshot.models.forEach { model ->
-            require(model.apiId.isNotBlank()) { "Model id must not be blank" }
-            require(model.displayName.isNotBlank()) { "Model displayName must not be blank" }
-            require(model.apiFamily.wireValue == SUPPORTED_API_FAMILY) {
-                "Unsupported model API family"
-            }
+            validateModelMetadata(model.apiId, model.displayName, model.contextWindowTokens)
             require(ids.add(model.apiId)) { "Duplicate model id" }
         }
-        require(snapshot.models.singleOrNull { it.apiId == ChatModel.SOL.apiId } == ChatModel.SOL) {
-            "Model catalogue must contain the canonical GPT-5.6 Sol entry"
-        }
         return snapshot.copy(models = snapshot.models.toList())
+    }
+
+    internal fun validateModelMetadata(apiId: String, displayName: String, contextWindowTokens: Long?) {
+        require(apiId.isNotBlank()) { "Model id must not be blank" }
+        require(apiId.codePointCount(0, apiId.length) <= MAX_MODEL_ID_CHARACTERS) {
+            "Model id exceeds the maximum length"
+        }
+        require(apiId == apiId.trim()) { "Model id must not be padded" }
+        require(apiId.none(Char::isISOControl)) { "Model id must not contain control characters" }
+        require(displayName.isNotBlank()) { "Model displayName must not be blank" }
+        require(displayName.codePointCount(0, displayName.length) <= MAX_MODEL_DISPLAY_NAME_CHARACTERS) {
+            "Model displayName exceeds the maximum length"
+        }
+        require(displayName.none(Char::isISOControl)) { "Model displayName must not contain control characters" }
+        require(contextWindowTokens == null || contextWindowTokens > 0) {
+            "Model context window must be positive"
+        }
     }
 
     fun decode(text: String): ModelCatalogueSnapshot {
@@ -93,11 +128,7 @@ internal object ModelCatalogueCodec {
             "Model catalogue exceeds the maximum size"
         }
         return try {
-            val tokener = JSONTokener(text)
-            val root = tokener.nextValue()
-            require(root is JSONObject) { "Model catalogue must be a JSON object" }
-            require(tokener.nextClean() == '\u0000') { "Unexpected trailing model catalogue data" }
-            decodeObject(root)
+            decodeObject(parseUniqueJsonObject(text, "Model catalogue"))
         } catch (exception: IllegalArgumentException) {
             throw exception
         } catch (exception: Exception) {
@@ -108,7 +139,7 @@ internal object ModelCatalogueCodec {
     fun encode(snapshot: ModelCatalogueSnapshot): String {
         val validated = validate(snapshot)
         val encoded = JSONObject()
-            .put("schemaVersion", validated.schemaVersion)
+            .put("schemaVersion", SUPPORTED_SCHEMA_VERSION)
             .put("catalogueVersion", validated.catalogueVersion)
             .put("generatedAt", validated.generatedAt)
             .put("models", JSONArray().apply {
@@ -117,7 +148,8 @@ internal object ModelCatalogueCodec {
                         JSONObject()
                             .put("id", model.apiId)
                             .put("displayName", model.displayName)
-                            .put("apiFamily", model.apiFamily.wireValue),
+                            .put("apiFamily", model.apiFamily.wireValue)
+                            .put("contextWindowTokens", model.contextWindowTokens ?: JSONObject.NULL),
                     )
                 }
             })
@@ -129,6 +161,10 @@ internal object ModelCatalogueCodec {
     }
 
     private fun decodeObject(root: JSONObject): ModelCatalogueSnapshot {
+        val schemaVersion = intValue(root, "schemaVersion")
+        require(schemaVersion in LEGACY_SCHEMA_VERSION..SUPPORTED_SCHEMA_VERSION) {
+            "Unsupported model catalogue schema"
+        }
         requireKeys(root, setOf("schemaVersion", "catalogueVersion", "generatedAt", "models"))
         val modelsValue = root.get("models")
         require(modelsValue is JSONArray) { "Models must be an array" }
@@ -138,16 +174,25 @@ internal object ModelCatalogueCodec {
         val models = List(modelsValue.length()) { index ->
             val modelObject = modelsValue.get(index)
             require(modelObject is JSONObject) { "Model must be an object" }
-            requireKeys(modelObject, setOf("id", "displayName", "apiFamily"))
+            val expectedKeys = setOf("id", "displayName", "apiFamily") +
+                if (schemaVersion == SUPPORTED_SCHEMA_VERSION) setOf("contextWindowTokens") else emptySet()
+            requireKeys(modelObject, expectedKeys)
             val id = stringValue(modelObject, "id")
             val displayName = stringValue(modelObject, "displayName")
-            val apiFamily = stringValue(modelObject, "apiFamily")
-            require(apiFamily == SUPPORTED_API_FAMILY) { "Unsupported model API family" }
-            ChatModel(id, displayName, ApiFamily.OPENAI_CHAT)
+            val apiFamilyWireValue = stringValue(modelObject, "apiFamily")
+            val apiFamily = ApiFamily.values().firstOrNull { it.wireValue == apiFamilyWireValue }
+                ?: throw IllegalArgumentException("Unsupported model API family")
+            val contextWindowTokens = if (schemaVersion == LEGACY_SCHEMA_VERSION) {
+                null
+            } else {
+                nullableLongValue(modelObject, "contextWindowTokens")
+            }
+            validateModelMetadata(id, displayName, contextWindowTokens)
+            ChatModel(id, displayName, apiFamily, contextWindowTokens)
         }
         return validate(
             ModelCatalogueSnapshot(
-                schemaVersion = intValue(root, "schemaVersion"),
+                schemaVersion = schemaVersion,
                 catalogueVersion = stringValue(root, "catalogueVersion"),
                 generatedAt = longValue(root, "generatedAt"),
                 models = models,
@@ -173,6 +218,13 @@ internal object ModelCatalogueCodec {
 
     private fun longValue(objectValue: JSONObject, key: String): Long = integerValue(objectValue, key)
 
+    private fun nullableLongValue(objectValue: JSONObject, key: String): Long? {
+        val value = objectValue.get(key)
+        if (value === JSONObject.NULL) return null
+        require(value is Int || value is Long) { "$key must be an integer or null" }
+        return value.toLong().also { require(it > 0) { "$key must be positive" } }
+    }
+
     private fun integerValue(objectValue: JSONObject, key: String): Long {
         val value = objectValue.get(key)
         require(value is Int || value is Long) { "$key must be an integer" }
@@ -181,10 +233,11 @@ internal object ModelCatalogueCodec {
 }
 
 internal object QuotaSnapshotCodec {
-    const val SUPPORTED_SCHEMA_VERSION = 2
+    const val SUPPORTED_SCHEMA_VERSION = 3
     const val MAX_QUOTA_BYTES = 65_536
 
     private const val LEGACY_SCHEMA_VERSION = 1
+    private const val PREVIOUS_SCHEMA_VERSION = 2
 
     fun validate(snapshot: QuotaSnapshot): QuotaSnapshot {
         require(epochMillis(snapshot.fetchedAt, "fetchedAt") > 0) {
@@ -200,6 +253,7 @@ internal object QuotaSnapshotCodec {
         }
         snapshot.fiveHour?.let { validateWindow(it, "fiveHour") }
         snapshot.weekly?.let { validateWindow(it, "weekly") }
+        snapshot.monthlyRenewsAt?.let { epochMillis(it, "monthlyRenewsAt") }
         requireAmount(snapshot.purchasedCredits, "purchasedCredits")
         requireAmount(snapshot.freeCredits, "freeCredits")
         return snapshot
@@ -239,6 +293,10 @@ internal object QuotaSnapshotCodec {
             .put("fetchedAt", epochMillis(validated.fetchedAt, "fetchedAt"))
             .put("planId", validated.planId ?: JSONObject.NULL)
             .put(
+                "monthlyRenewsAt",
+                validated.monthlyRenewsAt?.let { epochMillis(it, "monthlyRenewsAt") } ?: JSONObject.NULL,
+            )
+            .put(
                 "monthly",
                 JSONObject()
                     .put("remaining", validated.monthly.remaining)
@@ -256,7 +314,8 @@ internal object QuotaSnapshotCodec {
 
     private fun decodeObject(root: JSONObject): QuotaSnapshot = when (intValue(root, "schemaVersion")) {
         LEGACY_SCHEMA_VERSION -> decodeLegacyObject(root)
-        SUPPORTED_SCHEMA_VERSION -> decodeCurrentObject(root)
+        PREVIOUS_SCHEMA_VERSION -> decodeCurrentObject(root, includesRenewal = false)
+        SUPPORTED_SCHEMA_VERSION -> decodeCurrentObject(root, includesRenewal = true)
         else -> throw IllegalArgumentException("Unsupported quota schema")
     }
 
@@ -300,19 +359,17 @@ internal object QuotaSnapshotCodec {
         )
     }
 
-    private fun decodeCurrentObject(root: JSONObject): QuotaSnapshot {
-        requireKeys(
-            root,
-            setOf(
-                "schemaVersion",
-                "fetchedAt",
-                "planId",
-                "monthly",
-                "windowLimits",
-                "purchasedCredits",
-                "freeCredits",
-            ),
-        )
+    private fun decodeCurrentObject(root: JSONObject, includesRenewal: Boolean): QuotaSnapshot {
+        val expectedKeys = setOf(
+            "schemaVersion",
+            "fetchedAt",
+            "planId",
+            "monthly",
+            "windowLimits",
+            "purchasedCredits",
+            "freeCredits",
+        ) + if (includesRenewal) setOf("monthlyRenewsAt") else emptySet()
+        requireKeys(root, expectedKeys)
         val monthly = objectValue(root, "monthly")
         requireKeys(monthly, setOf("remaining", "cap"))
         val windowsValue = root.get("windowLimits")
@@ -328,6 +385,7 @@ internal object QuotaSnapshotCodec {
             QuotaSnapshot(
                 fetchedAt = Instant.ofEpochMilli(epochMillis(root, "fetchedAt")),
                 planId = nullableStringValue(root, "planId"),
+                monthlyRenewsAt = if (includesRenewal) nullableInstantValue(root, "monthlyRenewsAt") else null,
                 limited = windows?.let { booleanValue(it, "limited") },
                 monthly = RemainingQuota(
                     remaining = amountValue(monthly, "remaining"),
@@ -384,6 +442,13 @@ internal object QuotaSnapshotCodec {
         require(value is String) { "$key must be a string or null" }
         return value
     }
+
+    private fun nullableInstantValue(objectValue: JSONObject, key: String): Instant? =
+        if (objectValue.get(key) === JSONObject.NULL) {
+            null
+        } else {
+            Instant.ofEpochMilli(epochMillis(objectValue, key))
+        }
 
     private fun booleanValue(objectValue: JSONObject, key: String): Boolean {
         val value = objectValue.get(key)

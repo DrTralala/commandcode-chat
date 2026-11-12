@@ -216,6 +216,7 @@ private fun AppContent(viewModel: AppViewModel) {
                         onSubmitMessageEdit = viewModel::submitMessageEdit,
                         onCancelMessageEdit = viewModel::cancelMessageEdit,
                         onSelectAlternative = { requestNavigation(EditNavigation.Branch(it)) },
+                        onRefreshModels = viewModel::refreshModels,
                         onDraftChange = viewModel::updateDraft,
                         onAttach = {
                             if (pendingPickerTicket == null) {

@@ -4,15 +4,23 @@ import com.commandcode.chat.domain.TokenUsage
 import org.json.JSONException
 import org.json.JSONObject
 
+internal interface StreamParser {
+    fun acceptLine(line: String): List<StreamEvent>
+    fun finish(): List<StreamEvent>
+}
+
+enum class CompletionNotice { OUTPUT_LIMIT, CONTEXT_LIMIT, REFUSAL }
+
 sealed interface StreamEvent {
     data class Delta(val content: String) : StreamEvent
     data class Usage(val usage: TokenUsage) : StreamEvent
+    data class Notice(val reason: CompletionNotice) : StreamEvent
     data object Done : StreamEvent
     data class Error(val code: String, val message: String) : StreamEvent
 }
 
-class SseParser {
-    fun acceptLine(line: String): List<StreamEvent> {
+class SseParser : StreamParser {
+    override fun acceptLine(line: String): List<StreamEvent> {
         val value = line.trimEnd('\r')
         if (value.isBlank() || value.startsWith(":")) return emptyList()
         if (!value.startsWith("data:")) return emptyList()
@@ -41,5 +49,5 @@ class SseParser {
         }
     }
 
-    fun finish(): List<StreamEvent> = emptyList()
+    override fun finish(): List<StreamEvent> = emptyList()
 }

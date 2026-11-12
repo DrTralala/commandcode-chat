@@ -170,7 +170,9 @@ internal fun MessageRow(
     editEnabled: Boolean = false,
     retryEnabled: Boolean = false,
     failedActionsEnabled: Boolean = false,
+    failedRetryEnabled: Boolean = false,
     branchActionsEnabled: Boolean = false,
+    editSubmitEnabled: Boolean = true,
     messageEdit: MessageEdit? = null,
     onEditChange: (String) -> Unit = {},
     onStartEdit: () -> Unit = {},
@@ -209,7 +211,9 @@ internal fun MessageRow(
         editEnabled,
         retryEnabled,
         failedActionsEnabled,
+        failedRetryEnabled,
         branchActionsEnabled,
+        editSubmitEnabled,
     ) {
         actionsOpen = false
         failureActionsOpen = false
@@ -266,6 +270,7 @@ internal fun MessageRow(
                                 message = message,
                                 edit = requireNotNull(messageEdit),
                                 enabled = editorEnabled,
+                                submitEnabled = editSubmitEnabled,
                                 loadAttachmentPreview = loadAttachmentPreview,
                                 onChange = { selectionOwner.clear(); onEditChange(it) },
                                 onSubmit = { selectionOwner.clear(); onSubmitEdit() },
@@ -387,7 +392,7 @@ internal fun MessageRow(
                             selectionOwner.clear()
                             onRetry()
                         },
-                        enabled = failedActionsEnabled,
+                        enabled = failedRetryEnabled,
                         modifier = Modifier.testTag("failed_message_retry_${message.id}"),
                     )
                     DropdownMenuItem(
@@ -418,6 +423,7 @@ private fun MessageEditor(
     message: Message,
     edit: MessageEdit,
     enabled: Boolean,
+    submitEnabled: Boolean,
     loadAttachmentPreview: suspend (String, Int) -> Bitmap,
     onChange: (String) -> Unit,
     onSubmit: () -> Unit,
@@ -442,7 +448,8 @@ private fun MessageEditor(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = onSubmit,
-                enabled = enabled && (edit.text.isNotBlank() || message.attachments.isNotEmpty()),
+                enabled = enabled && submitEnabled &&
+                    (edit.text.isNotBlank() || message.attachments.isNotEmpty()),
                 modifier = Modifier.testTag("message_edit_save_${message.id}"),
             ) { Text("Save & send") }
             OutlinedButton(

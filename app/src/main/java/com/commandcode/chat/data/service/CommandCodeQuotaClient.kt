@@ -93,17 +93,27 @@ class CommandCodeQuotaClient(
                 val credits = async(Dispatchers.IO) {
                     execute(creditsRequest)
                 }
-                val planId = async(Dispatchers.IO) {
-                    fetchOptionalPlanId(subscriptionRequest)
+                val subscriptionResponse = async(Dispatchers.IO) {
+                    fetchOptionalSubscriptionResponse(subscriptionRequest)
                 }
                 val creditsText = credits.await()
-                val subscriptionPlanId = planId.await()
+                val subscriptionText = subscriptionResponse.await()
+                val fetchedAt = clock.instant()
+                val subscriptionMetadata = subscriptionText?.let { text ->
+                    try {
+                        CommandCodeSubscriptionResponseCodec.decode(text, fetchedAt)
+                    } catch (failure: CancellationException) {
+                        throw failure
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
                 try {
                     CommandCodeQuotaResponseCodec.decode(
                         text = creditsText,
-                        fetchedAt = clock.instant(),
-                        subscriptionPlanId = subscriptionPlanId,
-                    )
+                        fetchedAt = fetchedAt,
+                        subscriptionPlanId = subscriptionMetadata?.planId,
+                    ).copy(monthlyRenewsAt = subscriptionMetadata?.renewsAt)
                 } catch (_: Exception) {
                     throw ServiceException(ServiceException.Kind.BAD_RESPONSE)
                 }
@@ -120,8 +130,8 @@ class CommandCodeQuotaClient(
         .header("Authorization", bearer)
         .build()
 
-    private suspend fun fetchOptionalPlanId(request: Request): String? = try {
-        CommandCodeSubscriptionResponseCodec.decodePlanId(execute(request))
+    private suspend fun fetchOptionalSubscriptionResponse(request: Request): String? = try {
+        execute(request)
     } catch (failure: CancellationException) {
         throw failure
     } catch (_: Exception) {

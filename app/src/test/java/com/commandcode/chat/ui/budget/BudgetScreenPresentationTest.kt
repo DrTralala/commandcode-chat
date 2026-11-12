@@ -8,9 +8,17 @@ import com.commandcode.chat.ui.BudgetUiState
 import java.time.Instant
 import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class BudgetScreenPresentationTest {
+    @Test
+    fun monthlyUseIsDerivedOnlyWhenAllowanceIsKnown() {
+        assertEquals(28.0, monthlyUsed(RemainingQuota(42.0, 70.0))!!, 0.0)
+        assertEquals(0.0, monthlyUsed(RemainingQuota(80.0, 70.0))!!, 0.0)
+        assertNull(monthlyUsed(RemainingQuota(42.0, null)))
+    }
+
     @Test
     fun creditValuesUseHalfUpRoundingWithAtMostTwoDecimalPlaces() {
         assertEquals("1.23", formatCredits(1.234))
@@ -29,9 +37,7 @@ class BudgetScreenPresentationTest {
     }
 
     @Test
-    fun progressUsesConsumedMonthlyFractionAndClampsUsedQuotas() {
-        assertEquals(0.4f, consumedQuotaFraction(42.0, 70.0))
-        assertEquals(0.0f, consumedQuotaFraction(80.0, 70.0))
+    fun usedQuotaFractionClampsUsedQuotas() {
         assertEquals(1.0f, usedQuotaFraction(20.0, 14.0))
         assertEquals(0.0f, usedQuotaFraction(-1.0, 14.0))
     }

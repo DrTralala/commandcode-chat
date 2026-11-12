@@ -20,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.commandcode.chat.data.service.RemainingQuota
 import com.commandcode.chat.data.service.commandCodePlan
 import com.commandcode.chat.ui.BudgetFreshness
 import com.commandcode.chat.ui.BudgetUiState
@@ -32,11 +33,11 @@ import java.time.format.DateTimeFormatterBuilder
 import java.time.temporal.ChronoField
 import java.util.Locale
 
-internal fun consumedQuotaFraction(remaining: Double, cap: Double): Float =
-    ((cap - remaining) / cap).toFloat().coerceIn(0f, 1f)
-
 internal fun usedQuotaFraction(used: Double, cap: Double): Float =
     (used / cap).toFloat().coerceIn(0f, 1f)
+
+internal fun monthlyUsed(quota: RemainingQuota): Double? =
+    quota.cap?.let { (it - quota.remaining).coerceAtLeast(0.0) }
 
 internal fun formatQuotaTimestamp(instant: Instant, zone: ZoneId = ZoneId.systemDefault()): String =
     DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z", Locale.getDefault()).withZone(zone).format(instant)
@@ -133,23 +134,24 @@ fun BudgetScreen(budget: BudgetUiState, onRefresh: () -> Unit) {
                 )
             }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Monthly")
                 val monthlyCap = snapshot.monthly.cap
-                if (monthlyCap == null) {
-                    Text("Monthly credits remaining: ${formatCredits(snapshot.monthly.remaining)}")
+                val monthlyUsed = monthlyUsed(snapshot.monthly)
+                if (monthlyCap == null || monthlyUsed == null) {
+                    Text("Monthly usage unavailable")
                 } else {
                     Text(
-                        "${formatCredits(snapshot.monthly.remaining)} / " +
-                            "${formatCredits(monthlyCap)} credits remaining",
+                        "${formatCredits(monthlyUsed)} / ${formatCredits(monthlyCap)} credits used",
                     )
+                    Text("Plan-based allowance")
                     LinearProgressIndicator(
-                        progress = { consumedQuotaFraction(snapshot.monthly.remaining, monthlyCap) },
+                        progress = { usedQuotaFraction(monthlyUsed, monthlyCap) },
                         modifier = Modifier.fillMaxWidth().testTag("budget_monthly_progress"),
                     )
                 }
-            }
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Purchased credits: ${formatCredits(snapshot.purchasedCredits)}")
-                Text("Free credits: ${formatCredits(snapshot.freeCredits)}")
+                snapshot.monthlyRenewsAt
+                    ?.takeIf { it.isAfter(Instant.now()) }
+                    ?.let { Text("Renews ${formatQuotaResetTimestamp(it)}") }
             }
         }
         budget.errorMessage?.let { error ->

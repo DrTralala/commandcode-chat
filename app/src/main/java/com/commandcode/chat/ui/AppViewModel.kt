@@ -12,6 +12,7 @@ import com.commandcode.chat.SettingsStore
 import com.commandcode.chat.StreamSource
 import com.commandcode.chat.data.commandcode.ApiMessage
 import com.commandcode.chat.data.commandcode.CommandCodeException
+import com.commandcode.chat.data.commandcode.CompletionNotice
 import com.commandcode.chat.data.commandcode.StreamEvent
 import com.commandcode.chat.data.attachments.AttachmentOperations
 import com.commandcode.chat.data.database.AlternativeRequest
@@ -22,6 +23,9 @@ import com.commandcode.chat.data.security.KeyRecoveryRequired
 import com.commandcode.chat.data.security.SecureStoragePersistenceFailure
 import com.commandcode.chat.data.security.SystemPromptStore
 import com.commandcode.chat.data.security.effectiveSystemPrompt
+import com.commandcode.chat.data.service.CatalogueOrigin
+import com.commandcode.chat.data.service.ModelCatalogueCodec
+import com.commandcode.chat.data.service.ModelCatalogueSnapshot
 import com.commandcode.chat.data.service.ModelCatalogueSource
 import com.commandcode.chat.data.service.ContextWindowCatalogue
 import com.commandcode.chat.domain.ConversationTokenUsage
@@ -34,6 +38,7 @@ import com.commandcode.chat.domain.AttachmentException
 import com.commandcode.chat.domain.AttachmentFailure
 import com.commandcode.chat.domain.AttachmentPolicy
 import com.commandcode.chat.domain.AttachmentSupport
+import com.commandcode.chat.domain.ApiFamily
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.ImageAttachment
 import com.commandcode.chat.domain.MessageState
@@ -82,6 +87,9 @@ data class AppUiState(
     val keyConfigured: Boolean = false,
     val zdr: Boolean = true,
     val models: List<ChatModel> = listOf(ChatModel.SOL),
+    val modelCatalogueOrigin: CatalogueOrigin = CatalogueOrigin.BUNDLED,
+    val modelsRefreshing: Boolean = false,
+    val modelsError: String? = null,
     val selectedModel: ChatModel = ChatModel.SOL,
     val conversations: List<Conversation> = emptyList(),
     val currentConversationId: String? = null,
@@ -116,6 +124,9 @@ data class AppUiState(
         get() = currentConversationId?.let { it in deletingConversationIds } == true
 
     val contextUsage: ContextUsagePresentation get() = contextUsagePresentation(this)
+
+    val selectedModelAvailable: Boolean
+        get() = models.any { it.apiId == selectedModel.apiId }
 
     val visibleMessages: List<Message>
         get() = if (currentConversationId == activeConversationId && activeAssistantMessageId != null) {
@@ -159,13 +170,16 @@ class AppViewModel(
     private var attachmentImportJob: Job? = null
     private var attachmentImportConversationId: String? = null
     private var quotaJob: Job? = null
+    private var modelRefreshJob: Job? = null
     private val keyMutationMutex = Mutex()
     private var activeTurn: ActiveTurn? = null
     private var sendTargetConversationId: String? = null
     private var messageMutationJob: Job? = null
     private var draftGeneration = 0L
     private var attachmentActionsReady = false
-    private var pendingModels: List<ChatModel>? = null
+    private var pendingModels: ModelCatalogueSnapshot? = null
+    private var bundledContextWindows = ContextWindowCatalogue()
+    private var knownContextWindowMetadata: Map<String, Long> = emptyMap()
     private val deletingConversationIds = mutableSetOf<String>()
 
     init {
@@ -179,12 +193,27 @@ class AppViewModel(
                 recoveryMessage = API_KEY_RECOVERY_MESSAGE
                 false
             }
-            val localModels = try {
-                modelCatalogue.loadLocal().models.requireSolModel()
+            val localCatalogue = try {
+                ModelCatalogueCodec.validate(modelCatalogue.loadLocal())
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                listOf(ChatModel.SOL)
+                ModelCatalogueCodec.validate(
+                    ModelCatalogueSnapshot(
+                        schemaVersion = ModelCatalogueCodec.SUPPORTED_SCHEMA_VERSION,
+                        catalogueVersion = "bundled-fallback",
+                        generatedAt = 1L,
+                        models = listOf(ChatModel.SOL),
+                        origin = CatalogueOrigin.BUNDLED,
+                    ),
+                )
+            }
+            val persistedContextWindows = try {
+                modelCatalogue.loadKnownContextWindowMetadata()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                emptyMap()
             }
             val cachedQuota = try {
                 quota.loadCached()
@@ -200,6 +229,8 @@ class AppViewModel(
             } catch (_: Exception) {
                 ContextWindowCatalogue()
             }
+            bundledContextWindows = contextWindows
+            knownContextWindowMetadata = persistedContextWindows + contextWindowMetadata(localCatalogue.models)
             var attachmentFailure: AttachmentFailure? = null
             try {
                 attachmentOperations.initialise()
@@ -221,11 +252,12 @@ class AppViewModel(
                 loading = false,
                 recoveryMessage = recoveryMessage,
                 keyConfigured = configured,
-                models = localModels,
-                contextWindows = contextWindows,
-                selectedModel = localModels.firstOrNull {
-                    it.apiId == mutableState.value.selectedModel.apiId
-                } ?: ChatModel.SOL,
+                models = localCatalogue.models,
+                modelCatalogueOrigin = localCatalogue.origin,
+                contextWindows = contextWindowsWithModelMetadata(contextWindows, localCatalogue.models),
+                selectedModel = localCatalogue.models.firstOrNull {
+                    it.apiId == ChatModel.SOL.apiId
+                } ?: localCatalogue.models.first(),
                 budget = cachedQuota?.takeIf { configured }?.let {
                     BudgetUiState(snapshot = it, freshness = BudgetFreshness.STALE)
                 } ?: BudgetUiState(),
@@ -657,12 +689,16 @@ class AppViewModel(
     fun selectModel(model: ChatModel) {
         if (selectionIsFrozen()) return
         val currentModel = mutableState.value.models.firstOrNull { it.apiId == model.apiId } ?: return
-        if (mutableState.value.selectedModel.apiId == currentModel.apiId) return
+        if (mutableState.value.selectedModel.apiId == currentModel.apiId) {
+            dismissResolvedUnavailableModelError()
+            return
+        }
         val conversationId = mutableState.value.currentConversationId
         if (conversationId == null) {
             nextDraftGeneration()
             mutableState.value = mutableState.value.copy(selectedModel = currentModel)
             dismissResolvedModelAttachmentError()
+            dismissResolvedUnavailableModelError()
             return
         }
         if (messageMutationJob != null || mutableState.value.messageMutationBusy) return
@@ -673,6 +709,7 @@ class AppViewModel(
                 nextDraftGeneration()
                 mutableState.value = mutableState.value.copy(selectedModel = currentModel)
                 dismissResolvedModelAttachmentError()
+                dismissResolvedUnavailableModelError()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -693,6 +730,13 @@ class AppViewModel(
             AttachmentPolicy.capability(current.selectedModel.apiId).support == AttachmentSupport.DOCUMENTED
         ) {
             dismissAttachmentError()
+        }
+    }
+
+    private fun dismissResolvedUnavailableModelError() {
+        val current = mutableState.value
+        if (current.errorMessage == SELECTED_MODEL_UNAVAILABLE_MESSAGE) {
+            mutableState.value = current.copy(errorMessage = null).withBlockingPromptBanner()
         }
     }
 
@@ -778,7 +822,11 @@ class AppViewModel(
             tokenUsage = ConversationTokenUsage(),
             selectedModel = if (invalidateDraft) {
                 val modelId = mutableState.value.conversations.firstOrNull { it.id == id }?.defaultModelId
-                mutableState.value.models.firstOrNull { it.apiId == modelId } ?: mutableState.value.selectedModel
+                modelId?.let { defaultModelId ->
+                    mutableState.value.models.firstOrNull { it.apiId == defaultModelId }
+                        ?: mutableState.value.selectedModel.takeIf { it.apiId == defaultModelId }
+                        ?: ChatModel(defaultModelId, defaultModelId, ApiFamily.OPENAI_CHAT)
+                } ?: mutableState.value.selectedModel
             } else mutableState.value.selectedModel,
             messages = emptyList(),
             draftText = "",
@@ -1040,6 +1088,10 @@ class AppViewModel(
             }
             return
         }
+        if (!snapshot.selectedModelAvailable) {
+            mutableState.value = snapshot.copy(errorMessage = SELECTED_MODEL_UNAVAILABLE_MESSAGE)
+            return
+        }
         val normalText = (action as? SendAction.Normal)?.text
         if ((normalText != null && normalText.trim().isEmpty() && snapshot.pendingAttachments.isEmpty()) ||
             selectionIsFrozen(includeEdit = action !is SendAction.Alternative) ||
@@ -1127,7 +1179,10 @@ class AppViewModel(
                         registeredTurn.usage,
                     )
                     if (!registeredTurn.completionCommitted) throw TurnFailure(TurnFailureKind.COMMIT_REJECTED)
-                    finishTurn(registeredTurn, errorMessage = null)
+                    finishTurn(
+                        registeredTurn,
+                        errorMessage = completionFeedback(registeredTurn.completionNotice),
+                    )
                     refreshQuota()
                 }
             } catch (cancelled: CancellationException) {
@@ -1135,7 +1190,7 @@ class AppViewModel(
                     turn?.let { interruptSafely(it, "cancelled") }
                     finishTurn(turn, if (turn?.partial?.isNotEmpty() == true) "Response interrupted" else null)
                 } else {
-                    finishTurn(turn, null)
+                    finishTurn(turn, completionFeedback(turn.completionNotice))
                 }
                 throw cancelled
             } catch (error: Exception) {
@@ -1154,7 +1209,16 @@ class AppViewModel(
                     val failure = error.kind
                     finishTurn(turn, safeAttachmentMessage(failure), attachmentFailure = failure)
                 } else {
-                    finishTurn(turn, if (turn == null) PREPARE_FAILURE_MESSAGE else safeMessage(error))
+                    finishTurn(
+                        turn,
+                        if (turn?.completionCommitted == true) {
+                            completionFeedback(turn.completionNotice)
+                        } else if (turn == null) {
+                            PREPARE_FAILURE_MESSAGE
+                        } else {
+                            safeMessage(error)
+                        },
+                    )
                 }
             } finally {
                 apiKey?.fill('\u0000')
@@ -1294,6 +1358,7 @@ class AppViewModel(
                     }
                 }
                 is StreamEvent.Usage -> turn.usage = event.usage
+                is StreamEvent.Notice -> turn.completionNotice = event.reason
                 StreamEvent.Done -> phase = StreamPhase.DONE
                 is StreamEvent.Error -> throw TurnFailure(TurnFailureKind.FRAME_ERROR)
             }
@@ -1333,28 +1398,38 @@ class AppViewModel(
         }
     }
 
-    private fun refreshModels() {
-        viewModelScope.launch {
+    fun refreshModels() {
+        if (modelRefreshJob?.isActive == true) return
+        mutableState.value = mutableState.value.copy(modelsRefreshing = true, modelsError = null)
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             try {
-                val models = modelCatalogue.refresh().models.requireSolModel()
+                val snapshot = ModelCatalogueCodec.validate(modelCatalogue.refresh())
                 if (selectionIsFrozen()) {
-                    pendingModels = models
+                    pendingModels = snapshot
                 } else {
-                    publishModels(models)
+                    publishModels(snapshot)
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
-                // The validated local catalogue remains active when refresh fails.
+            } catch (error: Exception) {
+                mutableState.value = mutableState.value.copy(modelsError = safeModelsMessage(error))
+            } finally {
+                if (modelRefreshJob === currentCoroutineContext()[Job]) {
+                    modelRefreshJob = null
+                    mutableState.value = mutableState.value.copy(modelsRefreshing = false)
+                    applyPendingModelsIfIdle()
+                }
             }
         }
+        modelRefreshJob = job
+        job.start()
     }
 
     private fun applyPendingModelsIfIdle() {
         if (selectionIsFrozen()) return
-        pendingModels?.let { models ->
+        pendingModels?.let { snapshot ->
             pendingModels = null
-            publishModels(models)
+            publishModels(snapshot)
         }
     }
 
@@ -1365,12 +1440,57 @@ class AppViewModel(
         applyPendingModelsIfIdle()
     }
 
-    private fun publishModels(models: List<ChatModel>) {
-        val selected = models.firstOrNull {
-            it.apiId == mutableState.value.selectedModel.apiId
-        } ?: ChatModel.SOL
-        if (selected.apiId != mutableState.value.selectedModel.apiId) nextDraftGeneration()
-        mutableState.value = mutableState.value.copy(models = models, selectedModel = selected)
+    private fun publishModels(snapshot: ModelCatalogueSnapshot) {
+        val current = mutableState.value
+        val selected = snapshot.models.firstOrNull {
+            it.apiId == current.selectedModel.apiId
+        } ?: current.selectedModel
+        knownContextWindowMetadata = knownContextWindowMetadata + contextWindowMetadata(snapshot.models)
+        mutableState.value = current.copy(
+            models = snapshot.models,
+            selectedModel = selected,
+            modelCatalogueOrigin = snapshot.origin,
+            contextWindows = contextWindowsWithModelMetadata(
+                bundled = bundledContextWindows,
+                models = snapshot.models,
+                measuredModelId = current.tokenUsage.measurement?.modelId,
+                previous = current.contextWindows,
+            ),
+        )
+    }
+
+    private fun contextWindowsWithModelMetadata(
+        bundled: ContextWindowCatalogue,
+        models: List<ChatModel>,
+        measuredModelId: String? = null,
+        previous: ContextWindowCatalogue = ContextWindowCatalogue(),
+    ): ContextWindowCatalogue {
+        val availableModelIds = models.mapTo(hashSetOf()) { it.apiId }
+        val retiredCapacities = knownContextWindowMetadata.filter { (id, tokens) ->
+            id !in availableModelIds && tokens > 0
+        }
+        val apiCapacities = contextWindowMetadata(models)
+        // Retain only the last measured model's known capacity; retired models never re-enter choices.
+        val retainedMeasurementCapacity = measuredModelId
+            ?.takeIf { id -> models.none { it.apiId == id } }
+            ?.let { id -> previous.limitFor(id)?.let { id to it } }
+            ?.let { mapOf(it) }
+            .orEmpty()
+        return bundled.copy(limits = bundled.limits + retiredCapacities + apiCapacities + retainedMeasurementCapacity)
+    }
+
+    private fun contextWindowMetadata(models: List<ChatModel>): Map<String, Long> = models.mapNotNull { model ->
+        model.contextWindowTokens?.takeIf { it > 0 }?.let { model.apiId to it }
+    }.toMap()
+
+    private fun safeModelsMessage(error: Exception): String = when ((error as? ServiceException)?.kind) {
+        ServiceException.Kind.UNAUTHORIZED -> "Model catalogue request was not authorised."
+        ServiceException.Kind.FORBIDDEN -> "Model catalogue access is forbidden."
+        ServiceException.Kind.RATE_LIMITED -> "Model catalogue is temporarily rate limited."
+        ServiceException.Kind.TIMEOUT -> "Model catalogue request timed out. Try again."
+        ServiceException.Kind.BAD_RESPONSE -> "Model catalogue returned an invalid response."
+        ServiceException.Kind.UNAVAILABLE -> "Model catalogue service is unavailable. Try again."
+        null -> "Models could not be refreshed. Try again."
     }
 
     private fun safeQuotaMessage(error: Exception): String = when ((error as? ServiceException)?.kind) {
@@ -1381,10 +1501,6 @@ class AppViewModel(
         ServiceException.Kind.BAD_RESPONSE -> "Quota service returned an invalid response."
         ServiceException.Kind.UNAVAILABLE -> "Quota service is unavailable. Try again."
         null -> "Quota could not be refreshed. Try again."
-    }
-
-    private fun List<ChatModel>.requireSolModel(): List<ChatModel> = also { models ->
-        require(models.any { it == ChatModel.SOL }) { "The active catalogue must contain GPT-5.6 Sol" }
     }
 
     private fun safeMessage(error: Exception): String = when (error) {
@@ -1401,6 +1517,13 @@ class AppViewModel(
         }
         is IOException -> "Network stream interrupted. Partial response saved. Try again."
         else -> "The request could not be completed. Try again."
+    }
+
+    private fun completionFeedback(notice: CompletionNotice?): String? = when (notice) {
+        CompletionNotice.OUTPUT_LIMIT -> "Response reached the output limit."
+        CompletionNotice.CONTEXT_LIMIT -> "Response reached the model context limit."
+        CompletionNotice.REFUSAL -> "The model declined this request."
+        null -> null
     }
 
     private fun attachmentFailureOf(error: Throwable, fallback: AttachmentFailure): AttachmentFailure = when (error) {
@@ -1435,6 +1558,7 @@ class AppViewModel(
         val draftImages: List<ImageAttachment>,
         val partial: StringBuilder = StringBuilder(),
         var usage: TokenUsage? = null,
+        var completionNotice: CompletionNotice? = null,
         var completionCommitted: Boolean = false,
     )
 
@@ -1460,6 +1584,8 @@ class AppViewModel(
         private const val API_KEY_CLEAR_FAILURE_MESSAGE = "API key could not be cleared. Try again."
         private const val QUOTA_CACHE_CLEAR_FAILURE_MESSAGE = "Saved quota could not be cleared. Try again."
         private const val PREPARE_FAILURE_MESSAGE = "The request could not be completed. Try again."
+        private const val SELECTED_MODEL_UNAVAILABLE_MESSAGE =
+            "Selected model is no longer available. Choose another model."
         private const val ATTACHMENT_CLEANUP_WARNING =
             "Conversation deleted, but encrypted attachment cleanup could not be completed."
         private const val USER_ROLE = "USER"

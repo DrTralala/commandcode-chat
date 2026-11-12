@@ -5,6 +5,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SseParserTest {
+    @Test fun `openai parser remains usable through shared stream parser contract`() {
+        val parser: StreamParser = SseParser()
+        assertEquals(listOf(StreamEvent.Delta("Hi")), parser.acceptLine("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}"))
+        assertEquals(listOf(StreamEvent.Done), parser.acceptLine("data: [DONE]"))
+        assertTrue(parser.finish().isEmpty())
+    }
+
     @Test fun `null answer during reasoning is not rendered as literal null`() {
         val parser = SseParser()
         assertTrue(parser.acceptLine("""data: {"choices":[{"delta":{"content":null,"reasoning_content":"private"}}]}""").isEmpty())

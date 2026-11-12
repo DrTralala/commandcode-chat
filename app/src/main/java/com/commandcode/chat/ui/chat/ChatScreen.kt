@@ -54,6 +54,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.commandcode.chat.R
 import com.commandcode.chat.data.database.Message
+import com.commandcode.chat.data.service.CatalogueOrigin
 import com.commandcode.chat.domain.ChatModel
 import com.commandcode.chat.domain.formatStorageBytes
 import com.commandcode.chat.domain.ImageAttachment
@@ -65,6 +66,12 @@ internal fun modelOptionTestTag(apiId: String): String = buildString {
     apiId.forEach { character ->
         append(if (character.isLetterOrDigit()) character else '_')
     }
+}
+
+internal fun modelCatalogueStatusLabel(origin: CatalogueOrigin): String = when (origin) {
+    CatalogueOrigin.LIVE -> "Live models"
+    CatalogueOrigin.CACHED -> "Cached models"
+    CatalogueOrigin.BUNDLED -> "Bundled models"
 }
 
 internal enum class MessageSide { START, END }
@@ -87,6 +94,7 @@ internal fun sendButtonEnabled(state: AppUiState): Boolean =
     !state.messageActionsBusy &&
         state.messageEdit == null &&
         state.systemPromptLoaded &&
+        state.selectedModelAvailable &&
         (state.draftText.isNotBlank() || state.pendingAttachments.isNotEmpty())
 
 internal data class MessageActionAvailability(
@@ -94,6 +102,7 @@ internal data class MessageActionAvailability(
     val editEnabled: Boolean,
     val retryEnabled: Boolean,
     val failedActionsEnabled: Boolean,
+    val failedRetryEnabled: Boolean,
     val branchEnabled: Boolean,
 )
 
@@ -110,8 +119,9 @@ internal fun messageActionAvailability(state: AppUiState, message: Message): Mes
         // Keep this enabled for another editable message while an editor is open:
         // AppRoot uses the callback to raise the discard-navigation guard.
         editEnabled = mutationIdle && editable,
-        retryEnabled = mutationIdle && !editing && assistantRetryable,
+        retryEnabled = mutationIdle && !editing && assistantRetryable && state.selectedModelAvailable,
         failedActionsEnabled = mutationIdle && !editing && failed,
+        failedRetryEnabled = mutationIdle && !editing && failed && state.selectedModelAvailable,
         // Branch clicks also need to reach AppRoot while editing so the same
         // discard-navigation guard can be shown before selecting a sibling.
         branchEnabled = mutationIdle,
@@ -223,6 +233,7 @@ fun ChatScreen(
     onSubmitMessageEdit: () -> Unit = {},
     onCancelMessageEdit: () -> Unit = {},
     onSelectAlternative: (String) -> Unit = {},
+    onRefreshModels: () -> Unit = {},
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val selectionOwner = rememberMessageSelectionOwner()
@@ -294,6 +305,29 @@ fun ChatScreen(
                         onDismissRequest = { menuOpen = false },
                         modifier = Modifier.testTag("model_menu"),
                     ) {
+                        Text(
+                            text = modelCatalogueStatusLabel(state.modelCatalogueOrigin),
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                .testTag("model_catalogue_status"),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (state.modelsRefreshing) {
+                            Text(
+                                "Refreshing models…",
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        state.modelsError?.let { error ->
+                            Text(
+                                error,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
                         state.models.forEach { model ->
                             DropdownMenuItem(
                                 text = { Text(model.displayName) },
@@ -307,6 +341,12 @@ fun ChatScreen(
                                     .semantics { contentDescription = "Use ${model.displayName}" },
                             )
                         }
+                        DropdownMenuItem(
+                            text = { Text("Refresh models") },
+                            onClick = onRefreshModels,
+                            enabled = !state.modelsRefreshing,
+                            modifier = Modifier.testTag("model_refresh"),
+                        )
                     }
                 }
                 IconButton(
@@ -372,7 +412,9 @@ fun ChatScreen(
                         editEnabled = actionAvailability.editEnabled,
                         retryEnabled = actionAvailability.retryEnabled,
                         failedActionsEnabled = actionAvailability.failedActionsEnabled,
+                        failedRetryEnabled = actionAvailability.failedRetryEnabled,
                         branchActionsEnabled = actionAvailability.branchEnabled,
+                        editSubmitEnabled = state.selectedModelAvailable,
                         messageEdit = state.messageEdit,
                         onEditChange = onMessageEditChange,
                         onStartEdit = { onStartMessageEdit(message.id) },
@@ -402,11 +444,22 @@ fun ChatScreen(
                 }
             }
         }
-        if (state.pendingAttachments.isNotEmpty() || state.attachmentError != null || state.errorMessage != null) {
+        if (state.pendingAttachments.isNotEmpty() || state.attachmentError != null || state.errorMessage != null ||
+            !state.selectedModelAvailable
+        ) {
             LazyColumn(
                 modifier = Modifier.fillMaxWidth().heightIn(max = supportHeight).testTag("pending_attachments"),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                if (!state.selectedModelAvailable) {
+                    item(key = "model_unavailable") {
+                        Text(
+                            "This model is no longer available. Choose another model.",
+                            modifier = Modifier.testTag("model_unavailable"),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
                 state.attachmentError?.let { failure ->
                     item(key = "attachment_error") {
                         AttachmentErrorBox(failure) {
