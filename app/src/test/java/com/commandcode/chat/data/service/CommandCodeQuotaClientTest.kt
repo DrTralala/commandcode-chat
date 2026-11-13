@@ -94,6 +94,33 @@ class CommandCodeQuotaClientTest {
     }
 
     @Test
+    fun keepsValidQuotaWhenRollingResetTimestampsAreZeroOrNegative() = runBlocking {
+        val unavailableResetBodies = listOf(
+            CURRENT_CREDITS_JSON
+                .replace("1800000001234", "0")
+                .replace("1800000005678", "0"),
+            CURRENT_CREDITS_JSON
+                .replace("1800000001234", "-1")
+                .replace("1800000005678", "-1"),
+        )
+
+        unavailableResetBodies.forEach { body ->
+            val quota = clientFor(body).fetchQuota(KEY)
+
+            assertEquals("individual-goat", quota.planId)
+            assertEquals(RemainingQuota(42.5, 70.0), quota.monthly)
+            assertEquals(4.5, quota.fiveHour?.used ?: -1.0, 0.0)
+            assertEquals(14.0, quota.fiveHour?.cap ?: -1.0, 0.0)
+            assertNull(quota.fiveHour?.resetAt)
+            assertEquals(22.75, quota.weekly?.used ?: -1.0, 0.0)
+            assertEquals(35.0, quota.weekly?.cap ?: -1.0, 0.0)
+            assertNull(quota.weekly?.resetAt)
+            assertEquals(9.5, quota.purchasedCredits, 0.0)
+            assertEquals(0.0, quota.freeCredits, 0.0)
+        }
+    }
+
+    @Test
     fun subscriptionRenewalUsesTheSameInstantAsTheQuotaSnapshot() = runBlocking {
         val now = Instant.parse("2026-11-04T00:00:00Z")
         val clock = object : Clock() {
@@ -277,8 +304,8 @@ class CommandCodeQuotaClientTest {
     }
 
     @Test
-    fun rejectsNonIntegralNonPositiveAndOverflowingResetTimestamps() = runBlocking {
-        val invalidTimestamps = listOf("1.5", "0", "-1", "9223372036854775808", "1e10000")
+    fun rejectsFractionalAndOverflowingResetTimestamps() = runBlocking {
+        val invalidTimestamps = listOf("1.5", "0.5", "-0.5", "9223372036854775808", "1e10000")
         invalidTimestamps.forEachIndexed { index, timestamp ->
             assertBadResponse(
                 CURRENT_CREDITS_JSON.replace("1800000001234", timestamp),

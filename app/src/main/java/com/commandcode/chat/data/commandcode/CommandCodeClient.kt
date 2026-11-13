@@ -15,7 +15,11 @@ import okhttp3.Request
 import okhttp3.Response
 import okio.Buffer
 import okio.BufferedSource
+import org.json.JSONException
+import org.json.JSONObject
+import org.json.JSONTokener
 import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 sealed class CommandCodeException(message: String? = null) : IOException(message) {
@@ -23,6 +27,7 @@ sealed class CommandCodeException(message: String? = null) : IOException(message
     class Forbidden : CommandCodeException("API access is forbidden")
     class ZdrUnavailable : CommandCodeException("ZDR is unavailable")
     class RateLimited : CommandCodeException("Request rate or plan limit reached")
+    class InsufficientCredits : CommandCodeException("Insufficient Command Code credits")
     class ServerFailure : CommandCodeException("Command Code service failure")
 }
 
@@ -51,14 +56,16 @@ class CommandCodeClient(
                     owner.use { ownedResponse ->
                         if (!ownedResponse.isSuccessful) {
                             try {
-                                val bodyPrefix = if (ownedResponse.code == 422) {
+                                val bodyPrefix = if (ownedResponse.code == 400 || ownedResponse.code == 422) {
                                     readBoundedErrorBody(ownedResponse)
                                 } else {
                                     null
                                 }
                                 close(responseException(ownedResponse.code, bodyPrefix))
                             } catch (e: IOException) {
-                                close(e)
+                                close(
+                                    if (ownedResponse.code == 400) CommandCodeException.ServerFailure() else e,
+                                )
                             }
                             return@use
                         }
@@ -141,26 +148,167 @@ class CommandCodeClient(
                 }
                 .build()
         }
-        private fun responseException(code: Int, body: String?): CommandCodeException = when {
+        private fun responseException(code: Int, body: BoundedErrorBody?): CommandCodeException = when {
             code == 401 -> CommandCodeException.Unauthorized()
             code == 403 -> CommandCodeException.Forbidden()
-            code == 422 && body?.contains("cmd_zdr_no_providers") == true -> CommandCodeException.ZdrUnavailable()
+            code == 400 && body?.complete == true && isInsufficientCreditsError(body.text) ->
+                CommandCodeException.InsufficientCredits()
+            code == 422 && body?.text?.contains("cmd_zdr_no_providers") == true -> CommandCodeException.ZdrUnavailable()
             code == 429 -> CommandCodeException.RateLimited()
             code in 500..599 -> CommandCodeException.ServerFailure()
             else -> CommandCodeException.ServerFailure()
         }
 
-        private fun readBoundedErrorBody(response: Response): String? {
+        private fun isInsufficientCreditsError(body: String): Boolean {
+            if (!StrictJsonValidator(body).isValid()) return false
+            return try {
+                val tokener = JSONTokener(body)
+                val root = tokener.nextValue() as? JSONObject ?: return false
+                if (tokener.nextClean() != '\u0000') return false
+                val error = root.optJSONObject("error") ?: return false
+                if (error.opt("type") != "invalid_request_error") return false
+                val message = error.opt("message") as? String ?: return false
+                val normalised = message.lowercase(Locale.ROOT)
+                normalised.contains("insufficient credits") && normalised.contains("purchase more credits")
+            } catch (_: JSONException) {
+                false
+            }
+        }
+
+        private class StrictJsonValidator(private val input: String) {
+            private var offset = 0
+
+            fun isValid(): Boolean {
+                skipWhitespace()
+                if (!readValue(0)) return false
+                skipWhitespace()
+                return offset == input.length
+            }
+
+            private fun readValue(depth: Int): Boolean {
+                if (depth > MAX_JSON_NESTING) return false
+                skipWhitespace()
+                return when (input.getOrNull(offset)) {
+                    '{' -> readObject(depth)
+                    '[' -> readArray(depth)
+                    '"' -> readString()
+                    't' -> readLiteral("true")
+                    'f' -> readLiteral("false")
+                    'n' -> readLiteral("null")
+                    else -> readNumber()
+                }
+            }
+
+            private fun readObject(depth: Int): Boolean {
+                if (!consume('{')) return false
+                skipWhitespace()
+                if (consume('}')) return true
+                while (true) {
+                    if (!readString()) return false
+                    skipWhitespace()
+                    if (!consume(':') || !readValue(depth + 1)) return false
+                    skipWhitespace()
+                    if (consume('}')) return true
+                    if (!consume(',')) return false
+                    skipWhitespace()
+                }
+            }
+
+            private fun readArray(depth: Int): Boolean {
+                if (!consume('[')) return false
+                skipWhitespace()
+                if (consume(']')) return true
+                while (true) {
+                    if (!readValue(depth + 1)) return false
+                    skipWhitespace()
+                    if (consume(']')) return true
+                    if (!consume(',')) return false
+                }
+            }
+
+            private fun readString(): Boolean {
+                if (!consume('"')) return false
+                while (offset < input.length) {
+                    val character = input[offset++]
+                    when {
+                        character == '"' -> return true
+                        character == '\\' -> {
+                            if (offset >= input.length) return false
+                            when (input[offset++]) {
+                                '"', '\\', '/' , 'b', 'f', 'n', 'r', 't' -> Unit
+                                'u' -> repeat(4) {
+                                    if (offset >= input.length || input[offset].digitToIntOrNull(16) == null) return false
+                                    offset++
+                                }
+                                else -> return false
+                            }
+                        }
+                        character.code < 0x20 -> return false
+                    }
+                }
+                return false
+            }
+
+            private fun readNumber(): Boolean {
+                val start = offset
+                consume('-')
+                if (consume('0')) {
+                    if (input.getOrNull(offset) in '0'..'9') return false
+                } else {
+                    if (input.getOrNull(offset) !in '1'..'9') return false
+                    while (input.getOrNull(offset) in '0'..'9') offset++
+                }
+                if (consume('.')) {
+                    if (input.getOrNull(offset) !in '0'..'9') return false
+                    while (input.getOrNull(offset) in '0'..'9') offset++
+                }
+                if (consume('e') || consume('E')) {
+                    if (!consume('+')) consume('-')
+                    if (input.getOrNull(offset) !in '0'..'9') return false
+                    while (input.getOrNull(offset) in '0'..'9') offset++
+                }
+                return offset > start
+            }
+
+            private fun readLiteral(value: String): Boolean {
+                if (!input.startsWith(value, offset)) return false
+                offset += value.length
+                return true
+            }
+
+            private fun consume(character: Char): Boolean {
+                if (input.getOrNull(offset) != character) return false
+                offset++
+                return true
+            }
+
+            private fun skipWhitespace() {
+                while (true) {
+                    when (input.getOrNull(offset)) {
+                        ' ', '\t', '\n', '\r' -> offset++
+                        else -> return
+                    }
+                }
+            }
+        }
+
+        private fun readBoundedErrorBody(response: Response): BoundedErrorBody {
             val source = response.body.source()
             val buffer = Buffer()
             var remaining = MAX_ERROR_BODY_BYTES
+            var complete = false
             while (remaining > 0L) {
                 val read = source.read(buffer, minOf(remaining, 8_192L))
-                if (read == -1L) break
+                if (read == -1L) {
+                    complete = true
+                    break
+                }
                 remaining -= read
             }
-            return buffer.readUtf8()
+            return BoundedErrorBody(buffer.readUtf8(), complete)
         }
+
+        private data class BoundedErrorBody(val text: String, val complete: Boolean)
 
         private fun readBoundedMessagesLine(source: BufferedSource): String? {
             val newline = source.indexOf('\n'.code.toByte(), 0L, MessagesSseParser.MAX_FRAME_BYTES + 1L)
@@ -177,6 +325,7 @@ class CommandCodeClient(
         }
 
         private const val MAX_ERROR_BODY_BYTES = 16_384L
+        private const val MAX_JSON_NESTING = 64
     }
 
     private class MessagesLineTooLongException : IOException()

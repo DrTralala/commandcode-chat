@@ -161,13 +161,13 @@ fun BudgetScreen(budget: BudgetUiState, onRefresh: () -> Unit) {
 }
 
 @Composable
-private fun QuotaWindow(label: String, used: Double, cap: Double, resetAt: Instant, testTag: String) {
+private fun QuotaWindow(label: String, used: Double, cap: Double, resetAt: Instant?, testTag: String) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text("$label: ${formatCredits(used)} / ${formatCredits(cap)} credits used")
         LinearProgressIndicator(
             progress = { usedQuotaFraction(used, cap) },
             modifier = Modifier.fillMaxWidth().testTag(testTag),
         )
-        Text("Resets: ${formatQuotaResetTimestamp(resetAt)}")
+        resetAt?.let { Text("Resets: ${formatQuotaResetTimestamp(it)}") }
     }
 }

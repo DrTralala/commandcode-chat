@@ -445,6 +445,108 @@ class CommandCodeClientTest {
         }
     }
 
+    @Test fun `insufficient credits 400 fixture maps on both protocol routes`() = runBlocking {
+        val fixture = """{"error":{"type":"invalid_request_error","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service."}}"""
+
+        listOf(ChatModel.SOL, messagesModel).forEach { model ->
+            val factory = RecordingCallFactory()
+            val result = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching {
+                    withTimeout(2_000) {
+                        CommandCodeClient(callFactory = factory)
+                            .stream(charArrayOf('k'), model, listOf(ApiMessage("user", "hello")))
+                            .toList()
+                    }
+                }
+            }
+            val call = factory.awaitCall()
+            val body = CloseTrackingResponseBody(fixture)
+            call.respond(response(call.request(), 400, body))
+
+            assertEquals(
+                CommandCodeException.InsufficientCredits::class.java,
+                result.await().exceptionOrNull()?.javaClass,
+            )
+            assertEquals(1, call.cancelCount)
+            assertEquals(1, body.closeCount)
+        }
+    }
+
+    @Test fun `unrecognised and truncated 400 bodies remain server failures`() = runBlocking {
+        val observedMessage = "You have insufficient credits to make this request. Please purchase more credits to continue using the service."
+        val cases = listOf(
+            "not json",
+            """{"error":{"type":"other_error","message":"$observedMessage"}}""",
+            """{"error":{"type":"invalid_request_error","message":"Please check the request fields."}}""",
+            """{"error":{"type":"invalid_request_error","message":"$observedMessage"}""",
+            """{"error":{"type":"invalid_request_error","message":"$observedMessage"}} trailing data""",
+            "{error: {type: 'invalid_request_error', message: '$observedMessage'}}",
+        )
+
+        cases.forEach { content ->
+            val factory = RecordingCallFactory()
+            val result = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching {
+                    withTimeout(2_000) {
+                        CommandCodeClient(callFactory = factory)
+                            .stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello")))
+                            .toList()
+                    }
+                }
+            }
+            val call = factory.awaitCall()
+            call.respond(response(call.request(), 400, content.toResponseBody()))
+
+            assertEquals(CommandCodeException.ServerFailure::class.java, result.await().exceptionOrNull()?.javaClass)
+        }
+
+        val validPrefixOverLimit = """{"error":{"type":"invalid_request_error","message":"$observedMessage"}}""" +
+            " ".repeat(16_384)
+        val oversizedBody = LargeTrackingResponseBody(validPrefixOverLimit)
+        val factory = RecordingCallFactory()
+        val result = async(start = CoroutineStart.UNDISPATCHED) {
+            runCatching {
+                withTimeout(2_000) {
+                    CommandCodeClient(callFactory = factory)
+                        .stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello")))
+                        .toList()
+                }
+            }
+        }
+        val call = factory.awaitCall()
+        call.respond(response(call.request(), 400, oversizedBody))
+
+        assertEquals(CommandCodeException.ServerFailure::class.java, result.await().exceptionOrNull()?.javaClass)
+        assertTrue("read ${oversizedBody.bytesRead} bytes", oversizedBody.bytesRead <= 16_384L)
+        assertEquals(1, oversizedBody.closeCount)
+    }
+
+    @Test fun `credit-like bodies do not override other HTTP status mappings`() = runBlocking {
+        val fixture = """{"error":{"type":"invalid_request_error","message":"You have insufficient credits to make this request. Please purchase more credits to continue using the service."}}"""
+        val cases = listOf(
+            Triple(403, CommandCodeException.Forbidden::class.java, "403 stays forbidden"),
+            Triple(429, CommandCodeException.RateLimited::class.java, "429 stays rate limited"),
+            Triple(500, CommandCodeException.ServerFailure::class.java, "500 stays server failure"),
+        )
+
+        cases.forEach { (code, expectedType, label) ->
+            val factory = RecordingCallFactory()
+            val result = async(start = CoroutineStart.UNDISPATCHED) {
+                runCatching {
+                    withTimeout(2_000) {
+                        CommandCodeClient(callFactory = factory)
+                            .stream(charArrayOf('k'), messagesModel, listOf(ApiMessage("user", "hello")))
+                            .toList()
+                    }
+                }
+            }
+            val call = factory.awaitCall()
+            call.respond(response(call.request(), code, fixture.toResponseBody()))
+
+            assertEquals(label, expectedType, result.await().exceptionOrNull()?.javaClass)
+        }
+    }
+
     @Test fun `non-zdr status does not read or leak error body content`() = runBlocking {
         val secret = "SENTINEL_SECRET_RESPONSE_BODY"
         val body = ThrowingTrackingResponseBody(secret)

@@ -61,7 +61,7 @@ internal object CommandCodeQuotaResponseCodec {
     private fun windowValue(window: JSONObject): UsedQuota = UsedQuota(
         used = amountValue(window, "used"),
         cap = capValue(window, "cap"),
-        resetAt = Instant.ofEpochMilli(epochMillis(window, "resetAt")),
+        resetAt = resetInstant(window, "resetAt"),
     )
 
     private fun booleanValue(objectValue: JSONObject, key: String): Boolean {
@@ -70,15 +70,14 @@ internal object CommandCodeQuotaResponseCodec {
         return value
     }
 
-    private fun epochMillis(objectValue: JSONObject, key: String): Long {
+    private fun resetInstant(objectValue: JSONObject, key: String): Instant? {
         val value = decimalValue(objectValue, key)
         val millis = try {
             value.longValueExact()
         } catch (exception: ArithmeticException) {
             throw IllegalArgumentException("$key must be an integer millisecond timestamp", exception)
         }
-        require(millis > 0) { "$key must be positive" }
-        return millis
+        return if (millis > 0) Instant.ofEpochMilli(millis) else null
     }
 
     private fun amountValue(objectValue: JSONObject, key: String): Double =

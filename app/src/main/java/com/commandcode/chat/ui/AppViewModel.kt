@@ -1508,6 +1508,8 @@ class AppViewModel(
         is CommandCodeException.Forbidden -> "API access is forbidden"
         is CommandCodeException.ZdrUnavailable -> "No ZDR-capable provider is available"
         is CommandCodeException.RateLimited -> "Request rate or plan limit reached"
+        is CommandCodeException.InsufficientCredits ->
+            "Command Code reports insufficient credits for this request. Check your plan usage and available credits in Command Code before retrying."
         is CommandCodeException.ServerFailure -> "Command Code service failure"
         is AttachmentException -> safeAttachmentMessage(error.kind)
         is TurnFailure -> when (error.kind) {

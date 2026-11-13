@@ -40,7 +40,7 @@ interface ModelCatalogueStore {
 
 data class RemainingQuota(val remaining: Double, val cap: Double?)
 
-data class UsedQuota(val used: Double, val cap: Double, val resetAt: Instant)
+data class UsedQuota(val used: Double, val cap: Double, val resetAt: Instant?)
 
 data class QuotaSnapshot(
     val fetchedAt: Instant,
@@ -233,11 +233,12 @@ internal object ModelCatalogueCodec {
 }
 
 internal object QuotaSnapshotCodec {
-    const val SUPPORTED_SCHEMA_VERSION = 3
+    const val SUPPORTED_SCHEMA_VERSION = 4
     const val MAX_QUOTA_BYTES = 65_536
 
     private const val LEGACY_SCHEMA_VERSION = 1
     private const val PREVIOUS_SCHEMA_VERSION = 2
+    private const val PREVIOUS_RENEWAL_SCHEMA_VERSION = 3
 
     fun validate(snapshot: QuotaSnapshot): QuotaSnapshot {
         require(epochMillis(snapshot.fetchedAt, "fetchedAt") > 0) {
@@ -314,8 +315,21 @@ internal object QuotaSnapshotCodec {
 
     private fun decodeObject(root: JSONObject): QuotaSnapshot = when (intValue(root, "schemaVersion")) {
         LEGACY_SCHEMA_VERSION -> decodeLegacyObject(root)
-        PREVIOUS_SCHEMA_VERSION -> decodeCurrentObject(root, includesRenewal = false)
-        SUPPORTED_SCHEMA_VERSION -> decodeCurrentObject(root, includesRenewal = true)
+        PREVIOUS_SCHEMA_VERSION -> decodeCurrentObject(
+            root,
+            includesRenewal = false,
+            nullableWindowResets = false,
+        )
+        PREVIOUS_RENEWAL_SCHEMA_VERSION -> decodeCurrentObject(
+            root,
+            includesRenewal = true,
+            nullableWindowResets = false,
+        )
+        SUPPORTED_SCHEMA_VERSION -> decodeCurrentObject(
+            root,
+            includesRenewal = true,
+            nullableWindowResets = true,
+        )
         else -> throw IllegalArgumentException("Unsupported quota schema")
     }
 
@@ -359,7 +373,11 @@ internal object QuotaSnapshotCodec {
         )
     }
 
-    private fun decodeCurrentObject(root: JSONObject, includesRenewal: Boolean): QuotaSnapshot {
+    private fun decodeCurrentObject(
+        root: JSONObject,
+        includesRenewal: Boolean,
+        nullableWindowResets: Boolean,
+    ): QuotaSnapshot {
         val expectedKeys = setOf(
             "schemaVersion",
             "fetchedAt",
@@ -391,8 +409,12 @@ internal object QuotaSnapshotCodec {
                     remaining = amountValue(monthly, "remaining"),
                     cap = nullableCapValue(monthly, "cap"),
                 ),
-                fiveHour = windows?.let { decodeWindow(objectValue(it, "fiveHour")) },
-                weekly = windows?.let { decodeWindow(objectValue(it, "weekly")) },
+                fiveHour = windows?.let {
+                    decodeWindow(objectValue(it, "fiveHour"), allowNullReset = nullableWindowResets)
+                },
+                weekly = windows?.let {
+                    decodeWindow(objectValue(it, "weekly"), allowNullReset = nullableWindowResets)
+                },
                 purchasedCredits = amountValue(root, "purchasedCredits"),
                 freeCredits = amountValue(root, "freeCredits"),
             ),
@@ -402,23 +424,25 @@ internal object QuotaSnapshotCodec {
     private fun encodeWindow(window: UsedQuota, label: String): JSONObject = JSONObject()
         .put("used", window.used)
         .put("cap", window.cap)
-        .put("resetAt", epochMillis(window.resetAt, "$label.resetAt"))
+        .put("resetAt", window.resetAt?.let { epochMillis(it, "$label.resetAt") } ?: JSONObject.NULL)
 
-    private fun decodeWindow(window: JSONObject): UsedQuota {
+    private fun decodeWindow(window: JSONObject, allowNullReset: Boolean = false): UsedQuota {
         requireKeys(window, setOf("used", "cap", "resetAt"))
         return UsedQuota(
             used = amountValue(window, "used"),
             cap = capValue(window, "cap"),
-            resetAt = Instant.ofEpochMilli(epochMillis(window, "resetAt")),
+            resetAt = if (allowNullReset) {
+                nullableInstantValue(window, "resetAt")
+            } else {
+                Instant.ofEpochMilli(epochMillis(window, "resetAt"))
+            },
         )
     }
 
     private fun validateWindow(window: UsedQuota, label: String) {
         requireAmount(window.used, "$label.used")
         requireCap(window.cap, "$label.cap")
-        require(epochMillis(window.resetAt, "$label.resetAt") > 0) {
-            "$label.resetAt must be positive"
-        }
+        window.resetAt?.let { epochMillis(it, "$label.resetAt") }
     }
 
     private fun objectValue(objectValue: JSONObject, key: String): JSONObject {

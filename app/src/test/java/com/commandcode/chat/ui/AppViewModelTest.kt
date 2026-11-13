@@ -740,6 +740,32 @@ class AppViewModelTest {
     }
 
     @Test
+    fun insufficientCreditsUsesFixedMessageAndInterruptsWithoutCompletingOrReportingContextLimit() = runTest(dispatcher) {
+        val chats = FakeChats()
+        var attempts = 0
+        val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flow {
+            attempts += 1
+            throw CommandCodeException.InsufficientCredits()
+        } })
+        configureKey(viewModel)
+
+        viewModel.send("hello")
+        advanceUntilIdle()
+
+        assertEquals(
+            "Command Code reports insufficient credits for this request. Check your plan usage and available credits in Command Code before retrying.",
+            viewModel.state.value.errorMessage,
+        )
+        assertEquals(1, attempts)
+        assertNull(chats.completedText)
+        assertEquals("", chats.interruptedText)
+        assertFalse(chats.usageCompleteByRequest.values.single())
+        assertEquals("INTERRUPTED", chats.assistantStatus("assistant-1"))
+        assertFalse(viewModel.state.value.errorMessage!!.contains("context", ignoreCase = true))
+        viewModel.viewModelScope.cancel()
+    }
+
+    @Test
     fun providerFrameCodeIsNeverInterpolatedIntoErrorText() = runTest(dispatcher) {
         val chats = FakeChats()
         val viewModel = viewModel(chats, StreamSource { _, _, _, _ -> flowOf(

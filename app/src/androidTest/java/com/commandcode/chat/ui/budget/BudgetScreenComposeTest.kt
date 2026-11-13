@@ -11,6 +11,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.commandcode.chat.data.service.QuotaSnapshotCodec
 import com.commandcode.chat.data.service.QuotaSnapshot
 import com.commandcode.chat.data.service.RemainingQuota
 import com.commandcode.chat.data.service.UsedQuota
@@ -86,6 +87,29 @@ class BudgetScreenComposeTest {
         compose.onAllNodesWithTag("budget_monthly_progress").assertCountEquals(0)
         compose.onAllNodesWithTag("budget_five_hour_progress").assertCountEquals(0)
         compose.onAllNodesWithTag("budget_weekly_progress").assertCountEquals(0)
+    }
+
+    @Test
+    fun unavailableRollingResetsKeepQuotaFiguresAndOmitResetLabels() {
+        val snapshot = QuotaSnapshotCodec.decode(UNAVAILABLE_RESET_SNAPSHOT_JSON)
+
+        compose.setContent {
+            MaterialTheme {
+                BudgetScreen(
+                    budget = BudgetUiState(snapshot = snapshot, freshness = BudgetFreshness.LIVE),
+                    onRefresh = {},
+                )
+            }
+        }
+        compose.waitForIdle()
+
+        compose.onNodeWithText("Five-hour: 4.5 / 14 credits used").assertIsDisplayed()
+        compose.onNodeWithText("Weekly: 22.75 / 35 credits used").assertIsDisplayed()
+        compose.onNodeWithText("28 / 70 credits used").assertIsDisplayed()
+        compose.onNodeWithTag("budget_five_hour_progress").assertIsDisplayed()
+        compose.onNodeWithTag("budget_weekly_progress").assertIsDisplayed()
+        compose.onNodeWithTag("budget_monthly_progress").assertIsDisplayed()
+        compose.onAllNodesWithText("Resets", substring = true).assertCountEquals(0)
     }
 
     @Test
@@ -207,12 +231,12 @@ class BudgetScreenComposeTest {
         compose.onNodeWithText("Five-hour: 3.2 / 14 credits used").fetchSemanticsNode()
         compose.onNodeWithTag("budget_five_hour_progress").fetchSemanticsNode()
         assertProgress("budget_five_hour_progress", 3.2f / 14f)
-        compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(fiveHour.resetAt)}")
+        compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(requireNotNull(fiveHour.resetAt))}")
             .fetchSemanticsNode()
         compose.onNodeWithText("Weekly: 8 / 100 credits used").fetchSemanticsNode()
         compose.onNodeWithTag("budget_weekly_progress").fetchSemanticsNode()
         assertProgress("budget_weekly_progress", 0.08f)
-        compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(weekly.resetAt)}")
+        compose.onNodeWithText("Resets: ${formatQuotaResetTimestamp(requireNotNull(weekly.resetAt))}")
             .fetchSemanticsNode()
         val fiveHourBounds = compose.onNodeWithTag("budget_five_hour_progress").fetchSemanticsNode().boundsInRoot
         val weeklyBounds = compose.onNodeWithTag("budget_weekly_progress").fetchSemanticsNode().boundsInRoot
@@ -263,4 +287,13 @@ class BudgetScreenComposeTest {
         freeCredits = 4.0,
         monthlyRenewsAt = monthlyRenewsAt,
     )
+
+    private companion object {
+        private const val UNAVAILABLE_RESET_SNAPSHOT_JSON =
+            "{\"schemaVersion\":4,\"fetchedAt\":1800000000000,\"planId\":\"individual-goat\"," +
+                "\"monthlyRenewsAt\":1801000000000,\"monthly\":{\"remaining\":42.0,\"cap\":70.0}," +
+                "\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":4.5,\"cap\":14.0,\"resetAt\":null}," +
+                "\"weekly\":{\"used\":22.75,\"cap\":35.0,\"resetAt\":null}}," +
+                "\"purchasedCredits\":9.5,\"freeCredits\":0.0}"
+    }
 }
